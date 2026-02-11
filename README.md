@@ -81,7 +81,7 @@ For contributions:
 
 ## License
 
-MIT License. See [LICENSE](https://github.com/AnandShah10/CodePartner/LICENSE) for details.
+MIT License. See [LICENSE](https://github.com/AnandShah10/CodePartner/blob/master/LICENSE) for details.
 
 ## Acknowledgments
 
