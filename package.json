@@ -1,0 +1,103 @@
+{
+  "name": "codepartner",
+  "displayName": "CodePartner",
+  "description": "A user-friendly AI co-pilot to help build code, find bugs, and give solutions.",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onChatParticipant:codepartner.participant",
+    "onLanguageModelChatProvider:codepartner"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codepartner.helloWorld",
+        "title": "Hello World"
+      }
+    ],
+    "languageModelChatProviders": [
+      {
+        "vendor": "codepartner",
+        "displayName": "CodePartner",
+        "models": [
+      {
+        "id": "default-model",
+        "name": "CodePartner Model"
+      }
+    ]
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "codepartner.participant",
+        "name": "codePartner",
+        "fullName": "My AI Agent",
+        "description": "Custom AI agent using your LLM.",
+        "isSticky": true
+      }
+    ],
+    "configuration": {
+      "title": "CodePartner",
+      "properties": {
+        "codepartner.apiEndpoint": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "LLM API endpoint (OpenAI-compatible)."
+        },
+        "codepartner.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the LLM provider."
+        },
+        "codepartner.model": {
+          "type": "string",
+          "default": "gpt-4",
+          "description": "Model name (e.g., gpt-4, grok-beta, llama3)."
+        },
+        "codepartner.maxTokens": {
+          "type": "number",
+          "default": 512,
+          "description": "Max output tokens."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.19.11",
+    "@types/vscode": "^1.86.0",
+    "@types/markdown-it": "^14.1.2",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.27.2",
+    "eslint": "^9.39.2",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.54.0"
+  },
+  "dependencies": {
+    "axios": "^1.13.5",
+    "markdown-it": "^14.1.0"
+  }
+}
