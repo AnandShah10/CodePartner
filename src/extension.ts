@@ -2,34 +2,53 @@ import * as vscode from "vscode";
 import axios from "axios";
 import { createParser } from "eventsource-parser";
 import MarkdownIt = require("markdown-it");
+import * as path from "path";
 
 const md = new MarkdownIt();
 
-// Custom markdown-it rules to style codeblocks later if needed, but we will handle button injection via client-side DOM.
+// Custom TextDocumentContentProvider for our Git-style diff view
+class CodePartnerDiffProvider implements vscode.TextDocumentContentProvider {
+  public static scheme = 'codepartner-diff';
+  private _content: string = "";
+
+  // Emitter to notify VS Code when the content changes
+  private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+  readonly onDidChange = this._onDidChange.event;
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    return this._content;
+  }
+
+  update(content: string) {
+    this._content = content;
+    // Notify all listeners that any URI under this scheme has changed
+    this._onDidChange.fire(vscode.Uri.parse(`${CodePartnerDiffProvider.scheme}:Proposed_Change`));
+  }
+}
+
+const diffProvider = new CodePartnerDiffProvider();
 
 const SYSTEM_PROMPT = `You are CodePartner, an expert AI coding assistant embedded in VS Code.
 You help users write, debug, refactor, and understand code.
 Always respond with clear, concise explanations and well-formatted code blocks.
 When showing code, always specify the language in the code fence.
-If the user shares code context, analyze it completely. Provide exactly what they need.`;
+If the user shares code context or searches the web/workspace, analyze it completely. Provide exactly what they need.`;
 
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("CodePartner");
   context.subscriptions.push(output);
   output.appendLine("CodePartner extension activated.");
 
+  // Register our diff provider
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(CodePartnerDiffProvider.scheme, diffProvider)
+  );
+
   const provider = new CodePartnerSidebarProvider(context.extensionUri, output);
   
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("codepartner-sidebar", provider)
   );
-
-  // Keep the diagnostic command around for debugging
-  const helloCmd = vscode.commands.registerCommand("codepartner.helloWorld", async () => {
-    vscode.window.showInformationMessage("CodePartner: Running test command!");
-    // (Command logic omitted to keep this lean, API test logic here if needed)
-  });
-  context.subscriptions.push(helloCmd);
 }
 
 export function deactivate() {}
@@ -74,34 +93,154 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
           }
           break;
         }
-        case "insertCode": {
-          this.insertCodeIntoEditor(data.value);
+        case "applyDiff": {
+          this.applyDiffToEditor(data.value);
           break;
         }
       }
     });
   }
 
-  private async insertCodeIntoEditor(code: string) {
+  private async applyDiffToEditor(aiCode: string) {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
-      vscode.window.showErrorMessage("CodePartner: Open a file to insert code.");
+      vscode.window.showErrorMessage("CodePartner: Open a file to apply a diff comparing changes.");
       return;
     }
 
+    const document = editor.document;
     const selection = editor.selection;
-    editor.edit((editBuilder) => {
-      // If there's a selection, replace it. Otherwise, insert at the cursor.
-      if (!selection.isEmpty) {
-        editBuilder.replace(selection, code);
-      } else {
-        editBuilder.insert(selection.active, code);
+    
+    // We will compare the entire file
+    // But we need to logically replace the selection (if any) with aiCode 
+    // to build the "Proposed" file content.
+    let proposedFullContent = "";
+    
+    if (!selection.isEmpty) {
+      // Replace only the selection with AI code
+      const textBefore = document.getText(new vscode.Range(new vscode.Position(0,0), selection.start));
+      const textAfter = document.getText(new vscode.Range(selection.end, document.lineAt(document.lineCount - 1).range.end));
+      proposedFullContent = textBefore + aiCode + textAfter;
+    } else {
+      // If no selection, assume the AI code is a full file rewrite, OR just append it.
+      // Usually, if there's no selection, we show a diff of the whole file replaced.
+      proposedFullContent = aiCode;
+    }
+
+    // Update the diff provider's content
+    diffProvider.update(proposedFullContent);
+
+    // Build the URIs
+    const originalUri = document.uri;
+    const ext = path.extname(document.fileName) || '.txt';
+    const proposedUri = vscode.Uri.parse(`${CodePartnerDiffProvider.scheme}:Proposed_Change${ext}`);
+
+    // Open native diff
+    vscode.commands.executeCommand(
+      'vscode.diff',
+      originalUri,
+      proposedUri,
+      'CodePartner: Review Changes'
+    );
+  }
+
+  // Parses @filename and returns file contents
+  private async getFileMentionsContext(prompt: string): Promise<string> {
+    const mentionRegex = /@([a-zA-Z0-9_\-./\\]+)/g;
+    let match;
+    let context = "";
+    const seenFiles = new Set<string>();
+
+    while ((match = mentionRegex.exec(prompt)) !== null) {
+      const filename = match[1];
+      if (filename === "web" || filename === "workspace") continue; // Special tags
+
+      if (!seenFiles.has(filename)) {
+        seenFiles.add(filename);
+        try {
+          // Find files matching this name exactly or partially
+          const files = await vscode.workspace.findFiles(`**/${filename}`, '{**/node_modules/**,**/.git/**,**/dist/**}', 1);
+          if (files.length > 0) {
+            const document = await vscode.workspace.openTextDocument(files[0]);
+            context += `\n--- Extracted File: ${filename} ---\n\`\`\`\n${document.getText()}\n\`\`\`\n\n`;
+            this.output.appendLine(`[CodePartner] Included @ mention file: ${filename}`);
+          } else {
+             // Fallback: try globbing it if it was a partial path
+             const fallbackFiles = await vscode.workspace.findFiles(`**/*${filename}*`, '{**/node_modules/**,**/dist/**}', 1);
+             if (fallbackFiles.length > 0) {
+                const document = await vscode.workspace.openTextDocument(fallbackFiles[0]);
+                context += `\n--- Extracted File: ${vscode.workspace.asRelativePath(fallbackFiles[0])} ---\n\`\`\`\n${document.getText()}\n\`\`\`\n\n`;
+             }
+          }
+        } catch (e) {
+          this.output.appendLine(`[CodePartner] Could not read file mention: ${filename}`);
+        }
       }
-    });
+    }
+    return context;
+  }
+
+  // Performs a DuckDuckGo HTML search and extracts top snippets
+  private async getWebSearchContext(prompt: string): Promise<string> {
+    if (!prompt.includes("@web")) return "";
+
+    const queryMatch = prompt.match(/@web\s+(.*)/i);
+    const query = queryMatch ? queryMatch[1] : prompt.replace("@web", "").trim();
+    
+    if (!query) return "";
+    
+    this._view?.webview.postMessage({ type: 'status', value: 'Searching the web...' });
+
+    try {
+      this.output.appendLine(`[CodePartner] Searching web for: ${query}`);
+      const res = await axios.get(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+      });
+      
+      const html = res.data as string;
+      const snippets: string[] = [];
+      
+      // Extremely lightweight regex extraction of DDG results (result__snippet classes)
+      const snippetRegex = /<a class="result__snippet[^>]*>([\s\S]*?)<\/a>/g;
+      let match;
+      let count = 0;
+      while ((match = snippetRegex.exec(html)) !== null && count < 3) {
+        // Strip HTML tags from inner content
+        const rawText = match[1].replace(/<[^>]+>/g, "").trim();
+        snippets.push(rawText);
+        count++;
+      }
+
+      if (snippets.length > 0) {
+        return `\n--- Web Search Results for "${query}" ---\n` + snippets.map((s, i) => `${i+1}. ${s}`).join("\n\n") + "\n\n";
+      }
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] Web search failed: ${e.message}`);
+    }
+
+    return "\n--- Web Search Failed ---\nNo results could be fetched.\n\n";
+  }
+
+  // Gets a structural overview of the workspace
+  private async getWorkspaceContext(prompt: string): Promise<string> {
+    if (!prompt.includes("@workspace")) return "";
+    
+    this._view?.webview.postMessage({ type: 'status', value: 'Scanning workspace...' });
+    
+    try {
+      const files = await vscode.workspace.findFiles('**/*', '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}', 200);
+      const paths = files.map(f => vscode.workspace.asRelativePath(f)).sort();
+      
+      return `\n--- Workspace Structure (${paths.length} files) ---\n` + paths.join("\n") + "\n\n";
+    } catch (e) {
+      return "";
+    }
   }
 
   private async handlePrompt(prompt: string) {
     if (!this._view) return;
+
+    this._view.webview.postMessage({ type: 'status', value: 'Preparing context...' });
 
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
@@ -120,35 +259,45 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
 
     // --- CONTEXT INJECTION PIPELINE ---
-    const editor = vscode.window.activeTextEditor;
     let contextHeader = "";
-    
+
+    // 1. @website / web search
+    contextHeader += await this.getWebSearchContext(prompt);
+
+    // 2. @workspace structural search
+    contextHeader += await this.getWorkspaceContext(prompt);
+
+    // 3. @filename mentions
+    contextHeader += await this.getFileMentionsContext(prompt);
+
+    // 4. Active Editor Context
+    const editor = vscode.window.activeTextEditor;
     if (editor) {
       const document = editor.document;
       const selection = editor.selection;
       const fileName = document.fileName.split(/[/\\]/).pop();
 
-      // Prioritize highlighted text context. If none, grab some surrounding context or whole file if short.
       let codeContext = "";
       if (!selection.isEmpty) {
         codeContext = document.getText(selection);
-        contextHeader = `\n\n--- Context ---\nFile: \`${fileName}\`\nSelected Code:\n\`\`\`\n${codeContext}\n\`\`\``;
+        contextHeader += `\n--- Context ---\nActive File: \`${fileName}\`\nSelected Code (Target of Prompt):\n\`\`\`\n${codeContext}\n\`\`\`\n`;
       } else {
-        // Just the file content (capped to avoid blowing up tokens)
         const text = document.getText();
-        const cappedText = text.length > 5000 ? text.substring(0, 5000) + "\n... (truncated)" : text;
-        contextHeader = `\n\n--- Context ---\nActive File: \`${fileName}\`\nContent:\n\`\`\`\n${cappedText}\n\`\`\``;
+        const cappedText = text.length > 8000 ? text.substring(0, 8000) + "\n... (truncated)" : text;
+        contextHeader += `\n--- Context ---\nActive File: \`${fileName}\`\nContent:\n\`\`\`\n${cappedText}\n\`\`\`\n`;
       }
     }
 
-    const finalPrompt = prompt + contextHeader;
+    const finalPrompt = contextHeader.length > 0 
+      ? `${contextHeader}\n\nUser Question:\n${prompt}` 
+      : prompt;
     // ----------------------------------
 
-    // Add user message to history
     this.messageHistory.push({ role: "user", content: finalPrompt });
 
     let url = "";
     const headers: Record<string, string> = { "Content-Type": "application/json" };
+    // Fixed replace regex syntax error
     const endpoint = apiEndpoint.replace(/\/$/, "");
 
     if (providerType === "azure") {
@@ -160,7 +309,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
 
     const body: Record<string, unknown> = {
-      messages: this.messageHistory.map(msg => ({ role: msg.role, content: msg.content })), // strip any extra keys
+      messages: this.messageHistory.map(msg => ({ role: msg.role, content: msg.content })),
       max_tokens: maxTokens,
       temperature: 0.7,
       stream: true,
@@ -171,6 +320,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
 
     this.output.appendLine(`[CodePartner] POST → ${url}`);
+    this._view.webview.postMessage({ type: 'status', value: 'Thinking...' });
 
     this.abortController = new AbortController();
     let fullResponse = "";
@@ -258,20 +408,20 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       display: flex;
       flex-direction: column;
       height: 100vh;
-      overflow: hidden;
+      overflow: hidden; /* Prevent body scrollbar! */
     }
     
     /* Scrollbar Polish */
     ::-webkit-scrollbar {
-      width: 8px;
-      height: 8px;
+      width: 6px;
+      height: 6px;
     }
     ::-webkit-scrollbar-track {
       background: transparent;
     }
     ::-webkit-scrollbar-thumb {
       background: var(--vscode-scrollbarSlider-background);
-      border-radius: 4px;
+      border-radius: 3px;
     }
     ::-webkit-scrollbar-thumb:hover {
       background: var(--vscode-scrollbarSlider-hoverBackground);
@@ -282,7 +432,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
     #chat-history {
       flex: 1;
-      overflow-y: auto;
+      overflow-y: overlay; /* Native-like overlay scrollbar */
+      overflow-x: hidden;
       padding: 16px;
       display: flex;
       flex-direction: column;
@@ -317,15 +468,9 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
     
     /* Markdown Styles */
-    .assistant p {
-      margin: 0 0 10px 0;
-    }
-    .assistant p:last-child {
-      margin-bottom: 0;
-    }
-    .assistant a {
-      color: var(--vscode-textLink-foreground);
-    }
+    .assistant p { margin: 0 0 10px 0; }
+    .assistant p:last-child { margin-bottom: 0; }
+    .assistant a { color: var(--vscode-textLink-foreground); }
 
     /* CODE BLOCKS WITH BUTTONS */
     .code-block-wrapper {
@@ -349,13 +494,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     .code-block-header button {
       background: transparent;
       color: var(--vscode-foreground);
-      border: none;
-      padding: 4px 8px;
+      border: 1px solid transparent;
+      padding: 3px 8px;
       border-radius: 3px;
       cursor: pointer;
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 6px;
       font-size: 11px;
       opacity: 0.8;
       transition: all 0.2s;
@@ -363,7 +508,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     
     .code-block-header button:hover {
       background-color: var(--vscode-toolbar-hoverBackground);
+      border: 1px solid var(--vscode-toolbar-hoverOutline);
       opacity: 1;
+    }
+    
+    .code-block-header button svg {
+      width: 12px;
+      height: 12px;
     }
 
     .assistant pre {
@@ -463,6 +614,14 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-errorForeground);
     }
 
+    /* Status text underneath textarea */
+    #status-text {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      min-height: 12px;
+      opacity: 0.7;
+    }
+
     /* Loading dots */
     .typing-indicator {
       display: inline-flex;
@@ -492,13 +651,19 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   <div id="chat-history">
     <div class="message assistant">
       <p>Hello! I am CodePartner.</p>
-      <p>I will automatically read the file you have open, and specifically any code you have highlighted, to give you perfectly contextual answers.</p>
+      <ul>
+        <li><strong>@filename</strong> to inject a file</li>
+        <li><strong>@workspace</strong> to search repo structure</li>
+        <li><strong>@web</strong> to hit the internet</li>
+      </ul>
+      <p>I automatically read your active file and highlighted code!</p>
     </div>
   </div>
 
   <div id="input-container">
+    <div id="status-text"></div>
     <div class="input-wrapper">
-      <textarea id="prompt-input" rows="1" placeholder="Ask CodePartner... (Shift+Enter for newline)"></textarea>
+      <textarea id="prompt-input" rows="1" placeholder="Ask CodePartner... (@web, @workspace, @file)"></textarea>
       <button id="send-btn" title="Send (Enter)">
         <svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>
       </button>
@@ -510,15 +675,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const chatHistory = document.getElementById('chat-history');
     const promptInput = document.getElementById('prompt-input');
     const sendBtn = document.getElementById('send-btn');
+    const statusText = document.getElementById('status-text');
     
     let currentAssistantDiv = null;
     let isWaiting = false;
 
-    // Send Icon SVG
-    const sendIcon = \`<svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>\`;
-    
-    // Stop Icon SVG
-    const stopIcon = \`<svg viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1"/></svg>\`;
+    const sendIcon = '<svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>';
+    const stopIcon = '<svg viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1"/></svg>';
 
     promptInput.addEventListener('input', function() {
       this.style.height = 'auto';
@@ -538,7 +701,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         setWaitingState(false);
         if (currentAssistantDiv) {
           currentAssistantDiv.innerHTML += '<br><br><em style="opacity:0.6;">(Cancelled)</em>';
-          processCodeBlocks(currentAssistantDiv); // One final pass to wrap pre tags
+          processCodeBlocks(currentAssistantDiv);
           currentAssistantDiv = null;
         }
       } else {
@@ -554,6 +717,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       } else {
         sendBtn.innerHTML = sendIcon;
         sendBtn.classList.remove('stop');
+        statusText.innerText = '';
       }
     }
 
@@ -580,7 +744,6 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'prompt', value: text });
     }
 
-    // Wrap raw <pre> tags with our custom header and action buttons
     function processCodeBlocks(container) {
       const pres = container.querySelectorAll('pre:not(.processed)');
       pres.forEach(pre => {
@@ -593,14 +756,10 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         header.className = 'code-block-header';
         
         const insertBtn = document.createElement('button');
-        insertBtn.innerHTML = \`<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M10.5 4v1.5H12V4h-1.5zm-5 0V4H4v1.5h1.5zm2.5 7.5L5.5 9h5l-2.5 2.5z"/></svg> Insert at Cursor\`;
+        insertBtn.innerHTML = '<svg fill="currentColor" viewBox="0 0 16 16"><path d="m14.53 4.53-3-3-.53-.22L1 3.22V15h14V5l-.47-.47zM11 2.56l2.44 2.44H11V2.56zM2 14v-9.7l8 1.94V6.5l3.52 3.52L14 14H2z"/><path d="m13.03 10.47-2-2L10 8.5l-3.5 3.5.53.53L9.5 9.06l1.47 1.47V7.5h-3l2.03 2.03-3.6 3.6.53.53 3.6-3.6z"/></svg> Apply Diff';
         insertBtn.onclick = () => {
           const code = pre.querySelector('code')?.innerText || pre.innerText;
-          vscode.postMessage({ type: 'insertCode', value: code });
-          
-          const oldHtml = insertBtn.innerHTML;
-          insertBtn.innerHTML = '✔ Inserted';
-          setTimeout(() => insertBtn.innerHTML = oldHtml, 2000);
+          vscode.postMessage({ type: 'applyDiff', value: code });
         };
         
         header.appendChild(insertBtn);
@@ -614,10 +773,12 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', event => {
       const message = event.data;
       switch (message.type) {
+        case 'status':
+          statusText.innerText = message.value;
+          break;
         case 'partial':
           if (currentAssistantDiv) {
             currentAssistantDiv.innerHTML = message.value;
-            // Intermittently process code blocks as they stream in to show buttons early
             processCodeBlocks(currentAssistantDiv); 
             scrollToBottom();
           }
