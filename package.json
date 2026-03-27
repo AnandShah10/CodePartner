@@ -7,12 +7,10 @@
     "vscode": "^1.86.0"
   },
   "categories": [
-    "Other"
+    "AI","Chat"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onChatParticipant:codepartner.participant",
-    "onLanguageModelChatProvider:codepartner"
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -22,34 +20,42 @@
         "title": "Hello World"
       }
     ],
-    "languageModelChatProviders": [
-      {
-        "vendor": "codepartner",
-        "displayName": "CodePartner",
-        "models": [
-      {
-        "id": "default-model",
-        "name": "CodePartner Model"
-      }
-    ]
-      }
-    ],
-    "chatParticipants": [
-      {
-        "id": "codepartner.participant",
-        "name": "codePartner",
-        "fullName": "My AI Agent",
-        "description": "Custom AI agent using your LLM.",
-        "isSticky": true
-      }
-    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codepartner-view-container",
+          "title": "CodePartner",
+          "icon": "$(robot)"
+        }
+      ]
+    },
+    "views": {
+      "codepartner-view-container": [
+        {
+          "type": "webview",
+          "id": "codepartner-sidebar",
+          "name": "CodePartner Chat",
+          "icon": "$(robot)",
+          "contextualTitle": "CodePartner Chat AI"
+        }
+      ]
+    },
     "configuration": {
       "title": "CodePartner",
       "properties": {
+        "codepartner.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "azure"
+          ],
+          "default": "openai",
+          "description": "LLM provider type"
+        },
         "codepartner.apiEndpoint": {
           "type": "string",
           "default": "https://api.openai.com/v1",
-          "description": "LLM API endpoint (OpenAI-compatible)."
+          "description": "LLM API endpoint"
         },
         "codepartner.apiKey": {
           "type": "string",
@@ -59,12 +65,17 @@
         "codepartner.model": {
           "type": "string",
           "default": "gpt-4",
-          "description": "Model name (e.g., gpt-4, grok-beta, llama3)."
+          "description": "Model name (OpenAI) or Deployment name (Azure)"
         },
         "codepartner.maxTokens": {
           "type": "number",
-          "default": 512,
+          "default": 1024,
           "description": "Max output tokens."
+        },
+        "codepartner.azureApiVersion": {
+          "type": "string",
+          "default": "2024-02-15-preview",
+          "description": "Azure OpenAI API version (only used when provider=azure)"
         }
       }
     }
@@ -84,10 +95,10 @@
     "test": "vscode-test"
   },
   "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "^22.19.11",
     "@types/vscode": "^1.86.0",
-    "@types/markdown-it": "^14.1.2",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
     "esbuild": "^0.27.2",
@@ -98,6 +109,7 @@
   },
   "dependencies": {
     "axios": "^1.13.5",
+    "eventsource-parser": "^3.0.6",
     "markdown-it": "^14.1.0"
   }
 }
