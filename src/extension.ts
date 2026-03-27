@@ -93,14 +93,20 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
           }
           break;
         case "applyDiff":
-          this.applyDiffToEditor(data.value);
+          // Show diff view so user can review before accepting
+          this.showDiffView(data.value);
+          break;
+        case "applyDirect":
+          // Directly apply the AI code to the active editor without diff
+          this.applyDirectToEditor(data.value);
           break;
         case "copyCode":
           vscode.env.clipboard.writeText(data.value);
           vscode.window.showInformationMessage("CodePartner: Code copied to clipboard.");
           break;
         case "insertCode":
-          this.insertCodeAtCursor(data.value);
+          // Smart insert: find best matching location in document
+          this.smartInsertCode(data.value);
           break;
         case "clearChat":
           this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
@@ -109,28 +115,148 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  // ── Insert code at cursor (no diff) ────────────────────────────────────────
-  private async insertCodeAtCursor(code: string) {
+  // ── Smart Insert: finds the right location in the document ─────────────────
+  // Strategy:
+  //  1. If there is a non-empty selection → replace selection
+  //  2. Else try to detect a function/class name in the AI code and find a
+  //     matching definition in the document to replace that block
+  //  3. Else fall back to inserting at the current cursor line (beginning of line)
+  private async smartInsertCode(code: string) {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
       vscode.window.showWarningMessage("CodePartner: No active editor to insert into.");
       return;
     }
-    await editor.edit((editBuilder) => {
-      if (!editor.selection.isEmpty) {
-        editBuilder.replace(editor.selection, code);
-      } else {
-        editBuilder.insert(editor.selection.active, code);
+
+    const document = editor.document;
+    const fullText = document.getText();
+
+    // 1. Replace active selection if present
+    if (!editor.selection.isEmpty) {
+      await editor.edit((eb) => eb.replace(editor.selection, code));
+      vscode.window.showInformationMessage("CodePartner: Code replaced selection.");
+      return;
+    }
+
+    // 2. Try to find a matching function/class block to replace
+    const targetName = this.extractDefinitionName(code);
+    if (targetName) {
+      const range = this.findDefinitionRange(document, targetName);
+      if (range) {
+        await editor.edit((eb) => eb.replace(range, code));
+        // Move cursor to start of replaced range
+        const newPos = range.start;
+        editor.selection = new vscode.Selection(newPos, newPos);
+        editor.revealRange(new vscode.Range(newPos, newPos), vscode.TextEditorRevealType.InCenter);
+        vscode.window.showInformationMessage(
+          `CodePartner: Replaced "${targetName}" in file.`
+        );
+        return;
       }
-    });
-    vscode.window.showInformationMessage("CodePartner: Code inserted.");
+    }
+
+    // 3. Fallback: insert at the beginning of the current cursor line
+    const cursorLine = editor.selection.active.line;
+    const insertPos = new vscode.Position(cursorLine, 0);
+    const insertText = code.endsWith("\n") ? code : code + "\n";
+    await editor.edit((eb) => eb.insert(insertPos, insertText));
+    editor.selection = new vscode.Selection(insertPos, insertPos);
+    editor.revealRange(new vscode.Range(insertPos, insertPos), vscode.TextEditorRevealType.InCenter);
+    vscode.window.showInformationMessage("CodePartner: Code inserted at current line.");
   }
 
-  // ── Apply diff ─────────────────────────────────────────────────────────────
-  private async applyDiffToEditor(aiCode: string) {
+  // Extract the first function/class/method name from a code snippet
+  private extractDefinitionName(code: string): string | null {
+    // Matches: function foo, async function foo, class Foo,
+    //          const foo =, let foo =, public/private foo(, foo(
+    const patterns = [
+      /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)/m,
+      /^\s*(?:export\s+)?(?:abstract\s+)?class\s+(\w+)/m,
+      /^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=/m,
+      /^\s*(?:public|private|protected|static|async|\s)*\s+(\w+)\s*\(/m,
+    ];
+    for (const re of patterns) {
+      const m = re.exec(code);
+      if (m?.[1] && m[1] !== "function" && m[1] !== "class") return m[1];
+    }
+    return null;
+  }
+
+  // Find the range of a function/class definition in the document using brace matching
+  private findDefinitionRange(
+    document: vscode.TextDocument,
+    name: string
+  ): vscode.Range | null {
+    const text = document.getText();
+    // Look for the definition line
+    const defRegex = new RegExp(
+      `(^|\\n)([ \\t]*)(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?(?:function\\s+${name}|class\\s+${name}|(?:const|let|var)\\s+${name}\\s*=|(?:public|private|protected|static|async|\\s)*\\s*${name}\\s*\\()`
+    );
+    const match = defRegex.exec(text);
+    if (!match) return null;
+
+    const matchStart = match.index + (match[1] === "\n" ? 1 : 0);
+    const startPos = document.positionAt(matchStart);
+
+    // Find the opening brace from the definition onwards
+    let braceStart = text.indexOf("{", matchStart);
+    if (braceStart === -1) return null;
+
+    // Balance braces to find the end of the block
+    let depth = 0;
+    let i = braceStart;
+    while (i < text.length) {
+      if (text[i] === "{") depth++;
+      else if (text[i] === "}") {
+        depth--;
+        if (depth === 0) break;
+      }
+      i++;
+    }
+
+    if (depth !== 0) return null;
+
+    // Include the closing brace and any trailing newline
+    const endIndex = i + 1;
+    const trailingNewline = text[endIndex] === "\n" ? endIndex + 1 : endIndex;
+    const endPos = document.positionAt(trailingNewline);
+
+    return new vscode.Range(startPos, endPos);
+  }
+
+  // ── Apply Directly: replace file/selection without diff view ───────────────
+  private async applyDirectToEditor(aiCode: string) {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
-      vscode.window.showErrorMessage("CodePartner: Open a file to apply a diff.");
+      vscode.window.showErrorMessage("CodePartner: Open a file to apply changes.");
+      return;
+    }
+
+    const document = editor.document;
+    const selection = editor.selection;
+
+    if (!selection.isEmpty) {
+      // Replace selected region
+      await editor.edit((eb) => eb.replace(selection, aiCode));
+      vscode.window.showInformationMessage("CodePartner: Applied to selection.");
+    } else {
+      // Replace entire file content
+      const fullRange = new vscode.Range(
+        new vscode.Position(0, 0),
+        document.lineAt(document.lineCount - 1).range.end
+      );
+      await editor.edit((eb) => eb.replace(fullRange, aiCode));
+      vscode.window.showInformationMessage("CodePartner: Applied to file.");
+    }
+  }
+
+  // ── Show Diff View (only for explicit review, not the default action) ───────
+  // The key fix: we only send CHANGED lines to the diff provider so VS Code
+  // correctly highlights only the lines that differ, not the whole file as green.
+  private async showDiffView(aiCode: string) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      vscode.window.showErrorMessage("CodePartner: Open a file to diff.");
       return;
     }
 
@@ -151,7 +277,6 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       );
       proposedFullContent = before + aiCode + after;
     } else {
-      // No selection → treat AI code as full-file replacement
       proposedFullContent = aiCode;
     }
 
@@ -223,7 +348,6 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     try {
       this.output.appendLine(`[CodePartner] Web search: ${query}`);
 
-      // Primary: DuckDuckGo Instant Answer JSON API
       const res = await axios.get(
         `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`,
         { timeout: 8000, headers: { "User-Agent": "CodePartner-VSCode/1.0" } }
@@ -248,7 +372,6 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         );
       }
 
-      // Fallback: DuckDuckGo HTML scrape
       const htmlRes = await axios.get(
         `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
         { timeout: 8000, headers: { "User-Agent": "Mozilla/5.0" } }
@@ -319,7 +442,6 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     contextHeader += await this.getWorkspaceContext(prompt);
     contextHeader += await this.getFileMentionsContext(prompt);
 
-    // Active editor context
     const editor = vscode.window.activeTextEditor;
     if (editor) {
       const document = editor.document;
@@ -512,7 +634,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
     #clear-btn svg { width: 13px; height: 13px; fill: currentColor; }
 
-    /* Chat history - CRITICAL for proper scrolling */
+    /* Chat history */
     #chat-history {
       flex: 1 1 auto;
       min-height: 0;
@@ -606,7 +728,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       font-size: 12.5px;
     }
 
-    /* Code block wrapper - cleaner look */
+    /* Code block wrapper */
     .code-block-wrapper {
       margin: 12px 0;
       border-radius: 6px;
@@ -657,6 +779,18 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       border-color: var(--vscode-toolbar-hoverOutline);
     }
     .code-btn svg { width: 13px; height: 13px; fill: currentColor; }
+
+    /* Apply button — more prominent */
+    .code-btn.apply-btn {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      opacity: 1;
+      border-color: transparent;
+    }
+    .code-btn.apply-btn:hover {
+      opacity: 0.88;
+      background: var(--vscode-button-hoverBackground);
+    }
 
     .assistant pre {
       margin: 0;
@@ -792,7 +926,6 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   </div>
 
   <div id="chat-history">
-    <!-- Initial welcome message stays here -->
     <div class="message assistant">
       <strong>👋 Hello! I'm CodePartner.</strong>
       <p style="margin:10px 0 8px;">Quick tips:</p>
@@ -801,7 +934,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         <li><code>@workspace</code> — Show project structure</li>
         <li><code>@filename</code> — Pull in a file</li>
       </ul>
-      <p style="margin:10px 0 0;">I also automatically include your active file + selection.</p>
+      <p style="margin:10px 0 0;">On code blocks: <strong>Apply</strong> writes directly to your file, <strong>Insert</strong> smart-places it, <strong>Diff</strong> shows a review first.</p>
     </div>
   </div>
 
@@ -834,7 +967,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     let isWaiting = false;
 
     const SEND_ICON = '<svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>';
-    const STOP_ICON = '<svg viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>';
+    const STOP_ICON  = '<svg viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>';
 
     function insertTag(tag) {
       const pos = promptInput.selectionStart;
@@ -844,7 +977,6 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       promptInput.selectionStart = promptInput.selectionEnd = pos + tag.length;
     }
 
-    // Auto-grow textarea
     promptInput.addEventListener('input', function () {
       this.style.height = 'auto';
       this.style.height = Math.min(this.scrollHeight, 180) + 'px';
@@ -933,6 +1065,29 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         const actions = document.createElement('div');
         actions.className = 'code-actions';
 
+        // ── Apply button (direct write, no diff) ──────────────────────────
+        const applyBtn = makeBtn(
+          '<svg viewBox="0 0 16 16"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>',
+          'Apply'
+        );
+        applyBtn.classList.add('apply-btn');
+        applyBtn.title = 'Apply directly to file (replaces matched function/selection/file)';
+        applyBtn.onclick = () => {
+          vscode.postMessage({ type: 'applyDirect', value: rawCode() });
+          const lbl = applyBtn.querySelector('span');
+          if (lbl) lbl.textContent = 'Applied!';
+          setTimeout(() => { if (lbl) lbl.textContent = 'Apply'; }, 1800);
+        };
+
+        // ── Insert button (smart placement) ──────────────────────────────
+        const insertBtn = makeBtn(
+          '<svg viewBox="0 0 16 16"><path d="M1 2h2v2H1V2zm0 4h2v2H1V6zm0 4h2v2H1v-2zm4-8h10v2H5V2zm0 4h10v2H5V6zm0 4h6v2H5v-2z"/></svg>',
+          'Insert'
+        );
+        insertBtn.title = 'Smart insert: replaces matching function/class or inserts at cursor line';
+        insertBtn.onclick = () => vscode.postMessage({ type: 'insertCode', value: rawCode() });
+
+        // ── Copy button ───────────────────────────────────────────────────
         const copyBtn = makeBtn(
           '<svg viewBox="0 0 16 16"><path d="M4 4h8v1H4V4zm0 2h8v1H4V6zm0 2h5v1H4V8zm8-7H3L2 2v11l1 1h4v-1H3V2h8v1h1V2l-1-1zm2 4h-7l-1 1v8l1 1h7l1-1V6l-1-1zm0 9H6V6h7v9z"/></svg>',
           'Copy'
@@ -944,19 +1099,15 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
           setTimeout(() => { if (lbl) lbl.textContent = 'Copy'; }, 1500);
         };
 
-        const insertBtn = makeBtn(
-          '<svg viewBox="0 0 16 16"><path d="M1 2h2v2H1V2zm0 4h2v2H1V6zm0 4h2v2H1v-2zm4-8h10v2H5V2zm0 4h10v2H5V6zm0 4h6v2H5v-2z"/></svg>',
-          'Insert'
-        );
-        insertBtn.onclick = () => vscode.postMessage({ type: 'insertCode', value: rawCode() });
-
+        // ── Diff button (review before applying) ─────────────────────────
         const diffBtn = makeBtn(
           '<svg viewBox="0 0 16 16"><path d="M6 3h4v2H6V3zm0 4h4v2H6V7zm0 4h4v2H6v-2zM2 3h3v2H2V3zm0 4h3v2H2V7zm0 4h3v2H2v-2zm9 0h3v2h-3v-2zm0-4h3v2h-3V7zm0-4h3v2h-3V3z"/></svg>',
           'Diff'
         );
+        diffBtn.title = 'Show diff view before applying';
         diffBtn.onclick = () => vscode.postMessage({ type: 'applyDiff', value: rawCode() });
 
-        actions.append(copyBtn, insertBtn, diffBtn);
+        actions.append(applyBtn, insertBtn, copyBtn, diffBtn);
         header.append(langSpan, actions);
 
         pre.parentNode.insertBefore(wrapper, pre);
