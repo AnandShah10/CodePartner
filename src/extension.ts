@@ -426,7 +426,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
   // ── HTML ───────────────────────────────────────────────────────────────────
   private getHtmlForWebview() {
-    return /* html */ `<!DOCTYPE html>
+  return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -436,9 +436,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     *, *::before, *::after { box-sizing: border-box; }
 
     :root {
-      --radius: 10px;
-      --radius-sm: 6px;
-      --gap: 14px;
+      --radius: 8px;
+      --gap: 16px;
     }
 
     html, body {
@@ -458,8 +457,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       height: 100vh;
     }
 
-    /* ── Scrollbar ── */
-    ::-webkit-scrollbar { width: 5px; }
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb {
       background: var(--vscode-scrollbarSlider-background);
@@ -469,12 +468,12 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-scrollbarSlider-hoverBackground);
     }
 
-    /* ── Header ── */
+    /* Header */
     #header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 10px 14px 8px;
+      padding: 10px 16px 8px;
       border-bottom: 1px solid var(--vscode-panel-border);
       flex-shrink: 0;
     }
@@ -483,16 +482,14 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       gap: 8px;
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 600;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      opacity: 0.8;
+      opacity: 0.9;
     }
 
     #header-title svg {
-      width: 14px;
-      height: 14px;
+      width: 16px;
+      height: 16px;
       fill: var(--vscode-button-background);
     }
 
@@ -500,22 +497,24 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       background: transparent;
       border: none;
       color: var(--vscode-foreground);
-      opacity: 0.5;
+      opacity: 0.6;
       cursor: pointer;
-      padding: 3px 6px;
-      border-radius: var(--radius-sm);
-      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
       display: flex;
       align-items: center;
       gap: 5px;
-      transition: opacity 0.2s, background 0.2s;
     }
-    #clear-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
-    #clear-btn svg { width: 12px; height: 12px; fill: currentColor; }
+    #clear-btn:hover {
+      opacity: 1;
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+    #clear-btn svg { width: 13px; height: 13px; fill: currentColor; }
 
-    /* ── Chat history — THE key fix: flex child with min-height:0 ── */
+    /* Chat history - CRITICAL for proper scrolling */
     #chat-history {
-      flex: 1 1 0;
+      flex: 1 1 auto;
       min-height: 0;
       overflow-y: auto;
       overflow-x: hidden;
@@ -526,20 +525,20 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       scroll-behavior: smooth;
     }
 
-    /* ── Messages ── */
+    /* Messages */
     .message {
-      padding: 10px 14px;
+      padding: 12px 16px;
       border-radius: var(--radius);
-      max-width: 96%;
+      line-height: 1.5;
+      font-size: 13px;
+      max-width: 100%;
       word-wrap: break-word;
       overflow-wrap: anywhere;
-      line-height: 1.55;
-      font-size: 13px;
-      animation: fadeIn 0.18s ease;
+      animation: fadeIn 0.2s ease forwards;
     }
 
     @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(4px); }
+      from { opacity: 0; transform: translateY(6px); }
       to   { opacity: 1; transform: translateY(0); }
     }
 
@@ -547,16 +546,16 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       align-self: flex-end;
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
-      border-bottom-right-radius: 3px;
+      border-bottom-right-radius: 2px;
+      max-width: 85%;
     }
 
     .assistant {
       align-self: flex-start;
       background: var(--vscode-editor-background);
       border: 1px solid var(--vscode-panel-border);
-      border-bottom-left-radius: 3px;
+      border-bottom-left-radius: 2px;
       width: 100%;
-      overflow: hidden;
     }
 
     .error-msg {
@@ -564,49 +563,53 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       background: transparent;
       border: 1px solid var(--vscode-errorForeground);
       color: var(--vscode-errorForeground);
-      font-size: 12px;
-      border-radius: var(--radius-sm);
+      font-size: 12.5px;
+      padding: 10px 14px;
     }
 
-    /* ── Markdown inside .assistant ── */
-    .assistant p { margin: 0 0 8px; }
+    /* Markdown styling */
+    .assistant p { margin: 0 0 10px; }
     .assistant p:last-child { margin-bottom: 0; }
-    .assistant ul, .assistant ol { margin: 6px 0 8px 18px; padding: 0; }
-    .assistant li { margin-bottom: 3px; }
-    .assistant h1,.assistant h2,.assistant h3 {
-      margin: 10px 0 6px;
-      font-size: 13px;
-      font-weight: 700;
+    .assistant ul, .assistant ol { margin: 8px 0 10px 20px; padding: 0; }
+    .assistant li { margin-bottom: 4px; }
+    .assistant h1, .assistant h2, .assistant h3 {
+      margin: 14px 0 8px;
+      font-size: 13.5px;
+      font-weight: 600;
     }
     .assistant a { color: var(--vscode-textLink-foreground); }
     .assistant blockquote {
-      margin: 6px 0;
-      padding: 4px 10px;
+      margin: 10px 0;
+      padding: 6px 12px;
       border-left: 3px solid var(--vscode-button-background);
-      opacity: 0.8;
+      opacity: 0.85;
     }
-    .assistant table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12px; }
+    .assistant table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 10px 0;
+      font-size: 12.5px;
+    }
     .assistant th, .assistant td {
       border: 1px solid var(--vscode-panel-border);
-      padding: 4px 8px;
+      padding: 6px 10px;
       text-align: left;
     }
     .assistant th { background: var(--vscode-editorGroupHeader-tabsBackground); }
 
-    /* inline code */
+    /* Inline code */
     :not(pre) > code {
       background: var(--vscode-textCodeBlock-background);
-      padding: 1px 5px;
-      border-radius: 4px;
-      font-family: var(--vscode-editor-font-family, Consolas, monospace);
-      font-size: 12px;
-      color: var(--vscode-symbolIcon-variableForeground);
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12.5px;
     }
 
-    /* ── Code block wrapper ── */
+    /* Code block wrapper - cleaner look */
     .code-block-wrapper {
-      margin: 10px 0;
-      border-radius: var(--radius-sm);
+      margin: 12px 0;
+      border-radius: 6px;
       border: 1px solid var(--vscode-widget-border);
       background: var(--vscode-textCodeBlock-background);
       overflow: hidden;
@@ -616,163 +619,161 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 4px 8px;
+      padding: 6px 12px;
       background: var(--vscode-editorGroupHeader-tabsBackground);
       border-bottom: 1px solid var(--vscode-widget-border);
+      font-size: 11.5px;
     }
 
     .code-lang {
-      font-size: 10px;
-      opacity: 0.55;
+      opacity: 0.7;
       font-family: var(--vscode-editor-font-family, monospace);
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.5px;
     }
 
-    .code-actions { display: flex; gap: 4px; }
+    .code-actions {
+      display: flex;
+      gap: 6px;
+    }
 
     .code-btn {
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 5px;
       background: transparent;
       color: var(--vscode-foreground);
       border: 1px solid transparent;
-      padding: 2px 8px;
-      border-radius: 3px;
+      padding: 3px 9px;
+      border-radius: 4px;
       cursor: pointer;
-      font-size: 11px;
-      opacity: 0.75;
-      transition: all 0.15s;
-      white-space: nowrap;
+      font-size: 11.5px;
+      opacity: 0.8;
+      transition: all 0.12s;
     }
     .code-btn:hover {
-      background: var(--vscode-toolbar-hoverBackground);
-      border-color: var(--vscode-toolbar-hoverOutline, transparent);
       opacity: 1;
+      background: var(--vscode-toolbar-hoverBackground);
+      border-color: var(--vscode-toolbar-hoverOutline);
     }
-    .code-btn svg { width: 11px; height: 11px; fill: currentColor; flex-shrink: 0; }
+    .code-btn svg { width: 13px; height: 13px; fill: currentColor; }
 
     .assistant pre {
       margin: 0;
-      padding: 12px;
+      padding: 14px;
       overflow-x: auto;
       background: transparent;
+      font-size: 13px;
     }
 
     .assistant code {
       font-family: var(--vscode-editor-font-family, Consolas, monospace);
-      font-size: 12px;
     }
 
-    /* ── Typing indicator ── */
+    /* Typing indicator */
     .typing-indicator {
       display: inline-flex;
-      gap: 4px;
-      align-items: center;
-      padding: 2px 0;
+      gap: 5px;
+      padding: 4px 0;
     }
     .typing-indicator span {
-      width: 6px; height: 6px;
+      width: 6px;
+      height: 6px;
       background: var(--vscode-foreground);
       border-radius: 50%;
-      opacity: 0.35;
-      animation: bounce 1.3s infinite ease-in-out;
+      opacity: 0.4;
+      animation: bounce 1.4s infinite ease-in-out;
     }
-    .typing-indicator span:nth-child(2) { animation-delay: 0.18s; }
-    .typing-indicator span:nth-child(3) { animation-delay: 0.36s; }
+    .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+    .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
     @keyframes bounce {
-      0%,100% { transform: translateY(0); opacity: 0.35; }
-      50%      { transform: translateY(-4px); opacity: 0.9; }
+      0%, 100% { transform: translateY(0); opacity: 0.4; }
+      50% { transform: translateY(-5px); opacity: 0.9; }
     }
 
-    /* ── Input area ── */
+    /* Input area */
     #input-container {
       flex-shrink: 0;
-      padding: 10px 12px 12px;
+      padding: 12px 16px 16px;
       border-top: 1px solid var(--vscode-panel-border);
       background: var(--vscode-sideBar-background);
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: 8px;
     }
 
     #status-text {
-      font-size: 10px;
+      font-size: 11px;
       color: var(--vscode-descriptionForeground);
-      min-height: 13px;
-      opacity: 0.7;
-      padding-left: 2px;
+      min-height: 16px;
+      padding-left: 4px;
     }
 
     .input-row {
       display: flex;
       align-items: flex-end;
-      gap: 6px;
+      gap: 8px;
     }
 
     .input-wrapper {
       flex: 1;
       display: flex;
-      align-items: flex-end;
       border: 1px solid var(--vscode-input-border);
-      border-radius: var(--radius-sm);
+      border-radius: 6px;
       background: var(--vscode-input-background);
-      transition: border-color 0.18s;
-      overflow: hidden;
+      transition: border-color 0.15s;
     }
-    .input-wrapper:focus-within { border-color: var(--vscode-focusBorder); }
+    .input-wrapper:focus-within {
+      border-color: var(--vscode-focusBorder);
+    }
 
     textarea {
       flex: 1;
       background: transparent;
       color: var(--vscode-input-foreground);
       border: none;
-      padding: 8px 10px;
+      padding: 10px 12px;
       font-family: var(--vscode-font-family);
       font-size: 13px;
       resize: none;
-      min-height: 36px;
-      max-height: 160px;
+      min-height: 38px;
+      max-height: 180px;
       outline: none;
       line-height: 1.5;
     }
     textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
 
     #send-btn {
-      flex-shrink: 0;
-      width: 34px;
-      height: 34px;
+      width: 36px;
+      height: 36px;
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
       border: none;
-      border-radius: var(--radius-sm);
+      border-radius: 6px;
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
-      transition: opacity 0.15s;
+      flex-shrink: 0;
     }
-    #send-btn:hover { opacity: 0.85; }
+    #send-btn:hover { opacity: 0.9; }
     #send-btn.stop { background: var(--vscode-errorForeground); }
-    #send-btn svg { width: 15px; height: 15px; fill: currentColor; }
+    #send-btn svg { width: 16px; height: 16px; fill: currentColor; }
 
-    /* ── Quick-insert tag hints ── */
+    /* Tag hints */
     .tag-hints {
       display: flex;
-      gap: 6px;
+      gap: 8px;
       flex-wrap: wrap;
     }
     .tag-hint {
-      font-size: 10px;
-      padding: 2px 7px;
-      border-radius: 12px;
+      font-size: 11px;
+      padding: 3px 9px;
+      border-radius: 999px;
       background: var(--vscode-badge-background);
       color: var(--vscode-badge-foreground);
       cursor: pointer;
-      opacity: 0.75;
-      transition: opacity 0.15s;
-      user-select: none;
+      opacity: 0.85;
     }
     .tag-hint:hover { opacity: 1; }
   </style>
@@ -791,15 +792,16 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   </div>
 
   <div id="chat-history">
+    <!-- Initial welcome message stays here -->
     <div class="message assistant">
       <strong>👋 Hello! I'm CodePartner.</strong>
-      <p style="margin:8px 0 6px;">Use these tags in any message:</p>
-      <ul style="margin:0;padding-left:18px;">
-        <li><code>@web &lt;query&gt;</code> — search the internet</li>
-        <li><code>@workspace</code> — include repo structure</li>
-        <li><code>@filename</code> — inject a file's contents</li>
+      <p style="margin:10px 0 8px;">Quick tips:</p>
+      <ul style="margin:0 0 0 20px; padding:0;">
+        <li><code>@web &lt;query&gt;</code> — Search the web</li>
+        <li><code>@workspace</code> — Show project structure</li>
+        <li><code>@filename</code> — Pull in a file</li>
       </ul>
-      <p style="margin:8px 0 0;">I automatically read your active file &amp; selection!</p>
+      <p style="margin:10px 0 0;">I also automatically include your active file + selection.</p>
     </div>
   </div>
 
@@ -807,7 +809,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     <div id="status-text"></div>
     <div class="input-row">
       <div class="input-wrapper">
-        <textarea id="prompt-input" rows="1" placeholder="Ask anything… (@web, @workspace, @file)"></textarea>
+        <textarea id="prompt-input" rows="1" placeholder="Ask me anything... (@web, @workspace, @file)"></textarea>
       </div>
       <button id="send-btn" title="Send (Enter)">
         <svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>
@@ -821,15 +823,15 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   </div>
 
   <script>
-    const vscode       = acquireVsCodeApi();
-    const chatHistory  = document.getElementById('chat-history');
-    const promptInput  = document.getElementById('prompt-input');
-    const sendBtn      = document.getElementById('send-btn');
-    const statusText   = document.getElementById('status-text');
-    const clearBtn     = document.getElementById('clear-btn');
+    const vscode = acquireVsCodeApi();
+    const chatHistory = document.getElementById('chat-history');
+    const promptInput = document.getElementById('prompt-input');
+    const sendBtn = document.getElementById('send-btn');
+    const statusText = document.getElementById('status-text');
+    const clearBtn = document.getElementById('clear-btn');
 
     let currentDiv = null;
-    let isWaiting  = false;
+    let isWaiting = false;
 
     const SEND_ICON = '<svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>';
     const STOP_ICON = '<svg viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>';
@@ -845,11 +847,14 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     // Auto-grow textarea
     promptInput.addEventListener('input', function () {
       this.style.height = 'auto';
-      this.style.height = Math.min(this.scrollHeight, 160) + 'px';
+      this.style.height = Math.min(this.scrollHeight, 180) + 'px';
     });
 
     promptInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendPrompt();
+      }
     });
 
     sendBtn.addEventListener('click', () => {
@@ -857,7 +862,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({ type: 'cancel' });
         setWaiting(false);
         if (currentDiv) {
-          currentDiv.innerHTML += '<br><em style="opacity:.5;font-size:11px">(cancelled)</em>';
+          currentDiv.innerHTML += '<br><em style="opacity:0.6;font-size:12px">(cancelled)</em>';
           processCodeBlocks(currentDiv);
           currentDiv = null;
         }
@@ -868,7 +873,9 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
     clearBtn.addEventListener('click', () => {
       vscode.postMessage({ type: 'clearChat' });
-      while (chatHistory.children.length > 1) chatHistory.removeChild(chatHistory.lastChild);
+      while (chatHistory.children.length > 1) {
+        chatHistory.removeChild(chatHistory.lastChild);
+      }
     });
 
     function setWaiting(waiting) {
@@ -900,7 +907,6 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'prompt', value: text });
     }
 
-    // ── Code block enhancement ──────────────────────────────────────────────
     function getLang(pre) {
       const code = pre.querySelector('code');
       if (!code) return '';
@@ -911,8 +917,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     function processCodeBlocks(container) {
       container.querySelectorAll('pre:not([data-cp])').forEach(pre => {
         pre.setAttribute('data-cp', '1');
-
-        const lang    = getLang(pre);
+        const lang = getLang(pre);
         const rawCode = () => (pre.querySelector('code') || pre).innerText;
 
         const wrapper = document.createElement('div');
@@ -928,28 +933,26 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         const actions = document.createElement('div');
         actions.className = 'code-actions';
 
-        // Copy
         const copyBtn = makeBtn(
           '<svg viewBox="0 0 16 16"><path d="M4 4h8v1H4V4zm0 2h8v1H4V6zm0 2h5v1H4V8zm8-7H3L2 2v11l1 1h4v-1H3V2h8v1h1V2l-1-1zm2 4h-7l-1 1v8l1 1h7l1-1V6l-1-1zm0 9H6V6h7v9z"/></svg>',
-          'Copy', 'copy-lbl'
+          'Copy'
         );
         copyBtn.onclick = () => {
           vscode.postMessage({ type: 'copyCode', value: rawCode() });
-          copyBtn.querySelector('.copy-lbl').textContent = 'Copied!';
-          setTimeout(() => copyBtn.querySelector('.copy-lbl').textContent = 'Copy', 1500);
+          const lbl = copyBtn.querySelector('span');
+          if (lbl) lbl.textContent = 'Copied!';
+          setTimeout(() => { if (lbl) lbl.textContent = 'Copy'; }, 1500);
         };
 
-        // Insert
         const insertBtn = makeBtn(
           '<svg viewBox="0 0 16 16"><path d="M1 2h2v2H1V2zm0 4h2v2H1V6zm0 4h2v2H1v-2zm4-8h10v2H5V2zm0 4h10v2H5V6zm0 4h6v2H5v-2z"/></svg>',
-          'Insert', null
+          'Insert'
         );
         insertBtn.onclick = () => vscode.postMessage({ type: 'insertCode', value: rawCode() });
 
-        // Diff
         const diffBtn = makeBtn(
           '<svg viewBox="0 0 16 16"><path d="M6 3h4v2H6V3zm0 4h4v2H6V7zm0 4h4v2H6v-2zM2 3h3v2H2V3zm0 4h3v2H2V7zm0 4h3v2H2v-2zm9 0h3v2h-3v-2zm0-4h3v2h-3V7zm0-4h3v2h-3V3z"/></svg>',
-          'Diff', null
+          'Diff'
         );
         diffBtn.onclick = () => vscode.postMessage({ type: 'applyDiff', value: rawCode() });
 
@@ -962,15 +965,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    function makeBtn(iconSvg, label, labelClass) {
+    function makeBtn(iconSvg, label) {
       const btn = document.createElement('button');
       btn.className = 'code-btn';
-      const cls = labelClass ? \` class="\${labelClass}"\` : '';
-      btn.innerHTML = iconSvg + \`<span\${cls}>\${label}</span>\`;
+      btn.innerHTML = iconSvg + \`<span>\${label}</span>\`;
       return btn;
     }
 
-    // ── Message handling ────────────────────────────────────────────────────
     window.addEventListener('message', ({ data: msg }) => {
       switch (msg.type) {
         case 'status':
@@ -987,16 +988,16 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
         case 'done':
           setWaiting(false);
-          if (currentDiv) { processCodeBlocks(currentDiv); currentDiv = null; }
+          if (currentDiv) {
+            processCodeBlocks(currentDiv);
+            currentDiv = null;
+          }
           break;
 
         case 'error':
           setWaiting(false);
-          const target = currentDiv || (() => {
-            const d = document.createElement('div');
-            chatHistory.appendChild(d);
-            return d;
-          })();
+          const target = currentDiv || document.createElement('div');
+          if (!currentDiv) chatHistory.appendChild(target);
           target.innerHTML = msg.value;
           target.className = 'message error-msg';
           currentDiv = null;
@@ -1011,5 +1012,5 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   </script>
 </body>
 </html>`;
-  }
+}
 }
