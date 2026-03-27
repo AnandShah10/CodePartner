@@ -4,6 +4,20 @@ import { createParser } from "eventsource-parser";
 import MarkdownIt = require("markdown-it");
 import * as path from "path";
 
+class SingleContentProvider implements vscode.TextDocumentContentProvider {
+  private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+  readonly onDidChange: vscode.Event<vscode.Uri> = this._onDidChange.event;
+
+  constructor(private content: string) {}
+
+  provideTextDocumentContent(
+    uri: vscode.Uri,
+    token: vscode.CancellationToken
+  ): string {
+    return this.content;
+  }
+}
+
 const md = new MarkdownIt({ html: false, linkify: true, typographer: true });
 
 // ─── Diff Provider ────────────────────────────────────────────────────────────
@@ -32,7 +46,12 @@ const SYSTEM_PROMPT = `You are CodePartner, an expert AI coding assistant embedd
 You help users write, debug, refactor, and understand code.
 Always respond with clear, concise explanations and well-formatted code blocks.
 When showing code, always specify the language in the code fence.
-If the user shares code context or searches the web/workspace, analyze it completely.`;
+If the user shares code context or searches the web/workspace, analyze it completely.
+When the user asks to modify, refactor, fix, or update code:
+- Do **not** wrap it in "here is the updated code" explanations inside the code fence.
+- Always use proper markdown code fences with language.
+- Focus on minimal, precise changes when possible.
+-Only give code that is needed`;
 
 // ─── Activate ─────────────────────────────────────────────────────────────────
 export function activate(context: vscode.ExtensionContext) {
@@ -226,61 +245,82 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
   // ── Apply Directly: replace file/selection without diff view ───────────────
   private async applyDirectToEditor(aiCode: string) {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-      vscode.window.showErrorMessage("CodePartner: Open a file to apply changes.");
-      return;
-    }
-
-    const document = editor.document;
-    const selection = editor.selection;
-
-    if (!selection.isEmpty) {
-      // Replace selected region
-      await editor.edit((eb) => eb.replace(selection, aiCode));
-      vscode.window.showInformationMessage("CodePartner: Applied to selection.");
-    } else {
-      // Replace entire file content
-      const fullRange = new vscode.Range(
-        new vscode.Position(0, 0),
-        document.lineAt(document.lineCount - 1).range.end
-      );
-      await editor.edit((eb) => eb.replace(fullRange, aiCode));
-      vscode.window.showInformationMessage("CodePartner: Applied to file.");
-    }
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    vscode.window.showErrorMessage("CodePartner: No active editor.");
+    return;
   }
 
-  // ── Show Diff View (only for explicit review, not the default action) ───────
-  // The key fix: we only send CHANGED lines to the diff provider so VS Code
-  // correctly highlights only the lines that differ, not the whole file as green.
-  private async showDiffView(aiCode: string) {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-      vscode.window.showErrorMessage("CodePartner: Open a file to diff.");
-      return;
-    }
+  const document = editor.document;
+  const selection = editor.selection;
 
-    const document = editor.document;
-    const selection = editor.selection;
-    let proposedFullContent: string;
-
+  try {
     if (!selection.isEmpty) {
-      // Replace ONLY the selected region — keep everything else intact
-      const before = document.getText(
-        new vscode.Range(new vscode.Position(0, 0), selection.start)
-      );
-      const after = document.getText(
-        new vscode.Range(
-          selection.end,
-          document.lineAt(document.lineCount - 1).range.end
-        )
-      );
-      proposedFullContent = before + aiCode + after;
+      await editor.edit((editBuilder) => {
+        editBuilder.replace(selection, aiCode);
+      });
+      vscode.window.showInformationMessage("CodePartner: Applied to selection.");
     } else {
-      proposedFullContent = aiCode;
+      // Full file replacement
+      const fullRange = new vscode.Range(0, 0, document.lineCount, 0);
+      await editor.edit((editBuilder) => {
+        editBuilder.replace(fullRange, aiCode);
+      });
+      vscode.window.showInformationMessage("✅ CodePartner: File updated with AI changes.");
     }
+  } catch (err) {
+    vscode.window.showErrorMessage("Failed to apply changes: " + err);
+  }
+}
 
-    diffProvider.update(proposedFullContent);
+  // ── Show Proper Git-like Diff (Only real changes are highlighted) ─────────────
+private async showDiffView(aiCode: string) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    vscode.window.showErrorMessage("CodePartner: Open a file to review changes.");
+    return;
+  }
+
+  const document = editor.document;
+  const selection = editor.selection;
+  let originalContent: string;
+  let proposedContent: string;
+
+  if (!selection.isEmpty) {
+    // Only diff the selected region
+    originalContent = document.getText(selection);
+    proposedContent = aiCode;
+
+    // Create temporary URIs for diff
+    const originalUri = vscode.Uri.parse(`codepartner-diff:Original_Selection${path.extname(document.fileName)}`);
+    const proposedUri = vscode.Uri.parse(`codepartner-diff:Proposed_Selection${path.extname(document.fileName)}`);
+
+    // Register temporary providers for selection diff
+    const originalProvider = new SingleContentProvider(originalContent);
+    const proposedProvider = new SingleContentProvider(proposedContent);
+
+    const disposable1 = vscode.workspace.registerTextDocumentContentProvider("codepartner-diff", originalProvider);
+    const disposable2 = vscode.workspace.registerTextDocumentContentProvider("codepartner-diff", proposedProvider);
+
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      originalUri,
+      proposedUri,
+      "CodePartner: Review Changes (Selection) ← Original | AI Proposal →"
+    );
+
+    // Clean up after a short delay
+    setTimeout(() => {
+      disposable1.dispose();
+      disposable2.dispose();
+    }, 5000);
+
+  } else {
+    // Full file diff - only show real differences
+    originalContent = document.getText();
+    proposedContent = aiCode;
+
+    diffProvider.update(proposedContent);
 
     const originalUri = document.uri;
     const ext = path.extname(document.fileName) || ".txt";
@@ -292,9 +332,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       "vscode.diff",
       originalUri,
       proposedUri,
-      "CodePartner: Review Changes ← original | proposed →"
+      `CodePartner: Review Changes ← ${document.fileName} | AI Suggestion →`
     );
   }
+
+  vscode.window.showInformationMessage("Review the diff. Use the buttons in the diff editor to Accept or Revert changes.");
+}
+
 
   // ── @filename context ──────────────────────────────────────────────────────
   private async getFileMentionsContext(prompt: string): Promise<string> {
