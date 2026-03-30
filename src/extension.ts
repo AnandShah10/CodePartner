@@ -115,9 +115,11 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  const provider = new CodePartnerSidebarProvider(context.extensionUri, output);
+  const provider = new CodePartnerSidebarProvider(context, output);
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("codepartner-sidebar", provider)
+    vscode.window.registerWebviewViewProvider("codepartner-sidebar", provider, {
+      webviewOptions: { retainContextWhenHidden: true },
+    })
   );
 }
 
@@ -128,11 +130,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private messageHistory: any[] = [];
   private abortController?: AbortController;
+  private currentChatId: string;
 
   constructor(
-    private readonly _extensionUri: vscode.Uri,
+    private readonly context: vscode.ExtensionContext,
     private readonly output: vscode.OutputChannel
   ) {
+    this.currentChatId = Date.now().toString();
     this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
   }
 
@@ -144,9 +148,12 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     this._view = webviewView;
     webviewView.webview.options = {
       enableScripts: true,
-      localResourceRoots: [this._extensionUri],
+      localResourceRoots: [this.context.extensionUri],
     };
     webviewView.webview.html = this.getHtmlForWebview();
+    
+    // Send existing chats to webview on init
+    this.sendChatsToWebview();
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.type) {
@@ -174,10 +181,80 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
           this.smartInsertCode(data.value);
           break;
         case "clearChat":
-          this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+          this.newChat();
+          break;
+        case "loadChat":
+          this.loadChat(data.value);
+          break;
+        case "deleteChat":
+          this.deleteChat(data.value);
+          break;
+        case "listChats":
+          this.sendChatsToWebview();
           break;
       }
     });
+  }
+
+  private sendChatsToWebview() {
+    const chats = this.context.workspaceState.get<any[]>("cp-chats", []);
+    this._view?.webview.postMessage({ type: "chatHistory", value: chats });
+  }
+
+  private saveCurrentChat() {
+    const chats = this.context.workspaceState.get<any[]>("cp-chats", []);
+    const existingIndex = chats.findIndex(c => c.id === this.currentChatId);
+    
+    // Auto-generate title from first user message if not exists
+    let title = chats[existingIndex]?.title;
+    if (!title) {
+      const firstUserMsg = this.messageHistory.find(m => m.role === "user");
+      title = firstUserMsg ? (firstUserMsg.content.substring(0, 30) + "...") : "New Chat";
+    }
+
+    const updatedChat = {
+      id: this.currentChatId,
+      title: title,
+      messages: this.messageHistory,
+      timestamp: Date.now()
+    };
+
+    if (existingIndex > -1) {
+      chats[existingIndex] = updatedChat;
+    } else {
+      chats.unshift(updatedChat);
+    }
+    
+    this.context.workspaceState.update("cp-chats", chats.slice(0, 50)); // Keep last 50
+    this.sendChatsToWebview();
+  }
+
+  private loadChat(id: string) {
+    const chats = this.context.workspaceState.get<any[]>("cp-chats", []);
+    const chat = chats.find(c => c.id === id);
+    if (chat) {
+      this.currentChatId = chat.id;
+      this.messageHistory = chat.messages;
+      this._view?.webview.postMessage({ type: "loadMessages", value: this.messageHistory });
+    }
+  }
+
+  private deleteChat(id: string) {
+    let chats = this.context.workspaceState.get<any[]>("cp-chats", []);
+    chats = chats.filter(c => c.id !== id);
+    this.context.workspaceState.update("cp-chats", chats);
+    if (this.currentChatId === id) {
+      this.newChat();
+    } else {
+      this.sendChatsToWebview();
+    }
+  }
+
+  private newChat() {
+    this.currentChatId = Date.now().toString();
+    this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+    this._view?.webview.postMessage({ type: "loadMessages", value: [] });
+    this.sendChatsToWebview();
   }
 
   private async smartInsertCode(code: string) {
@@ -635,6 +712,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         break;
       } finally {
         this.abortController = undefined;
+        this.saveCurrentChat();
       }
     }
     this._view?.webview.postMessage({ type: "done" });
@@ -725,8 +803,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
   private getHtmlForWebview() {
     const webview = this._view!.webview;
-    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, "media", "main.js"));
-    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, "media", "main.css"));
+    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "main.js"));
+    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "main.css"));
 
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -744,24 +822,40 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         CodePartner
       </div>
       <div id="header-actions">
-        <button id="clear-btn" class="icon-btn" title="Clear conversation">
-          <svg viewBox="0 0 16 16"><path d="M10 3h3v1h-1v9l-1 1H4l-1-1V4H2V3h3V2a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v1zM9 2H6v1h3V2zM4 13h7V4H4v9zm2-8H5v7h1V5zm2 0H7v7h1V5zm2 0H9v7h1V5z"/></svg>
+        <button id="history-btn" class="icon-btn" title="Saved Chats">
+          <svg viewBox="0 0 16 16"><path d="M14.5 13.5V12a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v1.5a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5zM2 3V2a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1h1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3h1zm11 0V2H3v1h10zM2 12h12V4H2v8z"/></svg>
+        </button>
+        <button id="new-chat-btn" class="icon-btn" title="New Chat">
+          <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm3 8H9v2H7V9H5V7h2V5h2v2h2v2z"/></svg>
         </button>
       </div>
     </div>
-    <div id="chat-history"></div>
-    <div id="status-bar"><div id="status-text"></div></div>
-    <div id="input-outer">
-      <div id="input-container">
-        <textarea id="prompt-input" rows="1" placeholder="Ask me anything... (@web, @workspace, @file)"></textarea>
-        <div class="input-footer">
-          <div class="tag-hints">
-            <span class="tag-hint" onclick="insertTag('@web ')">@web</span>
-            <span class="tag-hint" onclick="insertTag('@workspace')">@workspace</span>
+
+    <div id="main-content">
+      <div id="history-panel" class="hidden">
+        <div class="panel-header">
+          <span>Saved Chats</span>
+          <button id="close-history" class="icon-btn" title="Close"><svg viewBox="0 0 16 16"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/></svg></button>
+        </div>
+        <div id="chat-list"></div>
+      </div>
+
+      <div id="chat-container">
+        <div id="chat-history"></div>
+        <div id="status-bar"><div id="status-text"></div></div>
+        <div id="input-outer">
+          <div id="input-container">
+            <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
+            <div class="input-footer">
+              <div class="tag-hints">
+                <span class="tag-hint" onclick="insertTag('@web ')">@web</span>
+                <span class="tag-hint" onclick="insertTag('@workspace')">@workspace</span>
+              </div>
+              <button id="send-btn" title="Send (Enter)">
+                <svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>
+              </button>
+            </div>
           </div>
-          <button id="send-btn" title="Send (Enter)">
-            <svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>
-          </button>
         </div>
       </div>
     </div>

@@ -4,7 +4,11 @@
   const promptInput = document.getElementById('prompt-input');
   const sendBtn = document.getElementById('send-btn');
   const statusText = document.getElementById('status-text');
-  const clearBtn = document.getElementById('clear-btn');
+  const historyBtn = document.getElementById('history-btn');
+  const newChatBtn = document.getElementById('new-chat-btn');
+  const closeHistoryBtn = document.getElementById('close-history');
+  const historyPanel = document.getElementById('history-panel');
+  const chatList = document.getElementById('chat-list');
 
   let currentAssistantMessageId = null;
   let isWaiting = false;
@@ -15,7 +19,8 @@
     APPLY: '<svg viewBox="0 0 16 16"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>',
     INSERT: '<svg viewBox="0 0 16 16"><path d="M1 2h2v2H1V2zm0 4h2v2H1V6zm0 4h2v2H1v-2zm4-8h10v2H5V2zm0 4h10v2H5V6zm0 4h6v2H5v-2z"/></svg>',
     COPY: '<svg viewBox="0 0 16 16"><path d="M4 4h8v1H4V4zm0 2h8v1H4V6zm0 2h5v1H4V8zm8-7H3L2 2v11l1 1h4v-1H3V2h8v1h1V2l-1-1zm2 4h-7l-1 1v8l1 1h7l1-1V6l-1-1zm0 9H6V6h7v9z"/></svg>',
-    DIFF: '<svg viewBox="0 0 16 16"><path d="M6 3h4v2H6V3zm0 4h4v2H6V7zm0 4h4v2H6v-2zM2 3h3v2H2V3zm0 4h3v2H2V7zm0 4h3v2H2v-2zm9 0h3v2h-3v-2zm0-4h3v2h-3V7zm0-4h3v2h-3V3z"/></svg>'
+    DIFF: '<svg viewBox="0 0 16 16"><path d="M6 3h4v2H6V3zm0 4h4v2H6V7zm0 4h4v2H6v-2zM2 3h3v2H2V3zm0 4h3v2H2V7zm0 4h3v2H2v-2zm9 0h3v2h-3v-2zm0-4h3v2h-3V7zm0-4h3v2h-3V3z"/></svg>',
+    TRASH: '<svg viewBox="0 0 16 16"><path d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM4.496 6.675a.75.75 0 1 0-1.492.15l.66 6.623C3.844 14.555 4.805 16 6.002 16h3.996c1.197 0 2.158-1.445 2.338-2.552l.66-6.623a.75.75 0 0 0-1.492-.15l-.66 6.623a.853.853 0 0 1-.845.727H6.002a.853.853 0 0 1-.845-.727l-.66-6.623zM6.75 1.5h2.5v1.5h-2.5V1.5z"/></svg>'
   };
 
   function scrollBottom() {
@@ -50,6 +55,72 @@
     return contentDiv;
   }
 
+  function renderChatList(chats) {
+    chatList.innerHTML = '';
+    chats.forEach(chat => {
+      const item = document.createElement('div');
+      item.className = 'chat-item';
+      
+      const title = document.createElement('div');
+      title.className = 'chat-item-title';
+      title.innerText = chat.title || 'Untitled Chat';
+      
+      const meta = document.createElement('div');
+      meta.className = 'chat-item-meta';
+      meta.innerText = new Date(chat.timestamp).toLocaleString();
+
+      const actions = document.createElement('div');
+      actions.style.display = 'flex';
+      actions.style.justifyContent = 'space-between';
+      actions.style.alignItems = 'center';
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'icon-btn';
+      deleteBtn.innerHTML = ICONS.TRASH;
+      deleteBtn.title = 'Delete chat';
+      deleteBtn.onclick = (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ type: 'deleteChat', value: chat.id });
+      };
+
+      item.onclick = () => {
+        vscode.postMessage({ type: 'loadChat', value: chat.id });
+        historyPanel.classList.add('hidden');
+      };
+
+      actions.append(title, deleteBtn);
+      item.append(actions, meta);
+      chatList.appendChild(item);
+    });
+  }
+
+  function loadMessages(messages) {
+    chatHistory.innerHTML = '';
+    messages.forEach(m => {
+      if (m.role === 'system') {
+        return;
+      }
+      const content = createMessage(m.role, m.content);
+      processCodeBlocks(content);
+    });
+    scrollBottom();
+  }
+
+  // UI Event Listeners
+  historyBtn.onclick = () => {
+    vscode.postMessage({ type: 'listChats' });
+    historyPanel.classList.remove('hidden');
+  };
+
+  closeHistoryBtn.onclick = () => {
+    historyPanel.classList.add('hidden');
+  };
+
+  newChatBtn.onclick = () => {
+    vscode.postMessage({ type: 'clearChat' });
+    historyPanel.classList.add('hidden');
+  };
+
   function insertTag(tag) {
     const pos = promptInput.selectionStart;
     const val = promptInput.value;
@@ -80,15 +151,6 @@
     } else {
       sendPrompt();
     }
-  });
-
-  // Handle Clear Chat
-  clearBtn.addEventListener('click', () => {
-    vscode.postMessage({ type: 'clearChat' });
-    while (chatHistory.children.length > 0) {
-      chatHistory.removeChild(chatHistory.lastChild);
-    }
-    createMessage('assistant', '<strong>👋 Hello! How can I help you today?</strong>');
   });
 
   function sendPrompt() {
@@ -190,15 +252,18 @@
         errDiv.innerHTML = `<div style="color: var(--vscode-errorForeground)">${msg.value}</div>`;
         currentAssistantMessageId = null;
         break;
+
+      case 'chatHistory':
+        renderChatList(msg.value);
+        break;
+
+      case 'loadMessages':
+        loadMessages(msg.value);
+        break;
     }
   });
 
   // Global functions for inline HTML
   window.insertTag = insertTag;
-
-  // Initial Greeting
-  if (chatHistory.children.length === 0) {
-    createMessage('assistant', '<strong>👋 Hello! I\'m CodePartner, your agentic assistant.</strong><p>I can help you build, debug, and understand code. Use <code>@web</code>, <code>@workspace</code>, or <code>@file</code> to provide context.</p>');
-  }
 
 })();
