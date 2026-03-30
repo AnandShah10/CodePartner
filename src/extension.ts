@@ -100,6 +100,17 @@ const TOOLS = [
       required: ["path", "content"],
     },
   },
+  {
+    name: "web_search",
+    description: "Search the web for information using DuckDuckGo.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The search query." },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 // ─── Activate ─────────────────────────────────────────────────────────────────
@@ -131,6 +142,9 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private messageHistory: any[] = [];
   private abortController?: AbortController;
   private currentChatId: string;
+  private modifiedFiles: Set<string> = new Set();
+  private fileBackups: Map<string, string> = new Map();
+  private fileChangeStats: Map<string, { added: number, removed: number }> = new Map();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -191,6 +205,18 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
           break;
         case "listChats":
           this.sendChatsToWebview();
+          break;
+        case "openFile":
+          this.openFileInEditor(data.value);
+          break;
+        case "showDiff":
+          this.showDiff(data.value);
+          break;
+        case "approveChanges":
+          this.approveChanges(data.value);
+          break;
+        case "rejectChanges":
+          this.rejectChanges(data.value);
           break;
       }
     });
@@ -255,6 +281,18 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
     this._view?.webview.postMessage({ type: "loadMessages", value: [] });
     this.sendChatsToWebview();
+  }
+
+  private async openFileInEditor(relPath: string) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return;
+    }
+    const fullPath = path.join(root, relPath);
+    if (fs.existsSync(fullPath)) {
+      const doc = await vscode.workspace.openTextDocument(fullPath);
+      await vscode.window.showTextDocument(doc);
+    }
   }
 
   private async smartInsertCode(code: string) {
@@ -578,6 +616,10 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const finalPrompt = contextHeader.length > 0 ? `${contextHeader}\n\nUser Question:\n${prompt}` : prompt;
     this.messageHistory.push({ role: "user", content: finalPrompt });
 
+    // Clear stats for the new message
+    this.fileChangeStats.clear();
+    this.modifiedFiles.clear();
+
     let iteration = 0;
     const maxIterations = 10;
 
@@ -585,7 +627,9 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       iteration++;
       this.abortController = new AbortController();
       let fullResponse = "";
+      let fullReasoning = "";
       let toolCalls: any[] = [];
+      this.modifiedFiles.clear();
 
       const endpoint = apiEndpoint.replace(/\/$/, "");
       let url = "";
@@ -641,6 +685,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
               if (!delta) {
                 return;
               }
+              if (delta.reasoning_content || delta.thought) {
+                const reasoning = delta.reasoning_content || delta.thought;
+                fullReasoning += reasoning;
+                this._view?.webview.postMessage({ type: "thought", value: md.render(fullReasoning) });
+              }
               if (delta.content) {
                 fullResponse += delta.content;
                 this._view?.webview.postMessage({ type: "partial", value: md.render(fullResponse) });
@@ -685,6 +734,14 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
             try {
               const args = JSON.parse(tc.function.arguments);
               result = await this.executeTool(tc.function.name, args);
+              if (tc.function.name === "edit_file" && !result.startsWith("Error")) {
+                this.modifiedFiles.add(args.path);
+                const stats = Array.from(this.modifiedFiles).map(f => ({
+                  path: f,
+                  ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
+                }));
+                this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
+              }
             } catch (e: any) {
               result = `Error executing tool: ${e.message}`;
             }
@@ -728,8 +785,10 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         return this.readFile(args.path);
       case "edit_file":
         return this.editFile(args.path, args.content);
+      case "web_search":
+        return this.getWebSearchContext(`@web ${args.query}`);
       default:
-        throw new Error(`Unknown tool: ${name}`);
+        return `Error: Tool not found: ${name}`;
     }
   }
 
@@ -783,10 +842,10 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private editFile(relPath: string, content: string): string {
+  private async editFile(relPath: string, content: string): Promise<string> {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
-      return "No workspace open.";
+      return "Error: No workspace folder open.";
     }
     const fullPath = path.join(root, relPath);
     try {
@@ -794,11 +853,83 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
+
+      let originalContent = "";
+      if (fs.existsSync(fullPath)) {
+        originalContent = fs.readFileSync(fullPath, "utf8");
+        // Back up for revert if not already backed up this session
+        if (!this.fileBackups.has(relPath)) {
+          this.fileBackups.set(relPath, originalContent);
+        }
+      }
+
+      // Simple line diff for summary
+      const oldLines = originalContent.split(/\r?\n/).filter(l => l.trim() !== "");
+      const newLines = content.split(/\r?\n/).filter(l => l.trim() !== "");
+      
+      const removed = oldLines.filter(l => !newLines.includes(l)).length;
+      const added = newLines.filter(l => !oldLines.includes(l)).length;
+
+      this.fileChangeStats.set(relPath, { added, removed });
+
       fs.writeFileSync(fullPath, content, "utf8");
-      return `Successfully updated ${relPath}`;
+      return `File ${relPath} updated successfully. +${added} -${removed} lines.`;
     } catch (e: any) {
-      return `Error updating file: ${e.message}`;
+      return `Error editing file: ${e.message}`;
     }
+  }
+
+  private async showDiff(relPath: string) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return;
+    }
+    const fullPath = path.join(root, relPath);
+    const original = this.fileBackups.get(relPath) || "";
+    
+    // Register temporary original content in diff provider
+    const originalUri = vscode.Uri.parse(`${CodePartnerDiffProvider.scheme}:Original/${path.basename(relPath)}`);
+    diffProvider.update(original);
+    
+    // Create new content provider for current file (or just use file:// uri)
+    const currentUri = vscode.Uri.file(fullPath);
+    
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      originalUri,
+      currentUri,
+      `${relPath} (Original ↔ Agentic Change)`
+    );
+  }
+
+  private async approveChanges(relPath: string) {
+    // Keep the changes, clear the backup
+    this.fileBackups.delete(relPath);
+    vscode.window.showInformationMessage(`Approved changes in ${relPath}.`);
+  }
+
+  private async rejectChanges(relPath: string) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root || !this.fileBackups.has(relPath)) {
+      return;
+    }
+    const fullPath = path.join(root, relPath);
+    const original = this.fileBackups.get(relPath)!;
+    
+    fs.writeFileSync(fullPath, original, "utf8");
+    this.fileBackups.delete(relPath);
+    
+    // Remove from modified files list
+    this.modifiedFiles.delete(relPath);
+    this.fileChangeStats.delete(relPath);
+    
+    const stats = Array.from(this.modifiedFiles).map(f => ({
+      path: f,
+      ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
+    }));
+    this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
+    
+    vscode.window.showWarningMessage(`Reverted changes in ${relPath}.`);
   }
 
   private getHtmlForWebview() {

@@ -475,6 +475,139 @@ textarea::-webkit-scrollbar { display: none; }
 
 .artifact-title { font-weight: 700; margin-bottom: 12px; font-size: 14px; }
 
+/* Thought Block Styles */
+.thought-container {
+  margin: 12px 0;
+  border-left: 3px solid var(--vscode-button-background);
+  background: rgba(var(--vscode-button-background-rgb, 0, 120, 212), 0.05);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.thought-header {
+  padding: 6px 12px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  opacity: 0.6;
+  background: rgba(var(--vscode-button-background-rgb, 0, 120, 212), 0.1);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.thought-content {
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--vscode-foreground);
+  opacity: 0.9;
+}
+
+.thought-content p { margin: 0 0 8px 0; }
+.thought-content p:last-child { margin-bottom: 0; }
+
+/* Modified Files Styles */
+.modified-files-container {
+  margin: 12px 0 4px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+}
+
+.modified-files-header {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  opacity: 0.5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.modified-files-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.file-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(var(--vscode-panel-border-rgb, 128, 128, 128), 0.1);
+}
+
+.file-row:last-child { border-bottom: none; }
+
+.file-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.file-name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground);
+}
+
+.file-name:hover { text-decoration: underline; }
+
+.file-stats {
+  display: flex;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.stat-add { color: var(--vscode-charts-green); }
+.stat-rem { color: var(--vscode-charts-red); }
+
+.file-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.action-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.6;
+  transition: var(--transition);
+}
+
+.action-btn:hover {
+  opacity: 1;
+  background: var(--vscode-toolbar-hoverBackground);
+}
+
+.action-btn.approve:hover { color: var(--vscode-charts-green); }
+.action-btn.reject:hover { color: var(--vscode-charts-red); }
+.action-btn svg { width: 14px; height: 14px; fill: currentColor; }
+
 .chat-item-meta {
   font-size: 10px;
   opacity: 0.6;
