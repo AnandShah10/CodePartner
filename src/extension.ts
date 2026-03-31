@@ -52,7 +52,8 @@ Follow this workflow:
 3. **Observe**: Review the tool output and adjust your plan.
 4. **Answer**: Provide the final result once the task is complete.
 
-Always use the provided tools for workspace interactions.`;
+Always use the provided tools for workspace interactions.
+IMPORTANT: Never truncate code. Provide complete, working, and correct code files or snippets. Do not use "//... rest of code" placeholders.`;
 
 const TOOLS = [
   {
@@ -144,6 +145,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private messageHistory: any[] = [];
   private abortController?: AbortController;
   private currentChatId: string;
+  private selectedModelId?: string;
+  private availableModels: any[] = [];
   private modifiedFiles: Set<string> = new Set();
   private fileBackups: Map<string, string> = new Map();
   private fileChangeStats: Map<string, { added: number, removed: number }> = new Map();
@@ -172,6 +175,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       
       // Send existing chats to webview on init
       this.sendChatsToWebview();
+      this.fetchModels();
       this.output.appendLine("[CodePartner] Webview view resolved successfully.");
     } catch (e: any) {
       this.output.appendLine(`[CodePartner] Error in resolveWebviewView: ${e.message}`);
@@ -180,8 +184,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.type) {
+        case "attachFiles":
+          this.handleAttachFiles();
+          break;
         case "prompt":
-          this.handlePrompt(data.value);
+          this.handlePrompt(data.value, data.attachments);
           break;
         case "cancel":
           if (this.abortController) {
@@ -211,6 +218,16 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
           break;
         case "deleteChat":
           this.deleteChat(data.value);
+          break;
+        case "renameChat":
+          this.renameChat(data.chatId, data.title);
+          break;
+        case "getSuggestions":
+          this.suggestFiles(data.value);
+          break;
+        case "changeModel":
+          this.selectedModelId = data.value;
+          this.output.appendLine(`[CodePartner] Model changed to: ${this.selectedModelId}`);
           break;
         case "listChats":
           this.sendChatsToWebview();
@@ -285,11 +302,156 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private renameChat(id: string, newTitle: string) {
+    const chats = this.context.workspaceState.get<any[]>("cp-chats", []);
+    const chat = chats.find(c => c.id === id);
+    if (chat) {
+      chat.title = newTitle;
+      this.context.workspaceState.update("cp-chats", chats);
+      this.sendChatsToWebview();
+    }
+  }
+
   private newChat() {
     this.currentChatId = Date.now().toString();
     this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
     this._view?.webview.postMessage({ type: "loadMessages", value: [] });
     this.sendChatsToWebview();
+  }
+
+  private async suggestFiles(query: string) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return;
+    }
+
+    const q = query.toLowerCase();
+    const suggestions: any[] = [
+      { label: "@web", detail: "Search the web", type: "special" },
+      { label: "@workspace", detail: "Entire workspace context", type: "special" },
+    ];
+
+    try {
+      // Find files
+      const files = await vscode.workspace.findFiles(
+        `**/*${q}*`,
+        "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}",
+        20
+      );
+
+      for (const f of files) {
+        suggestions.push({
+          label: "@" + vscode.workspace.asRelativePath(f),
+          detail: f.fsPath,
+          type: "file"
+        });
+      }
+
+      // Find folders (manual list shared root)
+      const dirs = fs.readdirSync(root, { withFileTypes: true })
+        .filter(d => d.isDirectory() && !d.name.startsWith(".") && d.name !== "node_modules");
+      
+      for (const d of dirs) {
+        if (d.name.toLowerCase().includes(q)) {
+          suggestions.push({
+            label: "@" + d.name + "/",
+            detail: "Folder",
+            type: "folder"
+          });
+        }
+      }
+
+    this._view?.webview.postMessage({ type: "suggestions", value: suggestions });
+    } catch {
+      // ignore
+    }
+  }
+
+  private async fetchModels() {
+    const config = vscode.workspace.getConfiguration("codepartner");
+    const provider = config.get<string>("provider") || "openai";
+    const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
+    const apiKey = config.get<string>("apiKey")?.trim() || "";
+    const currentModel = this.selectedModelId || config.get<string>("model") || "";
+
+    if (provider === "azure" || !apiEndpoint || !apiKey) {
+      // Azure doesn't easily list deployments via standard /models endpoint in many cases
+      // So we just use the current model or a common list
+      this.availableModels = [{ id: currentModel, name: currentModel }];
+      this.sendModelsToWebview(currentModel);
+      return;
+    }
+
+    try {
+      const res = await axios.get(`${apiEndpoint}/models`, {
+        headers: { "Authorization": `Bearer ${apiKey}` }
+      });
+      const models = res.data.data || res.data;
+      if (Array.isArray(models)) {
+        this.availableModels = models.map((m: any) => ({
+          id: m.id,
+          name: m.id
+        })).filter(m => m.id.includes("gpt") || m.id.includes("claude") || m.id.includes("gemini"));
+      } else {
+        this.availableModels = [{ id: currentModel, name: currentModel }];
+      }
+    } catch {
+      this.availableModels = [{ id: currentModel, name: currentModel }];
+    }
+    this.sendModelsToWebview(currentModel);
+  }
+
+  private sendModelsToWebview(selectedId: string) {
+    this._view?.webview.postMessage({
+      type: "models",
+      value: this.availableModels,
+      selected: selectedId
+    });
+  }
+
+  private async handleAttachFiles() {
+    const files = await vscode.window.showOpenDialog({
+      canSelectMany: true,
+      openLabel: "Attach",
+      filters: {
+        "All Files": ["*"],
+        "Images": ["png", "jpg", "jpeg", "gif", "webp"],
+        "Videos": ["mp4", "webm", "ogg"],
+        "Documents": ["pdf", "txt", "md"]
+      }
+    });
+
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    const attached = [];
+    for (const file of files) {
+      try {
+        const content = await fs.promises.readFile(file.fsPath);
+        const base64 = content.toString("base64");
+        const ext = path.extname(file.fsPath).toLowerCase().substring(1);
+        let mimeType = "application/octet-stream";
+        
+        if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
+          mimeType = `image/${ext === "jpg" ? "jpeg" : ext}`;
+        } else if (["mp4", "webm", "ogg"].includes(ext)) {
+          mimeType = `video/${ext}`;
+        } else if (ext === "pdf") {
+          mimeType = "application/pdf";
+        }
+
+        attached.push({
+          name: path.basename(file.fsPath),
+          mimeType,
+          data: base64
+        });
+      } catch (e: any) {
+        this.output.appendLine(`[CodePartner] Error reading file: ${e.message}`);
+      }
+    }
+
+    this._view?.webview.postMessage({ type: "fileAttached", value: attached });
   }
 
   private async openFileInEditor(relPath: string) {
@@ -580,7 +742,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async handlePrompt(prompt: string) {
+  private async handlePrompt(prompt: string, attachments: any[] = []) {
     if (!this._view) {
       return;
     }
@@ -589,10 +751,10 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
     const apiKey = config.get<string>("apiKey")?.trim() || "";
-    const modelId = config.get<string>("model")?.trim() || "";
+    const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
-    const maxTokens = config.get<number>("maxTokens") || 2048;
+    const maxTokens = config.get<number>("maxTokens") || 4096;
 
     if (!apiEndpoint || !apiKey || !modelId) {
       this._view.webview.postMessage({
@@ -622,8 +784,26 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    const finalPrompt = contextHeader.length > 0 ? `${contextHeader}\n\nUser Question:\n${prompt}` : prompt;
-    this.messageHistory.push({ role: "user", content: finalPrompt });
+    const finalPromptText = contextHeader.length > 0 ? `${contextHeader}\n\nUser Question:\n${prompt}` : prompt;
+    
+    // Construct multimodal content
+    const contentParts: any[] = [{ type: "text", text: finalPromptText }];
+    for (const att of attachments) {
+      if (att.mimeType.startsWith("image/")) {
+        contentParts.push({
+          type: "image_url",
+          image_url: { url: `data:${att.mimeType};base64,${att.data}` }
+        });
+      } else {
+        // For other files, we mention them or send as file parts if model supports
+        contentParts.push({
+          type: "text",
+          text: `\n[Attached File: ${att.name} (${att.mimeType})]\n(Non-image attachments are currently sent as metadata. Ensure your model supports ${att.mimeType} if you expect it to read the content.)`
+        });
+      }
+    }
+
+    this.messageHistory.push({ role: "user", content: attachments.length > 0 ? contentParts : finalPromptText });
 
     // Clear stats for the new message
     this.fileChangeStats.clear();
@@ -959,7 +1139,10 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     <div id="header">
       <div id="header-title">
         <svg class="logo" viewBox="0 0 16 16"><path fill="currentColor" d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 2a5 5 0 1 1 0 10A5 5 0 0 1 8 3zm-.5 2v3.25l2.6 1.5.5-.87L8.5 7.5V5h-1z"/></svg>
-        CodePartner
+        <span id="brand-name">CodePartner</span>
+        <select id="model-selector" title="Select Model">
+          <option value="">Loading models...</option>
+        </select>
       </div>
       <div id="header-actions">
         <button id="history-btn" class="icon-btn" title="Saved Chats">
@@ -984,12 +1167,15 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         <div id="chat-history"></div>
         <div id="status-bar"><div id="status-text"></div></div>
         <div id="input-outer">
+          <div id="suggestion-list" class="hidden"></div>
+          <div id="attachment-chips" class="hidden"></div>
           <div id="input-container">
             <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
             <div class="input-footer">
               <div class="tag-hints">
-                <span class="tag-hint" onclick="insertTag('@web ')">@web</span>
-                <span class="tag-hint" onclick="insertTag('@workspace')">@workspace</span>
+                <button id="attach-btn" class="icon-btn" title="Attach Files">
+                  <svg viewBox="0 0 16 16"><path d="M4.496 6.675l.66 6.623C5.336 14.445 6.297 16 7.494 16h4c1.197 0 2.158-1.445 2.338-2.552l.66-6.623a.75.75 0 0 0-1.492-.15l-.66 6.623a.853.853 0 0 1-.845.727H7.494a.853.853 0 0 1-.845-.727l-.66-6.623a.75.75 0 0 0-1.492-.15zM2.75 3.5h10.5a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5z"/></svg>
+                </button>
               </div>
               <button id="send-btn" title="Send (Enter)">
                 <svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>

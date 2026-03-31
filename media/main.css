@@ -76,6 +76,23 @@ html, body {
   filter: drop-shadow(0 0 8px rgba(var(--vscode-button-background-rgb, 0, 120, 212), 0.4));
 }
 
+#model-selector {
+  background: var(--vscode-dropdown-background);
+  color: var(--vscode-dropdown-foreground);
+  border: 1px solid var(--vscode-dropdown-border);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  padding: 2px 4px;
+  outline: none;
+  max-width: 120px;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+#model-selector:hover {
+  border-color: var(--vscode-focusBorder);
+}
+
 #header-actions {
   display: flex;
   gap: 8px;
@@ -280,6 +297,101 @@ pre {
   -webkit-backdrop-filter: blur(var(--blur));
   border-top: 1px solid rgba(var(--vscode-panel-border-rgb, 128, 128, 128), var(--border-opacity));
   flex-shrink: 0;
+  position: relative;
+}
+
+#suggestion-list {
+  position: absolute;
+  bottom: 100%;
+  left: 16px;
+  right: 16px;
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-focusBorder);
+  border-radius: var(--radius);
+  max-height: 240px;
+  overflow-y: auto;
+  box-shadow: var(--shadow-md);
+  margin-bottom: 8px;
+  z-index: 1000;
+}
+
+#suggestion-list.hidden { display: none; }
+
+.suggestion-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  transition: background 0.1s;
+}
+
+.suggestion-item:hover, .suggestion-item.selected {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.suggestion-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.suggestion-detail {
+  font-size: 10px;
+  opacity: 0.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--vscode-editor-background);
+  border-top: 1px solid var(--vscode-editorGroup-border);
+  border-radius: 8px 8px 0 0;
+  max-height: 100px;
+  overflow-y: auto;
+}
+
+#attachment-chips.hidden {
+  display: none;
+}
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+  border-radius: 4px;
+  font-size: 11px;
+  max-width: 150px;
+}
+
+.attachment-chip span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.attachment-chip .remove-btn {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  opacity: 0.7;
+}
+
+.attachment-chip .remove-btn:hover {
+  opacity: 1;
+}
+
+.attachment-chip svg {
+  width: 10px;
+  height: 10px;
 }
 
 #input-container {
@@ -472,6 +584,15 @@ textarea::-webkit-scrollbar { display: none; }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
+}
+
+.rename-input {
+  font-size: 12px;
+  font-family: inherit;
+  padding: 2px 4px;
+  border-radius: 4px;
+  outline: none;
 }
 
 .artifact-title { font-weight: 700; margin-bottom: 12px; font-size: 14px; }
