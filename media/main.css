@@ -118,7 +118,7 @@ html, body {
 .message {
   display: flex;
   flex-direction: column;
-  max-width: 90%;
+  max-width: 95%;
   animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   position: relative;
 }
@@ -129,15 +129,16 @@ html, body {
 }
 
 .message.user { align-self: flex-end; }
-.message.assistant { align-self: flex-start; width: 100%; }
+.message.assistant { align-self: flex-start; width: 100%; max-width: 100%; }
 
 .message-content {
-  padding: 12px 14px;
+  padding: clamp(8px, 2vw, 12px) clamp(10px, 3vw, 14px);
   border-radius: var(--radius);
   line-height: 1.6;
   word-wrap: break-word;
   overflow-wrap: anywhere;
   box-shadow: var(--shadow-sm);
+  font-size: clamp(12px, 1.1vw, 14px);
 }
 
 .user .message-content {

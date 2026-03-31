@@ -132,6 +132,8 @@ export function activate(context: vscode.ExtensionContext) {
       webviewOptions: { retainContextWhenHidden: true },
     })
   );
+
+  output.appendLine("CodePartner: Registered codepartner-sidebar provider.");
 }
 
 export function deactivate() {}
@@ -159,15 +161,22 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken
   ) {
-    this._view = webviewView;
-    webviewView.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [this.context.extensionUri],
-    };
-    webviewView.webview.html = this.getHtmlForWebview();
-    
-    // Send existing chats to webview on init
-    this.sendChatsToWebview();
+    this.output.appendLine("[CodePartner] Resolving webview view...");
+    try {
+      this._view = webviewView;
+      webviewView.webview.options = {
+        enableScripts: true,
+        localResourceRoots: [this.context.extensionUri],
+      };
+      webviewView.webview.html = this.getHtmlForWebview();
+      
+      // Send existing chats to webview on init
+      this.sendChatsToWebview();
+      this.output.appendLine("[CodePartner] Webview view resolved successfully.");
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] Error in resolveWebviewView: ${e.message}`);
+      vscode.window.showErrorMessage(`CodePartner Error: ${e.message}`);
+    }
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.type) {

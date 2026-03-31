@@ -179,7 +179,7 @@
         return;
       }
       const content = createMessage(m.role, m.content);
-      processCodeBlocks(content);
+      processCodeBlocks(content, m.role === 'assistant');
     });
     setWaiting(false);
     scrollBottom();
@@ -249,12 +249,18 @@
   }
 
   // Code Block Processing
-  function processCodeBlocks(container) {
+  function processCodeBlocks(container, isAssistant = false) {
     container.querySelectorAll('pre:not([data-cp])').forEach(pre => {
       pre.setAttribute('data-cp', '1');
       const code = (pre.querySelector('code') || pre).innerText;
       const lang = [...(pre.querySelector('code')?.classList || [])]
         .find(c => c.startsWith('language-'))?.replace('language-', '') || 'code';
+
+      // Only add actions to assistant messages and for blocks with more than 2 lines
+      const lineCount = code.trim().split('\n').length;
+      if (!isAssistant || lineCount < 3) {
+        return;
+      }
 
       const wrapper = document.createElement('div');
       wrapper.className = 'code-block-wrapper';
@@ -278,21 +284,29 @@
       applyBtn.onclick = () => {
         vscode.postMessage({ type: 'applyDirect', value: code });
         applyBtn.querySelector('span').innerText = 'Applied!';
-        setTimeout(() => applyBtn.querySelector('span').innerText = 'Apply', 2000);
+        setTimeout(() => {
+          applyBtn.querySelector('span').innerText = 'Apply';
+        }, 2000);
       };
 
       const insertBtn = makeBtn('INSERT', 'Insert', 'insert', 'Smart insert at cursor');
-      insertBtn.onclick = () => vscode.postMessage({ type: 'insertCode', value: code });
+      insertBtn.onclick = () => {
+        vscode.postMessage({ type: 'insertCode', value: code });
+      };
 
       const copyBtn = makeBtn('COPY', 'Copy', 'copy', 'Copy to clipboard');
       copyBtn.onclick = () => {
         vscode.postMessage({ type: 'copyCode', value: code });
         copyBtn.querySelector('span').innerText = 'Copied!';
-        setTimeout(() => copyBtn.querySelector('span').innerText = 'Copy', 2000);
+        setTimeout(() => {
+          copyBtn.querySelector('span').innerText = 'Copy';
+        }, 2000);
       };
 
       const diffBtn = makeBtn('DIFF', 'Diff', 'diff', 'Review changes (Diff)');
-      diffBtn.onclick = () => vscode.postMessage({ type: 'applyDiff', value: code });
+      diffBtn.onclick = () => {
+        vscode.postMessage({ type: 'applyDiff', value: code });
+      };
 
       actions.append(applyBtn, insertBtn, copyBtn, diffBtn);
       header.appendChild(actions);
@@ -323,7 +337,7 @@
       case 'partial':
         if (currentAssistantMessageId) {
           currentAssistantMessageId.innerHTML = msg.value;
-          processCodeBlocks(currentAssistantMessageId);
+          processCodeBlocks(currentAssistantMessageId, true);
           scrollBottom();
         }
         break;
@@ -331,7 +345,7 @@
       case 'done':
         setWaiting(false);
         if (currentAssistantMessageId) {
-          processCodeBlocks(currentAssistantMessageId);
+          processCodeBlocks(currentAssistantMessageId, true);
           currentAssistantMessageId = null;
           currentThoughtDiv = null;
         }
