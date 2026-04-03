@@ -1,5 +1,7 @@
 (function () {
   const vscode = acquireVsCodeApi();
+
+  const md = window.markdownit ? window.markdownit({ html: false, linkify: true, typographer: true }) : { render: (s) => `<p>${s.replace(/\n/g, '</p><p>')}</p>` };
   const chatHistory = document.getElementById('chat-history');
   const promptInput = document.getElementById('prompt-input');
   const sendBtn = document.getElementById('send-btn');
@@ -13,6 +15,10 @@
   const modelSelector = document.getElementById('model-selector');
   const attachBtn = document.getElementById('attach-btn');
   const attachmentChips = document.getElementById('attachment-chips');
+  const planList = document.getElementById('plan-list');
+  const artifactList = document.getElementById('artifact-list');
+  const tabBtns = document.querySelectorAll('.tab-btn');
+  const tabContents = document.querySelectorAll('.tab-content');
 
   let currentAssistantMessageId = null;
   let currentThoughtDiv = null;
@@ -73,6 +79,9 @@
           contentDiv.appendChild(img);
         }
       });
+    } else if (typeof content === 'string' && content) {
+      // Re-render markdown for loaded history messages so text doesn't merge
+      contentDiv.innerHTML = md.render(content);
     } else {
       contentDiv.innerHTML = content || (role === 'assistant' ? '<div class="spinner"></div>' : '');
     }
@@ -373,6 +382,115 @@
     promptInput.selectionStart = promptInput.selectionEnd = pos + tag.length;
   }
 
+  // --- Tab Management ---
+  tabBtns.forEach(btn => {
+    btn.onclick = () => {
+      const targetTab = btn.getAttribute('data-tab');
+      tabBtns.forEach(b => b.classList.toggle('active', b === btn));
+      tabContents.forEach(c => c.classList.toggle('active', c.id === `tab-${targetTab}`));
+    };
+  });
+
+  function renderPlan(tasks) {
+    planList.innerHTML = '';
+    if (!tasks || tasks.length === 0) {
+      planList.innerHTML = '<div class="empty-state">No active plan. Mention a complex task to generate one.</div>';
+      return;
+    }
+    tasks.forEach((task, index) => {
+      const item = document.createElement('div');
+      item.className = 'plan-item';
+      item.id = `plan-task-${index}`;
+      
+      const checkbox = document.createElement('div');
+      checkbox.className = 'plan-checkbox';
+      
+      const text = document.createElement('div');
+      text.className = 'plan-text';
+      
+      // Parse file mentions (@path/to/file)
+      const mentionRegex = /@([a-zA-Z0-9_\-./\\]+)/g;
+      let hasLink = false;
+      let firstLink = '';
+      
+      const parts = task.split(mentionRegex);
+      const matches = [...task.matchAll(mentionRegex)];
+      
+      let html = '';
+      let lastEnd = 0;
+      matches.forEach(match => {
+        html += task.slice(lastEnd, match.index);
+        html += `<span class="plan-mention">${match[0]}</span>`;
+        if (!hasLink) {
+          hasLink = true;
+          firstLink = match[1];
+        }
+        lastEnd = match.index + match[0].length;
+      });
+      html += task.slice(lastEnd);
+      text.innerHTML = html;
+      
+      item.appendChild(checkbox);
+      item.appendChild(text);
+
+      if (hasLink) {
+        const openBtn = document.createElement('button');
+        openBtn.className = 'plan-open-btn icon-btn';
+        openBtn.innerHTML = ICONS.FILE;
+        openBtn.title = `Open ${firstLink}`;
+        openBtn.onclick = (e) => {
+          e.stopPropagation();
+          vscode.postMessage({ type: 'openFile', value: firstLink });
+        };
+        item.appendChild(openBtn);
+      }
+
+      planList.appendChild(item);
+    });
+  }
+
+  function completeTask(index) {
+    const item = document.getElementById(`plan-task-${index}`);
+    if (item) {
+      const checkbox = item.querySelector('.plan-checkbox');
+      checkbox.classList.add('done');
+      item.style.opacity = '0.7';
+    }
+  }
+
+  function renderArtifact(art) {
+    // Remove empty state if present
+    const empty = artifactList.querySelector('.empty-state');
+    if (empty) {
+      artifactList.innerHTML = '';
+    }
+    
+    const card = document.createElement('div');
+    card.className = 'artifact-card';
+    // Use openAbsoluteFile for absolute paths from ArtifactRegistry
+    card.onclick = () => vscode.postMessage({ type: 'openAbsoluteFile', value: art.filePath });
+    card.title = 'Click to open file';
+    
+    const badge = document.createElement('div');
+    badge.className = 'artifact-type-badge';
+    badge.innerText = art.type;
+    
+    const title = document.createElement('div');
+    title.className = 'artifact-card-title';
+    title.innerText = art.title;
+    
+    const pathDiv = document.createElement('div');
+    pathDiv.className = 'artifact-card-path';
+    pathDiv.innerText = art.filePath ? art.filePath.split(/[\\/]/).pop() : '';
+    
+    const meta = document.createElement('div');
+    meta.className = 'artifact-card-meta';
+    meta.innerText = new Date(art.timestamp).toLocaleTimeString();
+    
+    card.append(badge, title, pathDiv, meta);
+    artifactList.prepend(card);
+  }
+
   // Handle Input Auto-resize and Suggestions
   promptInput.addEventListener('input', function () {
     this.style.height = 'auto';
@@ -561,7 +679,7 @@
       case 'error':
         setWaiting(false);
         const errDiv = currentAssistantMessageId || createMessage('assistant');
-        errDiv.innerHTML = `<div style="color: var(--vscode-errorForeground)">${msg.value}</div>`;
+        errDiv.innerHTML = `<div style="color: var(--vscode-errorForeground)">${md.render(msg.value)}</div>`;
         currentAssistantMessageId = null;
         currentThoughtDiv = null;
         break;
@@ -592,6 +710,23 @@
       case 'fileAttached':
         attachedFiles.push(...msg.value);
         renderAttachmentChips();
+        break;
+
+      case 'plan':
+        renderPlan(msg.value);
+        // Switch to plan tab automatically on first plan
+        const planTabBtn = document.querySelector('[data-tab="plan"]');
+        if (planTabBtn) {
+          planTabBtn.click();
+        }
+        break;
+
+      case 'artifact':
+        renderArtifact(msg.value);
+        break;
+
+      case 'completeTask':
+        completeTask(msg.value);
         break;
     }
   });

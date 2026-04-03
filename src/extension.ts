@@ -43,17 +43,139 @@ class CodePartnerDiffProvider implements vscode.TextDocumentContentProvider {
 
 const diffProvider = new CodePartnerDiffProvider();
 
-// ─── System Prompt ────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are CodePartner, an expert AI agentic assistant.
-You can use tools to interact with the system, run commands, and manage files.
-Follow this workflow:
-1. **Think**: Analyze the task and plan your steps.
-2. **Act**: Use a tool if needed.
-3. **Observe**: Review the tool output and adjust your plan.
-4. **Answer**: Provide the final result once the task is complete.
+// ─── Agent & Artifact Managers ────────────────────────────────────────────────
+interface SubAgentTask {
+  id: string;
+  agentType: string;
+  task: string;
+  status: "pending" | "running" | "done" | "error";
+  result?: string;
+}
 
-Always use the provided tools for workspace interactions.
-IMPORTANT: Never truncate code. Provide complete, working, and correct code files or snippets. Do not use "//... rest of code" placeholders.`;
+class ArtifactRegistry {
+  private artifacts: Map<string, any> = new Map();
+  private artifactDir: string;
+
+  constructor(private workspaceRoot: string) {
+    this.artifactDir = path.join(this.workspaceRoot, ".codepartner", "artifacts");
+    if (!fs.existsSync(this.artifactDir)) {
+      fs.mkdirSync(this.artifactDir, { recursive: true });
+    }
+  }
+
+  public create(title: string, content: string, type: string) {
+    const id = Date.now().toString();
+    const fileName = `${id}_${title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.${type === "code" ? "txt" : type === "markdown" ? "md" : "log"}`;
+    const filePath = path.join(this.artifactDir, fileName);
+
+    fs.writeFileSync(filePath, content, "utf8");
+
+    const artifact = { id, title, type, content, filePath, timestamp: Date.now() };
+    this.artifacts.set(id, artifact);
+    return artifact;
+  }
+
+  public getAll() {
+    return Array.from(this.artifacts.values());
+  }
+}
+
+class AgentManager {
+  private subagents: Map<string, SubAgentTask> = new Map();
+
+  public async dispatch(agentType: string, task: string, provider: CodePartnerSidebarProvider): Promise<string> {
+    const id = Math.random().toString(36).substring(7);
+    const subtask: SubAgentTask = { id, agentType, task, status: "pending" };
+    this.subagents.set(id, subtask);
+
+    provider.updateStatus(`Agent ${agentType} starting task: ${task.substring(0, 30)}...`);
+    subtask.status = "running";
+
+    // Simulate complex sub-agent logic (In reality, this would be a separate LLM call)
+    // For now, we'll use a basic internal prompt or delegate back to handlePrompt with a "subagent" flag
+    try {
+      const result = await provider.runInternalAgent(agentType, task);
+      subtask.status = "done";
+      subtask.result = result;
+      return result;
+    } catch (e: any) {
+      subtask.status = "error";
+      return `Error in sub-agent: ${e.message}`;
+    }
+  }
+}
+
+class BrowserManager {
+  private browser: any;
+
+  constructor(private workspaceRoot: string) {}
+
+  public async execute(action: string, url?: string, selector?: string, text?: string): Promise<string> {
+    const puppeteer = require("puppeteer-core");
+    const chromePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"; // Windows default
+
+    if (!this.browser) {
+      this.browser = await puppeteer.launch({
+        executablePath: chromePath,
+        headless: "new"
+      });
+    }
+
+    const page = await this.browser.newPage();
+    try {
+      if (action === "navigate" && url) {
+        await page.goto(url, { waitUntil: "networkidle2" });
+        const title = await page.title();
+        // @ts-ignore
+        const content = await page.evaluate(() => document.body.innerText.substring(0, 5000));
+        return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}`;
+      } else if (action === "screenshot" && url) {
+        await page.goto(url, { waitUntil: "networkidle2" });
+        const id = Date.now().toString();
+        const artifactDir = path.join(this.workspaceRoot, ".codepartner", "artifacts");
+        if (!fs.existsSync(artifactDir)) {
+          fs.mkdirSync(artifactDir, { recursive: true });
+        }
+        const fileName = `screenshot_${id}.png`;
+        const screenshotPath = path.join(artifactDir, fileName);
+        await page.screenshot({ path: screenshotPath });
+
+        // Add to artifacts
+        const artifact = {
+          id,
+          title: `Browser Screenshot: ${url}`,
+          type: "screenshot",
+          content: fileName,
+          filePath: screenshotPath,
+          timestamp: Date.now()
+        };
+        return JSON.stringify(artifact);
+      }
+      return `Action ${action} not implemented or missing URL.`;
+    } catch (e: any) {
+      return `Browser error: ${e.message}`;
+    } finally {
+      await page.close();
+    }
+  }
+}
+
+// ─── System Prompt ────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are CodePartner, a high-level agentic assistant capable of complex orchestration.
+Your workflow for every task involves:
+1. **Plan Phase**: For non-trivial requests, always start by generating a formal "Plan" (markdown list or JSON).
+2. **Execute Phase**: Dispatch specialized SubAgents for sub-tasks or use tools directly.
+3. **Artifact Phase**: Save meaningful code snippets, docs, or screenshots as "Artifacts".
+4. **Iterate**: Observe outcomes and refine the plan.
+
+Capabilities:
+- **Task Planning**: Break down complex requests into manageable tasks.
+- **Multi-Agent Orchestration**: Delegate to SubAgents (Researcher, CodeExpert, Tester) via tool.
+- **Browser Control**: Navigate and interact with the web directly.
+- **Artifacts**: Persistent storage for outputs.
+
+IMPORTANT: Always prioritize direct tool usage for local operations and SubAgents for parallelizable or deep-dive research.
+Never truncate code blocks. Provide full, working solutions.`;
 
 const TOOLS = [
   {
@@ -112,6 +234,47 @@ const TOOLS = [
       required: ["query"],
     },
   },
+  {
+    name: "call_subagent",
+    description: "Dispatch a specialized SubAgent for a concurrent sub-task.",
+    parameters: {
+      type: "object",
+      properties: {
+        agent_type: {
+          type: "string",
+          enum: ["researcher", "code_expert", "tester", "writer"],
+          description: "Type of specialized agent."
+        },
+        task: { type: "string", description: "Specific instruction for the sub-agent." },
+      },
+      required: ["agent_type", "task"],
+    },
+  },
+  {
+    name: "create_artifact",
+    description: "Record a code snippet, documentation, or result as an artifact for the user.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Description of the artifact." },
+        content: { type: "string", description: "The actual code or text." },
+        type: { type: "string", enum: ["code", "markdown", "log"], description: "Format of the artifact." },
+      },
+      required: ["title", "content", "type"],
+    },
+  },
+  {
+    name: "browser_control",
+    description: "Control a browser to navigate, search, and take screenshots.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["navigate", "screenshot"], description: "Action to perform." },
+        url: { type: "string", description: "Target URL." },
+      },
+      required: ["action", "url"],
+    },
+  },
 ];
 
 // ─── Activate ─────────────────────────────────────────────────────────────────
@@ -150,6 +313,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private modifiedFiles: Set<string> = new Set();
   private fileBackups: Map<string, string> = new Map();
   private fileChangeStats: Map<string, { added: number, removed: number }> = new Map();
+  private agentManager: AgentManager;
+  private artifactRegistry?: ArtifactRegistry;
+  private browserManager?: BrowserManager;
+  private currentPlan: string[] = [];
+  private currentArtifacts: any[] = [];
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -157,6 +325,41 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   ) {
     this.currentChatId = Date.now().toString();
     this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+    this.agentManager = new AgentManager();
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root) {
+      this.artifactRegistry = new ArtifactRegistry(root);
+      this.browserManager = new BrowserManager(root);
+    }
+  }
+
+  public updateStatus(msg: string) {
+    this._view?.webview.postMessage({ type: "status", value: msg });
+  }
+
+  public async runInternalAgent(agentType: string, task: string): Promise<string> {
+    // This is a specialized sub-call to the LLM
+    const config = vscode.workspace.getConfiguration("codepartner");
+    const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
+    const apiKey = config.get<string>("apiKey")?.trim() || "";
+    const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
+    const providerType = config.get<string>("provider") || "openai";
+    const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
+
+    const subPrompt = `You are a specialized SubAgent: ${agentType}.
+Your task is: ${task}
+Provide a concise, high-quality result. Do not use tools. Just answer.`;
+
+    const body = {
+      model: modelId,
+      messages: [{ role: "system", content: subPrompt }],
+      max_tokens: 2048,
+    };
+
+    const res = await axios.post(`${apiEndpoint}/chat/completions`, body, {
+      headers: { "Authorization": `Bearer ${apiKey}` }
+    });
+    return res.data.choices[0].message.content;
   }
 
   public resolveWebviewView(
@@ -172,7 +375,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         localResourceRoots: [this.context.extensionUri],
       };
       webviewView.webview.html = this.getHtmlForWebview();
-      
+
       // Send existing chats to webview on init
       this.sendChatsToWebview();
       this.fetchModels();
@@ -235,6 +438,9 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         case "openFile":
           this.openFileInEditor(data.value);
           break;
+        case "openAbsoluteFile":
+          this.openAbsoluteFileInEditor(data.value);
+          break;
         case "showDiff":
           this.showDiff(data.value);
           break;
@@ -256,7 +462,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private saveCurrentChat() {
     const chats = this.context.workspaceState.get<any[]>("cp-chats", []);
     const existingIndex = chats.findIndex(c => c.id === this.currentChatId);
-    
+
     // Auto-generate title from first user message if not exists
     let title = chats[existingIndex]?.title;
     if (!title) {
@@ -268,6 +474,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       id: this.currentChatId,
       title: title,
       messages: this.messageHistory,
+      plan: this.currentPlan,
+      artifacts: this.currentArtifacts,
       timestamp: Date.now()
     };
 
@@ -276,7 +484,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     } else {
       chats.unshift(updatedChat);
     }
-    
+
     this.context.workspaceState.update("cp-chats", chats.slice(0, 50)); // Keep last 50
     this.sendChatsToWebview();
   }
@@ -287,7 +495,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     if (chat) {
       this.currentChatId = chat.id;
       this.messageHistory = chat.messages;
+      this.currentPlan = chat.plan || [];
+      this.currentArtifacts = chat.artifacts || [];
       this._view?.webview.postMessage({ type: "loadMessages", value: this.messageHistory });
+      this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
+      this.currentArtifacts.forEach(a => this._view?.webview.postMessage({ type: "artifact", value: a }));
     }
   }
 
@@ -315,7 +527,10 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private newChat() {
     this.currentChatId = Date.now().toString();
     this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+    this.currentPlan = [];
+    this.currentArtifacts = [];
     this._view?.webview.postMessage({ type: "loadMessages", value: [] });
+    this._view?.webview.postMessage({ type: "plan", value: [] });
     this.sendChatsToWebview();
   }
 
@@ -350,7 +565,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       // Find folders (manual list shared root)
       const dirs = fs.readdirSync(root, { withFileTypes: true })
         .filter(d => d.isDirectory() && !d.name.startsWith(".") && d.name !== "node_modules");
-      
+
       for (const d of dirs) {
         if (d.name.toLowerCase().includes(q)) {
           suggestions.push({
@@ -361,7 +576,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         }
       }
 
-    this._view?.webview.postMessage({ type: "suggestions", value: suggestions });
+      this._view?.webview.postMessage({ type: "suggestions", value: suggestions });
     } catch {
       // ignore
     }
@@ -432,7 +647,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         const base64 = content.toString("base64");
         const ext = path.extname(file.fsPath).toLowerCase().substring(1);
         let mimeType = "application/octet-stream";
-        
+
         if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
           mimeType = `image/${ext === "jpg" ? "jpeg" : ext}`;
         } else if (["mp4", "webm", "ogg"].includes(ext)) {
@@ -463,6 +678,28 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     if (fs.existsSync(fullPath)) {
       const doc = await vscode.workspace.openTextDocument(fullPath);
       await vscode.window.showTextDocument(doc);
+    } else {
+      // Try as absolute path
+      if (fs.existsSync(relPath)) {
+        const doc = await vscode.workspace.openTextDocument(relPath);
+        await vscode.window.showTextDocument(doc);
+      }
+    }
+  }
+
+  private async openAbsoluteFileInEditor(absolutePath: string) {
+    if (!absolutePath) {
+      return;
+    }
+    try {
+      if (fs.existsSync(absolutePath)) {
+        const doc = await vscode.workspace.openTextDocument(absolutePath);
+        await vscode.window.showTextDocument(doc);
+      } else {
+        vscode.window.showWarningMessage(`CodePartner: File not found: ${absolutePath}`);
+      }
+    } catch (e: any) {
+      vscode.window.showErrorMessage(`CodePartner: Cannot open file: ${e.message}`);
     }
   }
 
@@ -785,7 +1022,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
 
     const finalPromptText = contextHeader.length > 0 ? `${contextHeader}\n\nUser Question:\n${prompt}` : prompt;
-    
+
     // Construct multimodal content
     const contentParts: any[] = [{ type: "text", text: finalPromptText }];
     for (const att of attachments) {
@@ -840,7 +1077,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
           if (m.tool_call_id) {
             msg.tool_call_id = m.tool_call_id;
           }
-          if (m.name) {
+          if (m.name && msg.role !== "tool") {
             msg.name = m.name;
           }
           return msg;
@@ -852,16 +1089,16 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         tool_choice: "auto",
       };
       if (providerType !== "azure") {
-      body.model = modelId;
-    }
+        body.model = modelId;
+      }
 
       this._view.webview.postMessage({ type: "status", value: iteration === 1 ? "Thinking..." : "Refining..." });
 
       try {
-        const response = await axios.post(url, body, { 
-          headers, 
-          responseType: "stream", 
-          signal: this.abortController.signal 
+        const response = await axios.post(url, body, {
+          headers,
+          responseType: "stream",
+          signal: this.abortController.signal
         });
         const parser = createParser({
           onEvent: (event) => {
@@ -912,6 +1149,16 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
           response.data.on("error", reject);
         });
 
+        // Extract and send plan if present
+        if (iteration === 1) {
+          const planMatch = fullResponse.match(/(?:^|\n)(?:Plan|Tasks?|Todo):\s*\n?((?:[-*]\s*.*(?:\n|$))+)/i);
+          if (planMatch) {
+            const plan = planMatch[1].trim().split("\n").map(line => line.replace(/^[-*]\s*/, "").trim());
+            this.currentPlan = plan;
+            this._view?.webview.postMessage({ type: "plan", value: plan });
+          }
+        }
+
         if (toolCalls.length > 0) {
           const assistantMessage = { role: "assistant", content: fullResponse || null, tool_calls: toolCalls };
           this.messageHistory.push(assistantMessage);
@@ -923,6 +1170,10 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
             try {
               const args = JSON.parse(tc.function.arguments);
               result = await this.executeTool(tc.function.name, args);
+
+              // Map tool completion to plan tasks (progressive)
+              this._view?.webview.postMessage({ type: "completeTask", value: iteration - 1 });
+
               if (tc.function.name === "edit_file" && !result.startsWith("Error")) {
                 this.modifiedFiles.add(args.path);
                 const stats = Array.from(this.modifiedFiles).map(f => ({
@@ -976,6 +1227,28 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         return this.editFile(args.path, args.content);
       case "web_search":
         return this.getWebSearchContext(`@web ${args.query}`);
+      case "call_subagent":
+        return this.agentManager.dispatch(args.agent_type, args.task, this);
+      case "create_artifact":
+        if (this.artifactRegistry) {
+          const art = this.artifactRegistry.create(args.title, args.content, args.type);
+          this.currentArtifacts.push(art);
+          this._view?.webview.postMessage({ type: "artifact", value: art });
+          return `Artifact created: ${art.title} (ID: ${art.id})`;
+        }
+        return "Error: Workspace not open, cannot create artifact.";
+      case "browser_control":
+        if (!this.browserManager) {
+          return "Error: Workspace not open, browser control disabled.";
+        }
+        const result = await this.browserManager.execute(args.action, args.url);
+        if (args.action === "screenshot" && !result.startsWith("Error")) {
+          const art = JSON.parse(result);
+          this.currentArtifacts.push(art);
+          this._view?.webview.postMessage({ type: "artifact", value: art });
+          return `Screenshot artifact created: ${art.title}`;
+        }
+        return result;
       default:
         return `Error: Tool not found: ${name}`;
     }
@@ -1055,7 +1328,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       // Simple line diff for summary
       const oldLines = originalContent.split(/\r?\n/).filter(l => l.trim() !== "");
       const newLines = content.split(/\r?\n/).filter(l => l.trim() !== "");
-      
+
       const removed = oldLines.filter(l => !newLines.includes(l)).length;
       const added = newLines.filter(l => !oldLines.includes(l)).length;
 
@@ -1075,14 +1348,14 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
     const fullPath = path.join(root, relPath);
     const original = this.fileBackups.get(relPath) || "";
-    
+
     // Register temporary original content in diff provider
     const originalUri = vscode.Uri.parse(`${CodePartnerDiffProvider.scheme}:Original/${path.basename(relPath)}`);
     diffProvider.update(original);
-    
+
     // Create new content provider for current file (or just use file:// uri)
     const currentUri = vscode.Uri.file(fullPath);
-    
+
     await vscode.commands.executeCommand(
       "vscode.diff",
       originalUri,
@@ -1104,20 +1377,20 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     }
     const fullPath = path.join(root, relPath);
     const original = this.fileBackups.get(relPath)!;
-    
+
     fs.writeFileSync(fullPath, original, "utf8");
     this.fileBackups.delete(relPath);
-    
+
     // Remove from modified files list
     this.modifiedFiles.delete(relPath);
     this.fileChangeStats.delete(relPath);
-    
+
     const stats = Array.from(this.modifiedFiles).map(f => ({
       path: f,
       ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
     }));
     this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
-    
+
     vscode.window.showWarningMessage(`Reverted changes in ${relPath}.`);
   }
 
@@ -1131,6 +1404,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src ${webview.cspSource}; img-src ${webview.cspSource} data:;" />
   <link href="${styleUri}" rel="stylesheet" />
   <title>CodePartner</title>
 </head>
@@ -1154,6 +1428,12 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
 
+    <div id="tab-bar">
+      <button class="tab-btn active" data-tab="chat">Chat</button>
+      <button class="tab-btn" data-tab="plan">Plan</button>
+      <button class="tab-btn" data-tab="artifacts">Artifacts</button>
+    </div>
+
     <div id="main-content">
       <div id="history-panel" class="hidden">
         <div class="panel-header">
@@ -1163,29 +1443,46 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         <div id="chat-list"></div>
       </div>
 
-      <div id="chat-container">
-        <div id="chat-history"></div>
-        <div id="status-bar"><div id="status-text"></div></div>
-        <div id="input-outer">
-          <div id="suggestion-list" class="hidden"></div>
-          <div id="attachment-chips" class="hidden"></div>
-          <div id="input-container">
-            <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
-            <div class="input-footer">
-              <div class="tag-hints">
-                <button id="attach-btn" class="icon-btn" title="Attach Files">
-                  <svg viewBox="0 0 16 16"><path d="M4.496 6.675l.66 6.623C5.336 14.445 6.297 16 7.494 16h4c1.197 0 2.158-1.445 2.338-2.552l.66-6.623a.75.75 0 0 0-1.492-.15l-.66 6.623a.853.853 0 0 1-.845.727H7.494a.853.853 0 0 1-.845-.727l-.66-6.623a.75.75 0 0 0-1.492-.15zM2.75 3.5h10.5a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5z"/></svg>
+      <div id="tab-chat" class="tab-content active">
+        <div id="chat-container">
+          <div id="chat-history"></div>
+          <div id="status-bar"><div id="status-text"></div></div>
+          <div id="input-outer">
+            <div id="suggestion-list" class="hidden"></div>
+            <div id="attachment-chips" class="hidden"></div>
+            <div id="input-container">
+              <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
+              <div class="input-footer">
+                <div class="tag-hints">
+                  <button id="attach-btn" class="icon-btn" title="Attach Files">
+                    <svg viewBox="0 0 16 16"><path d="M4.496 6.675l.66 6.623C5.336 14.445 6.297 16 7.494 16h4c1.197 0 2.158-1.445 2.338-2.552l.66-6.623a.75.75 0 0 0-1.492-.15l-.66 6.623a.853.853 0 0 1-.845.727H7.494a.853.853 0 0 1-.845-.727l-.66-6.623a.75.75 0 0 0-1.492-.15zM2.75 3.5h10.5a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5z"/></svg>
+                  </button>
+                </div>
+                <button id="send-btn" title="Send (Enter)">
+                  <svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>
                 </button>
               </div>
-              <button id="send-btn" title="Send (Enter)">
-                <svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>
-              </button>
             </div>
           </div>
         </div>
       </div>
+
+      <div id="tab-plan" class="tab-content">
+        <div class="pane-header">Project Roadmap</div>
+        <div id="plan-list">
+          <div class="empty-state">No active plan. Mention a complex task to generate one.</div>
+        </div>
+      </div>
+
+      <div id="tab-artifacts" class="tab-content">
+        <div class="pane-header">Stored Artifacts</div>
+        <div id="artifact-list">
+          <div class="empty-state">No artifacts created yet.</div>
+        </div>
+      </div>
     </div>
   </div>
+  <script src="${webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'markdown-it.min.js'))}"></script>
   <script src="${scriptUri}"></script>
 </body>
 </html>`;
