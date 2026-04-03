@@ -312,7 +312,9 @@
       const opt = document.createElement('option');
       opt.value = m.id;
       opt.innerText = m.name || m.id;
-      if (m.id === selected) opt.selected = true;
+      if (m.id === selected) {
+        opt.selected = true;
+      }
       modelSelector.appendChild(opt);
     });
   }
@@ -397,13 +399,24 @@
       planList.innerHTML = '<div class="empty-state">No active plan. Mention a complex task to generate one.</div>';
       return;
     }
-    tasks.forEach((task, index) => {
+    tasks.forEach((taskObj, index) => {
+      const task = typeof taskObj === 'string' ? taskObj : taskObj.task;
+      const isDone = taskObj.done || false;
+
       const item = document.createElement('div');
       item.className = 'plan-item';
+      if (isDone) {
+        item.style.opacity = '0.7';
+      }
       item.id = `plan-task-${index}`;
       
       const checkbox = document.createElement('div');
-      checkbox.className = 'plan-checkbox';
+      checkbox.className = `plan-checkbox${isDone ? ' done' : ''}`;
+      checkbox.onclick = () => {
+        if (!checkbox.classList.contains('done')) {
+          completeTask(index);
+        }
+      };
       
       const text = document.createElement('div');
       text.className = 'plan-text';
@@ -413,7 +426,6 @@
       let hasLink = false;
       let firstLink = '';
       
-      const parts = task.split(mentionRegex);
       const matches = [...task.matchAll(mentionRegex)];
       
       let html = '';
@@ -453,8 +465,11 @@
     const item = document.getElementById(`plan-task-${index}`);
     if (item) {
       const checkbox = item.querySelector('.plan-checkbox');
-      checkbox.classList.add('done');
-      item.style.opacity = '0.7';
+      if (!checkbox.classList.contains('done')) {
+        checkbox.classList.add('done');
+        item.style.opacity = '0.7';
+        vscode.postMessage({ type: 'completeTask', value: index });
+      }
     }
   }
 
@@ -726,7 +741,13 @@
         break;
 
       case 'completeTask':
-        completeTask(msg.value);
+        // local UI update only
+        const item = document.getElementById(`plan-task-${msg.value}`);
+        if (item) {
+          const checkbox = item.querySelector('.plan-checkbox');
+          checkbox.classList.add('done');
+          item.style.opacity = '0.7';
+        }
         break;
     }
   });

@@ -68,7 +68,11 @@ class ArtifactRegistry {
     const fileName = `${id}_${title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.${type === "code" ? "txt" : type === "markdown" ? "md" : "log"}`;
     const filePath = path.join(this.artifactDir, fileName);
 
+    if (!fs.existsSync(this.artifactDir)) {
+      fs.mkdirSync(this.artifactDir, { recursive: true });
+    }
     fs.writeFileSync(filePath, content, "utf8");
+    console.log(`[ArtifactRegistry] Saved artifact to: ${filePath}`);
 
     const artifact = { id, title, type, content, filePath, timestamp: Date.now() };
     this.artifacts.set(id, artifact);
@@ -298,6 +302,12 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   output.appendLine("CodePartner: Registered codepartner-sidebar provider.");
+  
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.focus", () => {
+      vscode.commands.executeCommand("workbench.view.extension.codepartner-view-container");
+    })
+  );
 }
 
 export function deactivate() {}
@@ -316,7 +326,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private agentManager: AgentManager;
   private artifactRegistry?: ArtifactRegistry;
   private browserManager?: BrowserManager;
-  private currentPlan: string[] = [];
+  private currentPlan: { task: string, done: boolean }[] = [];
   private currentArtifacts: any[] = [];
 
   constructor(
@@ -330,6 +340,19 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     if (root) {
       this.artifactRegistry = new ArtifactRegistry(root);
       this.browserManager = new BrowserManager(root);
+    }
+
+    // Try to restore last chat
+    const lastChatId = this.context.workspaceState.get<string>("cp-last-chat-id");
+    if (lastChatId) {
+      this.currentChatId = lastChatId;
+      const chats = this.context.workspaceState.get<any[]>("cp-chats", []);
+      const chat = chats.find(c => c.id === lastChatId);
+      if (chat) {
+        this.messageHistory = chat.messages;
+        this.currentPlan = chat.plan || [];
+        this.currentArtifacts = chat.artifacts || [];
+      }
     }
   }
 
@@ -379,6 +402,14 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       // Send existing chats to webview on init
       this.sendChatsToWebview();
       this.fetchModels();
+
+      // Send current state to webview
+      if (this.messageHistory.length > 1) {
+        this._view?.webview.postMessage({ type: "loadMessages", value: this.messageHistory });
+        this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
+        this.currentArtifacts.forEach(a => this._view?.webview.postMessage({ type: "artifact", value: a }));
+      }
+
       this.output.appendLine("[CodePartner] Webview view resolved successfully.");
     } catch (e: any) {
       this.output.appendLine(`[CodePartner] Error in resolveWebviewView: ${e.message}`);
@@ -450,6 +481,12 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         case "rejectChanges":
           this.rejectChanges(data.value);
           break;
+        case "completeTask":
+          if (this.currentPlan[data.value]) {
+            this.currentPlan[data.value].done = true;
+            this.saveCurrentChat();
+          }
+          break;
       }
     });
   }
@@ -486,10 +523,16 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     }
 
     this.context.workspaceState.update("cp-chats", chats.slice(0, 50)); // Keep last 50
+    this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
     this.sendChatsToWebview();
   }
 
   private loadChat(id: string) {
+    // Save current if it has history
+    if (this.messageHistory.length > 1) {
+      this.saveCurrentChat();
+    }
+
     const chats = this.context.workspaceState.get<any[]>("cp-chats", []);
     const chat = chats.find(c => c.id === id);
     if (chat) {
@@ -500,6 +543,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       this._view?.webview.postMessage({ type: "loadMessages", value: this.messageHistory });
       this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
       this.currentArtifacts.forEach(a => this._view?.webview.postMessage({ type: "artifact", value: a }));
+      this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
     }
   }
 
@@ -525,12 +569,18 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
   }
 
   private newChat() {
+    // Save current if it has history
+    if (this.messageHistory.length > 1) {
+      this.saveCurrentChat();
+    }
+
     this.currentChatId = Date.now().toString();
     this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
     this.currentPlan = [];
     this.currentArtifacts = [];
     this._view?.webview.postMessage({ type: "loadMessages", value: [] });
     this._view?.webview.postMessage({ type: "plan", value: [] });
+    this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
     this.sendChatsToWebview();
   }
 
@@ -587,13 +637,31 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     const provider = config.get<string>("provider") || "openai";
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
     const apiKey = config.get<string>("apiKey")?.trim() || "";
-    const currentModel = this.selectedModelId || config.get<string>("model") || "";
+    let currentModel = this.selectedModelId || config.get<string>("model") || "";
 
-    if (provider === "azure" || !apiEndpoint || !apiKey) {
-      // Azure doesn't easily list deployments via standard /models endpoint in many cases
-      // So we just use the current model or a common list
-      this.availableModels = [{ id: currentModel, name: currentModel }];
+    if (provider === "azure") {
+      const deployments = config.get<string[]>("azureDeployments") || [];
+      this.availableModels = deployments.map(d => ({ id: d, name: d }));
+      
+      // If none set, fallback to current or default
+      if (this.availableModels.length === 0) {
+        this.availableModels = [{ id: currentModel || "gpt-4o", name: currentModel || "gpt-4o" }];
+      }
+      
+      // Ensure current is in the list
+      if (currentModel && !this.availableModels.find(m => m.id === currentModel)) {
+        this.availableModels.unshift({ id: currentModel, name: currentModel });
+      } else if (!currentModel) {
+        currentModel = this.availableModels[0].id;
+      }
+      
       this.sendModelsToWebview(currentModel);
+      return;
+    }
+
+    if (!apiEndpoint || !apiKey) {
+      this.availableModels = [{ id: currentModel || "gpt-4", name: currentModel || "gpt-4" }];
+      this.sendModelsToWebview(currentModel || "gpt-4");
       return;
     }
 
@@ -601,17 +669,29 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       const res = await axios.get(`${apiEndpoint}/models`, {
         headers: { "Authorization": `Bearer ${apiKey}` }
       });
-      const models = res.data.data || res.data;
+      let models = res.data.data || res.data;
       if (Array.isArray(models)) {
+        // Multi-provider compatibility (Ollama, LM Studio, etc.)
         this.availableModels = models.map((m: any) => ({
-          id: m.id,
-          name: m.id
-        })).filter(m => m.id.includes("gpt") || m.id.includes("claude") || m.id.includes("gemini"));
+          id: typeof m === "string" ? m : m.id,
+          name: typeof m === "string" ? m : (m.id || m.name)
+        }));
+        
+        // Slightly smarter filter: prefer LLMs over embeddings if many exist
+        const llmKeywords = ["gpt", "claude", "gemini", "llama", "mistral", "phi"];
+        const filtered = this.availableModels.filter(m => llmKeywords.some(kw => m.id.toLowerCase().includes(kw)));
+        if (filtered.length > 0) {
+          this.availableModels = filtered;
+        }
       } else {
-        this.availableModels = [{ id: currentModel, name: currentModel }];
+        this.availableModels = [{ id: currentModel || "gpt-4", name: currentModel || "gpt-4" }];
       }
     } catch {
-      this.availableModels = [{ id: currentModel, name: currentModel }];
+      this.availableModels = [{ id: currentModel || "gpt-4", name: currentModel || "gpt-4" }];
+    }
+
+    if (!currentModel && this.availableModels.length > 0) {
+      currentModel = this.availableModels[0].id;
     }
     this.sendModelsToWebview(currentModel);
   }
@@ -1151,11 +1231,17 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
         // Extract and send plan if present
         if (iteration === 1) {
-          const planMatch = fullResponse.match(/(?:^|\n)(?:Plan|Tasks?|Todo):\s*\n?((?:[-*]\s*.*(?:\n|$))+)/i);
+          const planRegex = /(?:^|\n)(?:Plan|Tasks?|Todo|Roadmap):\s*\n?((?:(?:[*-]|\d+\.)\s*.*(?:\n|$))+)/i;
+          const planMatch = fullResponse.match(planRegex);
           if (planMatch) {
-            const plan = planMatch[1].trim().split("\n").map(line => line.replace(/^[-*]\s*/, "").trim());
-            this.currentPlan = plan;
-            this._view?.webview.postMessage({ type: "plan", value: plan });
+            const planTextLines = planMatch[1].trim().split("\n");
+            const newPlan = planTextLines
+              .map(line => line.replace(/^[*-]|\d+\.\s*/, "").trim())
+              .filter(t => t.length > 0)
+              .map(t => ({ task: t, done: false }));
+            
+            this.currentPlan = newPlan;
+            this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
           }
         }
 

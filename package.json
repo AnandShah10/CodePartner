@@ -2,7 +2,12 @@
   "name": "codepartner",
   "displayName": "CodePartner",
   "description": "A user-friendly AI co-pilot to help build code, find bugs, and give solutions.",
+  "publisher": "AnandShah",
   "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AnandShah10/CodePartner.git"
+  },
   "engines": {
     "vscode": "^1.86.0"
   },
@@ -17,8 +22,9 @@
   "contributes": {
     "commands": [
       {
-        "command": "codepartner.helloWorld",
-        "title": "Hello World"
+        "command": "codepartner.focus",
+        "title": "CodePartner: Focus on Chat Sidebar",
+        "icon": "$(robot)"
       }
     ],
     "viewsContainers": {
@@ -77,6 +83,12 @@
           "type": "string",
           "default": "2024-02-15-preview",
           "description": "Azure OpenAI API version (only used when provider=azure)"
+        },
+        "codepartner.azureDeployments": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["gpt-4o-mini", "gpt-4o"],
+          "description": "List of Azure OpenAI deployment names to show in the dropdown."
         }
       }
     }

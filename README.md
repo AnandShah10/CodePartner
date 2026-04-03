@@ -1,88 +1,70 @@
-# CodePartner VS Code Extension
+# CodePartner — Agentic AI Coding Companion
 
-## Overview
+CodePartner is a premium, agentic AI co-pilot designed to transform your development workflow. Unlike basic chat extensions, CodePartner uses a sophisticated multi-agent orchestration system to plan, execute, and iterate on complex coding tasks directly within your workspace.
 
-CodePartner is a user-friendly AI co-pilot extension for Visual Studio Code. It integrates a custom AI agent powered by any LLM (Large Language Model) via an OpenAI-compatible API. This extension provides features like interactive chat assistance, inline code completions, and a custom language model provider to help you build code, find bugs, and generate solutions efficiently.
+Powered by any OpenAI-compatible API (including local models like Ollama), CodePartner provides a high-level interface for task planning, terminal execution, and browser-based research, making it the ultimate tool for modern software engineering.
 
-## Features
+## 🚀 Key Features
 
-- **Custom AI Chat Participant**: Use `@codePartner` in the VS Code Chat view for conversational assistance with your configured LLM. Supports multi-turn conversations, Markdown rendering, and streaming responses.
-- **Inline Code Completions**: Get AI-powered suggestions while typing code in any file.
-- **Custom Language Model Provider**: Integrates with VS Code's Language Model API to make your LLM available in tools like GitHub Copilot Chat (if compatible).
-- **Configurable LLM**: Easily set up any OpenAI-compatible provider (e.g., OpenAI, Grok, Ollama local) via extension settings.
-- **Error Handling and Streaming**: Robust handling for API errors and incremental response streaming for better UX.
+*⚡ Agentic Task Planning**: Automatically breaks down complex requests into a structured "Project Roadmap" with step-by-step progress tracking.
+*📂 Multi-Agent Orchestration**: Dispatches specialized sub-agents (Researchers, CodeExperts, Testers) to handle concurrent or deep-dive sub-tasks.
+*🌐 Browser Control**: An integrated browser manager for real-world research, documentation lookups, and automated screenshots.
+*🛠️ Tool-Ready Core**: Built-in tools for shell command execution, directory listing, and intelligent file editing with diff verification.
+*📦 Persistent Artifacts**: Save code snippets, documentation, and screenshots into a dedicated `.codepartner/artifacts` folder for long-term reference.
+*🎨 Premium UI/UX**: A sleek, VS Code-native sidebar with glassmorphism aesthetics, dynamic animations, and integrated chat history.
 
-## Installation
+## 📦 Installation
 
-1. **From VSIX File**:
-   - Download the `.vsix` file from the releases page (or build it yourself).
-   - In VS Code, go to Extensions view (Ctrl+Shift+X), click the ... menu, and select "Install from VSIX...".
-   - Select the downloaded file and reload VS Code.
+1. **Marketplace**: Search for `CodePartner` in the VS Code Extensions view (`Ctrl+Shift+X`) and click **Install**.
+2. **Manual (VSIX)**:
+   - Download the latest `.vsix` from [Releases](https://github.com/AnandShah10/CodePartner/releases).
+   - Use the "Extensions: Install from VSIX..." command in VS Code.
+3. From Source:
 
-2. **From Source**:
-   - Clone the repository: `git clone https://github.com/AnandShah10/CodePartner.git`.
-   - Install dependencies: `npm install`.
-   - Build: `npm run compile`.
-   - Package: `vsce package` (requires `@vscode/vsce` installed globally: `npm install -g @vscode/vsce`).
-   - Install the generated `.vsix` as above.
+   ```bash
+   git clone https://github.com/AnandShah10/CodePartner.git
+   cd CodePartner
+   npm install
+   npm run package
+   ```
 
-## Requirements
+## ⚙️ Configuration
 
-- VS Code version 1.86.0 or later (for Language Model and Chat APIs).
-- An OpenAI-compatible LLM API (e.g., OpenAI, Grok API, local Ollama server).
-- Node.js v18+ for building.
+Configure CodePartner in your VS Code Settings (`Ctrl+,`):
 
-## Configuration
+| Setting | Description | Default |
+| :--- | :--- | :--- |
+| `codepartner.provider` | API provider (`openai` or `azure`) | `openai` |
+| `codepartner.apiEndpoint` | Your LLM endpoint URL | `https://api.openai.com/v1` |
+| `codepartner.apiKey` | Your API authentication key | `(Empty)` |
+| `codepartner.model` | Model/Deployment ID (e.g., `gpt-4-turbo`) | `gpt-4` |
+| `codepartner.maxTokens` | Maximum response length | `1024` |
+| `codepartner.azureDeployments` | List of Azure OpenAI deployment names | `["gpt-4o-mini", "gpt-4o"]` |
 
-After installation, configure the extension in VS Code Settings (Ctrl+,):
+## 🕹️ Usage
 
-- **codepartner.apiEndpoint**: LLM API endpoint (e.g., `https://api.openai.com/v1` for OpenAI, `http://localhost:11434/v1` for Ollama).
-- **codepartner.apiKey**: Your API key (required for authenticated providers; use a dummy for local like Ollama).
-- **codepartner.model**: Model name (e.g., `gpt-4o`, `grok-beta`, `llama3`).
-- **codepartner.maxTokens**: Maximum output tokens for responses (default: 512).
+1. Open the **CodePartner** icon in the Activity Bar.
+2. (Optional) Select your preferred model from the dropdown header.
+3. Start a conversation. For complex tasks, CodePartner will automatically generate a **Plan** in the Roadmap tab.
+4. Monitor sub-agent activity and tool executions in the **Status Bar**.
+5. View generated assets in the **Artifacts** tab or the `.codepartner/artifacts` directory.
 
-Example for Local Ollama:
-- apiEndpoint: `http://localhost:11434/v1`
-- apiKey: `ollama` (or any string)
-- model: `llama3`
+## 🛠️ Development
 
-## Usage
+To contribute or debug:
 
-### Chat Assistance
-1. Open the Chat view (View > Chat or Ctrl+Shift+P > "Chat: Open Chat").
-2. Type `@codePartner <your question>` (e.g., `@codePartner Explain this code snippet`).
-3. The agent will respond using your configured LLM, maintaining conversation history.
+1. Clone the repository.
+2. Run `npm install`.
+3. Press `F5` to open the Extension Development Host.
+4. Use the "CodePartner" output channel to view internal logs.
 
-### Inline Completions
-- Start typing in any code file.
-- Suggestions from your LLM will appear (e.g., function completions).
-- Press Tab to accept.
+## 📄 License
 
-### Custom Model in Other Tools
-- If using GitHub Copilot or similar, select "CodePartner" from the model picker in compatible chats.
+This project is licensed under the [MIT License](https://github.com/AnandShah10/CodePartner/blob/master/LICENSE).
 
-## Development and Debugging
+## 🤝 Acknowledgments
 
-1. Open the project in VS Code.
-2. Run `npm install` if not done.
-3. Press F5 to launch in debug mode.
-4. Test features in the Extension Development Host window.
+CodePartner is built on top of VS Code's extension architecture, utilizing `puppeteer-core` for browser automation and `markdown-it` for high-fidelity rendering. Special thanks to the open-source community for the underlying tools and inspirations.
 
-For contributions:
-- Fork the repo.
-- Make changes in `src/extension.ts`.
-- Submit a pull request.
-
-## Known Issues
-
-- Streaming may not work if your LLM doesn't support it; responses will load fully instead.
-- Inline completions use a basic prompt; customize in code for better results.
-- Token counting is approximate; integrate a proper tokenizer (e.g., `gpt-tokenizer`) for accuracy.
-
-## License
-
-MIT License. See [LICENSE](https://github.com/AnandShah10/CodePartner/blob/master/LICENSE) for details.
-
-## Acknowledgments
-
-Built with VS Code Extension APIs, Axios for HTTP, and Markdown-it for rendering. Inspired by custom AI integrations in VS Code.
+---
+Developed by **AnandShah** — [GitHub](https://github.com/AnandShah10)
