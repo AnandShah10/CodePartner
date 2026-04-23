@@ -3,7 +3,7 @@
   "displayName": "CodePartner",
   "description": "A user-friendly AI co-pilot to help build code, find bugs, and give solutions.",
   "publisher": "AnandShah",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/AnandShah10/CodePartner.git"

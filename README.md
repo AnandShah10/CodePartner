@@ -1,70 +1,50 @@
-# CodePartner — Agentic AI Coding Companion
+# CodePartner — The Premiere Agentic AI Coding Companion
 
-CodePartner is a premium, agentic AI co-pilot designed to transform your development workflow. Unlike basic chat extensions, CodePartner uses a sophisticated multi-agent orchestration system to plan, execute, and iterate on complex coding tasks directly within your workspace.
+**CodePartner** is a powerful, agentic AI co-pilot designed to transform how you build software. Unlike traditional chat extensions, CodePartner is built from the ground up with an "agent-first" philosophy—meaning it doesn't just suggest code; it plans, executes, and iterates on complex tasks directly in your workspace.
 
-Powered by any OpenAI-compatible API (including local models like Ollama), CodePartner provides a high-level interface for task planning, terminal execution, and browser-based research, making it the ultimate tool for modern software engineering.
+Whether you're refactoring a legacy codebase, building a new feature from scratch, or researching complex documentation, CodePartner is your autonomous partner in the editor.
 
-## 🚀 Key Features
+## ✨ Why CodePartner?
 
-*⚡ Agentic Task Planning**: Automatically breaks down complex requests into a structured "Project Roadmap" with step-by-step progress tracking.
-*📂 Multi-Agent Orchestration**: Dispatches specialized sub-agents (Researchers, CodeExperts, Testers) to handle concurrent or deep-dive sub-tasks.
-*🌐 Browser Control**: An integrated browser manager for real-world research, documentation lookups, and automated screenshots.
-*🛠️ Tool-Ready Core**: Built-in tools for shell command execution, directory listing, and intelligent file editing with diff verification.
-*📦 Persistent Artifacts**: Save code snippets, documentation, and screenshots into a dedicated `.codepartner/artifacts` folder for long-term reference.
-*🎨 Premium UI/UX**: A sleek, VS Code-native sidebar with glassmorphism aesthetics, dynamic animations, and integrated chat history.
+In a world of simple "chat-with-file" extensions, CodePartner stands out by offering:
 
-## 📦 Installation
+- **🎨 Premium Visual Experience**: A stunning, VS Code-native sidebar using modern glassmorphism design. It's not just a tool; it's a premium extension of your workflow.
+- **⚡ Two Ways to Work**: 
+  - **Fast Mode**: For quick questions, snippets, and bug fixes.
+  - **Planning Mode**: For complex architectural changes. CodePartner will generate a full roadmap before touching a single line of code.
+- **🧠 Reusable Skills**: Teach CodePartner your unique workflows. Save any set of instructions as a "Skill" and reuse it globally across all your projects.
+- **🛠️ Safe & Precise Editing**: CodePartner uses advanced Search/Replace semantics. No more worrying about the AI overwriting your entire file with a partial snippet.
+- **🌐 Autonomous Research**: Built-in browser control allows the AI to search the web, read documentation, and even take screenshots to verify UI changes.
+- **📂 Content-Aware Search**: Mention `@workspace` and CodePartner will intelligently find the most relevant files by scanning contents, not just filenames.
 
-1. **Marketplace**: Search for `CodePartner` in the VS Code Extensions view (`Ctrl+Shift+X`) and click **Install**.
-2. **Manual (VSIX)**:
-   - Download the latest `.vsix` from [Releases](https://github.com/AnandShah10/CodePartner/releases).
-   - Use the "Extensions: Install from VSIX..." command in VS Code.
-3. From Source:
+## 🚀 Getting Started (Initial Release)
 
-   ```bash
-   git clone https://github.com/AnandShah10/CodePartner.git
-   cd CodePartner
-   npm install
-   npm run package
-   ```
+CodePartner is currently in its premiere release! To get started:
 
-## ⚙️ Configuration
+1. **Install**: Click the **Install** button on this Marketplace page.
+2. **Configure**: Open VS Code Settings (`Ctrl+,`) and search for `CodePartner`.
+   - Set your **API Provider** (OpenAI, Gemini, Azure, etc.).
+   - Enter your **API Key** and **Model ID** (e.g., `gpt-4o`, `claude-3.5-sonnet`, `gemini-1.5-pro`).
+3. **Open the Sidebar**: Click the CodePartner icon in the Activity Bar.
+4. **Build**: Toggle to **Plan** mode and try asking: *"Refactor this project to use a modular structure and add unit tests."*
 
-Configure CodePartner in your VS Code Settings (`Ctrl+,`):
+## ⚙️ Configuration Options
 
-| Setting | Description | Default |
-| :--- | :--- | :--- |
-| `codepartner.provider` | API provider (`openai` or `azure`) | `openai` |
-| `codepartner.apiEndpoint` | Your LLM endpoint URL | `https://api.openai.com/v1` |
-| `codepartner.apiKey` | Your API authentication key | `(Empty)` |
-| `codepartner.model` | Model/Deployment ID (e.g., `gpt-4-turbo`) | `gpt-4` |
-| `codepartner.maxTokens` | Maximum response length | `1024` |
-| `codepartner.azureDeployments` | List of Azure OpenAI deployment names | `["gpt-4o-mini", "gpt-4o"]` |
+| Setting | Description |
+| :--- | :--- |
+| `codepartner.provider` | API provider (`openai`, `azure`, `anthropic`, etc.) |
+| `codepartner.apiEndpoint` | Your LLM endpoint URL |
+| `codepartner.apiKey` | Your API authentication key |
+| `codepartner.model` | The model ID to use (e.g., `gpt-4o`) |
+| `codepartner.maxTokens` | Maximum response length (default: 4096) |
 
-## 🕹️ Usage
+## 📦 Global Persistence
 
-1. Open the **CodePartner** icon in the Activity Bar.
-2. (Optional) Select your preferred model from the dropdown header.
-3. Start a conversation. For complex tasks, CodePartner will automatically generate a **Plan** in the Roadmap tab.
-4. Monitor sub-agent activity and tool executions in the **Status Bar**.
-5. View generated assets in the **Artifacts** tab or the `.codepartner/artifacts` directory.
-
-## 🛠️ Development
-
-To contribute or debug:
-
-1. Clone the repository.
-2. Run `npm install`.
-3. Press `F5` to open the Extension Development Host.
-4. Use the "CodePartner" output channel to view internal logs.
+Your learned **Skills** and generated **Artifacts** are stored globally in `~/.codepartner`. This ensures that a skill you teach CodePartner in one project is immediately available in all your others.
 
 ## 📄 License
 
-This project is licensed under the [MIT License](https://github.com/AnandShah10/CodePartner/blob/master/LICENSE).
-
-## 🤝 Acknowledgments
-
-CodePartner is built on top of VS Code's extension architecture, utilizing `puppeteer-core` for browser automation and `markdown-it` for high-fidelity rendering. Special thanks to the open-source community for the underlying tools and inspirations.
+CodePartner is released under the [MIT License](https://github.com/AnandShah10/CodePartner/blob/master/LICENSE).
 
 ---
-Developed by **AnandShah** — [GitHub](https://github.com/AnandShah10)
+Developed with ❤️ by **AnandShah** — [GitHub](https://github.com/AnandShah10)

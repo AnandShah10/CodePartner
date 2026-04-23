@@ -17,13 +17,18 @@
   const attachmentChips = document.getElementById('attachment-chips');
   const planList = document.getElementById('plan-list');
   const artifactList = document.getElementById('artifact-list');
+  const skillList = document.getElementById('skill-list');
   const tabBtns = document.querySelectorAll('.tab-btn');
   const tabContents = document.querySelectorAll('.tab-content');
+
+  const modeBtnFast = document.getElementById('mode-fast');
+  const modeBtnPlan = document.getElementById('mode-plan');
 
   let currentAssistantMessageId = null;
   let currentThoughtDiv = null;
   let isWaiting = false;
   let attachedFiles = [];
+  let currentMode = 'fast';
 
   const ICONS = {
     SEND: '<svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>',
@@ -37,7 +42,8 @@
     FILE: '<svg viewBox="0 0 16 16"><path d="M4 1.75V14h8V4.75L9.25 1.75H4zM3.25 0h6a.75.75 0 0 1 .53.22l3.5 3.5a.75.75 0 0 1 .22.53v10.5A1.25 1.25 0 0 1 12.25 16H3.75A1.25 1.25 0 0 1 2.5 14.75V1.25C2.5.56 3.06 0 3.75 0h-.5z"/></svg>',
     CHECK: '<svg viewBox="0 0 16 16"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>',
     CLOSE: '<svg viewBox="0 0 16 16"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/></svg>',
-    EDIT: '<svg viewBox="0 0 16 16"><path d="M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25a1.75 1.75 0 0 1 .445-.758l8.61-8.61Zm1.414 1.06a.25.25 0 0 0-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 0 0 0-.354l-1.086-1.086ZM11.189 6.25l-1.44-1.44L3.083 11.477a.25.25 0 0 0-.064.108l-.446 1.564 1.564-.446a.25.25 0 0 0 .108-.064L11.189 6.25Z"/></svg>'
+    EDIT: '<svg viewBox="0 0 16 16"><path d="M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25a1.75 1.75 0 0 1 .445-.758l8.61-8.61Zm1.414 1.06a.25.25 0 0 0-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 0 0 0-.354l-1.086-1.086ZM11.189 6.25l-1.44-1.44L3.083 11.477a.25.25 0 0 0-.064.108l-.446 1.564 1.564-.446a.25.25 0 0 0 .108-.064L11.189 6.25Z"/></svg>',
+    SKILL: '<svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6zM5 1a4 4 0 0 0-4 4v6a4 4 0 0 0 4 4h6a4 4 0 0 0 4-4V5a4 4 0 0 0-4-4H5z"/><path d="M5.5 10a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5zm0-2a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5zm0-2a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/></svg>'
   };
 
   function scrollBottom() {
@@ -99,7 +105,11 @@
     
     const header = document.createElement('div');
     header.className = 'thought-header';
-    header.innerHTML = `${ICONS.THOUGHT} <span>Thought</span>`;
+    header.innerHTML = `${ICONS.THOUGHT} <span>Thinking...</span> <span class="collapse-icon">▼</span>`;
+    header.onclick = () => {
+      header.classList.toggle('collapsed');
+      content.classList.toggle('collapsed');
+    };
     
     const content = document.createElement('div');
     content.className = 'thought-content';
@@ -322,7 +332,7 @@
   function loadMessages(messages) {
     chatHistory.innerHTML = '';
     messages.forEach(m => {
-      if (m.role === 'system') {
+      if (m.role === 'system' || m.hiddenFromUI) {
         return;
       }
       const content = createMessage(m.role, m.content);
@@ -361,6 +371,18 @@
     });
   }
 
+  // Mode toggle
+  function setMode(mode) {
+    currentMode = mode;
+    if (modeBtnFast && modeBtnPlan) {
+      modeBtnFast.classList.toggle('active', mode === 'fast');
+      modeBtnPlan.classList.toggle('active', mode === 'planning');
+    }
+    vscode.postMessage({ type: 'changeMode', value: mode });
+  }
+  if (modeBtnFast) modeBtnFast.onclick = () => setMode('fast');
+  if (modeBtnPlan) modeBtnPlan.onclick = () => setMode('planning');
+
   // UI Event Listeners
   historyBtn.onclick = () => {
     vscode.postMessage({ type: 'listChats' });
@@ -373,7 +395,7 @@
 
   newChatBtn.onclick = () => {
     vscode.postMessage({ type: 'clearChat' });
-    historyPanel.classList.add('hidden');
+    historyPanel.classList.remove('hidden');
   };
 
   function insertTag(tag) {
@@ -396,47 +418,38 @@
   function renderPlan(tasks) {
     planList.innerHTML = '';
     if (!tasks || tasks.length === 0) {
-      planList.innerHTML = '<div class="empty-state">No active plan. Mention a complex task to generate one.</div>';
+      planList.innerHTML = '<div class="empty-state"><svg viewBox="0 0 16 16"><path d="M2 2h12v12H2V2zm1 1v10h10V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7zm0 2h4v1H5V9z"/></svg>No active plan. Use Planning mode for complex tasks.</div>';
       return;
     }
+    // Progress counter
+    const doneCount = tasks.filter(t => t.done).length;
+    const progressEl = document.querySelector('.plan-progress');
+    if (progressEl) progressEl.textContent = `${doneCount}/${tasks.length} done`;
+
     tasks.forEach((taskObj, index) => {
       const task = typeof taskObj === 'string' ? taskObj : taskObj.task;
       const isDone = taskObj.done || false;
 
       const item = document.createElement('div');
       item.className = 'plan-item';
-      if (isDone) {
-        item.style.opacity = '0.7';
-      }
+      if (isDone) item.style.opacity = '0.6';
       item.id = `plan-task-${index}`;
       
       const checkbox = document.createElement('div');
       checkbox.className = `plan-checkbox${isDone ? ' done' : ''}`;
-      checkbox.onclick = () => {
-        if (!checkbox.classList.contains('done')) {
-          completeTask(index);
-        }
-      };
+      checkbox.onclick = () => { if (!checkbox.classList.contains('done')) completeTask(index); };
       
       const text = document.createElement('div');
       text.className = 'plan-text';
       
-      // Parse file mentions (@path/to/file)
       const mentionRegex = /@([a-zA-Z0-9_\-./\\]+)/g;
-      let hasLink = false;
-      let firstLink = '';
-      
+      let hasLink = false, firstLink = '';
       const matches = [...task.matchAll(mentionRegex)];
-      
-      let html = '';
-      let lastEnd = 0;
+      let html = '', lastEnd = 0;
       matches.forEach(match => {
         html += task.slice(lastEnd, match.index);
         html += `<span class="plan-mention">${match[0]}</span>`;
-        if (!hasLink) {
-          hasLink = true;
-          firstLink = match[1];
-        }
+        if (!hasLink) { hasLink = true; firstLink = match[1]; }
         lastEnd = match.index + match[0].length;
       });
       html += task.slice(lastEnd);
@@ -450,10 +463,7 @@
         openBtn.className = 'plan-open-btn icon-btn';
         openBtn.innerHTML = ICONS.FILE;
         openBtn.title = `Open ${firstLink}`;
-        openBtn.onclick = (e) => {
-          e.stopPropagation();
-          vscode.postMessage({ type: 'openFile', value: firstLink });
-        };
+        openBtn.onclick = (e) => { e.stopPropagation(); vscode.postMessage({ type: 'openFile', value: firstLink }); };
         item.appendChild(openBtn);
       }
 
@@ -729,15 +739,26 @@
 
       case 'plan':
         renderPlan(msg.value);
-        // Switch to plan tab automatically on first plan
         const planTabBtn = document.querySelector('[data-tab="plan"]');
-        if (planTabBtn) {
-          planTabBtn.click();
-        }
+        if (planTabBtn) planTabBtn.click();
+        break;
+
+      case 'planDocument':
+        renderPlanDocument(msg.value);
+        const planTab2 = document.querySelector('[data-tab="plan"]');
+        if (planTab2) planTab2.click();
         break;
 
       case 'artifact':
         renderArtifact(msg.value);
+        break;
+
+      case 'artifacts':
+        renderArtifacts(msg.value);
+        break;
+
+      case 'skills':
+        renderSkills(msg.value);
         break;
 
       case 'completeTask':
@@ -751,6 +772,61 @@
         break;
     }
   });
+
+  // Render full implementation plan document in Plan tab
+  function renderPlanDocument(markdownContent) {
+    if (!markdownContent) return;
+    const existing = planList.querySelector('.plan-document');
+    if (existing) existing.remove();
+
+    const doc = document.createElement('div');
+    doc.className = 'plan-document';
+    const header = document.createElement('div');
+    header.className = 'plan-document-header';
+    header.innerHTML = `${ICONS.FILE} Implementation Plan`;
+    const content = document.createElement('div');
+    content.className = 'plan-document-content';
+    content.innerHTML = md.render(markdownContent);
+    doc.appendChild(header);
+    doc.appendChild(content);
+    planList.prepend(doc);
+  }
+
+  function renderSkills(skills) {
+    if (!skillList) return;
+    skillList.innerHTML = '';
+    if (!skills || skills.length === 0) {
+      skillList.innerHTML = '<div class="empty-state"><svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>No skills learned yet. Ask the agent to "save a skill" to create one.</div>';
+      return;
+    }
+    skills.forEach(skill => {
+      const card = document.createElement('div');
+      card.className = 'artifact-card skill-card';
+      card.onclick = () => {
+        promptInput.value = `Use skill: ${skill.name}`;
+        promptInput.focus();
+      };
+      
+      const type = document.createElement('div');
+      type.className = 'artifact-type-badge';
+      type.style.background = 'rgba(255, 100, 0, 0.1)';
+      type.style.color = '#ff6400';
+      type.textContent = 'Skill';
+      
+      const title = document.createElement('div');
+      title.className = 'artifact-card-title';
+      title.textContent = skill.name;
+      
+      const detail = document.createElement('div');
+      detail.className = 'artifact-card-meta';
+      detail.textContent = skill.description;
+      
+      card.appendChild(type);
+      card.appendChild(title);
+      card.appendChild(detail);
+      skillList.appendChild(card);
+    });
+  }
 
   // Global functions for inline HTML
   window.insertTag = insertTag;

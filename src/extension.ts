@@ -5,6 +5,7 @@ import MarkdownIt = require("markdown-it");
 import * as path from "path";
 import * as fs from "fs";
 import * as cp from "child_process";
+import * as os from "os";
 
 class SingleContentProvider implements vscode.TextDocumentContentProvider {
   private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
@@ -54,22 +55,23 @@ interface SubAgentTask {
 
 class ArtifactRegistry {
   private artifacts: Map<string, any> = new Map();
-  private artifactDir: string;
+  private baseDir: string;
 
-  constructor(private workspaceRoot: string) {
-    this.artifactDir = path.join(this.workspaceRoot, ".codepartner", "artifacts");
-    if (!fs.existsSync(this.artifactDir)) {
-      fs.mkdirSync(this.artifactDir, { recursive: true });
+  constructor() {
+    const homeDir = os.homedir();
+    this.baseDir = path.join(homeDir, ".codepartner", "artifacts");
+    if (!fs.existsSync(this.baseDir)) {
+      fs.mkdirSync(this.baseDir, { recursive: true });
     }
   }
 
   public create(title: string, content: string, type: string) {
     const id = Date.now().toString();
     const fileName = `${id}_${title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.${type === "code" ? "txt" : type === "markdown" ? "md" : "log"}`;
-    const filePath = path.join(this.artifactDir, fileName);
+    const filePath = path.join(this.baseDir, fileName);
 
-    if (!fs.existsSync(this.artifactDir)) {
-      fs.mkdirSync(this.artifactDir, { recursive: true });
+    if (!fs.existsSync(this.baseDir)) {
+      fs.mkdirSync(this.baseDir, { recursive: true });
     }
     fs.writeFileSync(filePath, content, "utf8");
     console.log(`[ArtifactRegistry] Saved artifact to: ${filePath}`);
@@ -109,50 +111,111 @@ class AgentManager {
   }
 }
 
+class SkillManager {
+  constructor(private workspaceRoot: string) {}
+
+  private getSkillsDir(): string {
+    const homeDir = os.homedir();
+    const dir = path.join(homeDir, ".codepartner", "skills");
+    if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
+    return dir;
+  }
+
+  public createSkill(name: string, description: string, instructions: string): string {
+    const fileName = `${name.replace(/\s+/g, "_").toLowerCase()}.md`;
+    const fullPath = path.join(this.getSkillsDir(), fileName);
+    const content = `---\nDescription: ${description}\n---\n\n${instructions}`;
+    fs.writeFileSync(fullPath, content, "utf8");
+    return `Skill "${name}" saved to ${fileName}`;
+  }
+
+  public useSkill(name: string): string {
+    const fileName = `${name.replace(/\s+/g, "_").toLowerCase()}.md`;
+    const fullPath = path.join(this.getSkillsDir(), fileName);
+    if (!fs.existsSync(fullPath)) { return `Error: Skill "${name}" not found.`; }
+    const content = fs.readFileSync(fullPath, "utf8");
+    return `\n--- Skill: ${name} ---\n${content}\n\n`;
+  }
+
+  public listSkills(): any[] {
+    const dir = this.getSkillsDir();
+    return fs.readdirSync(dir)
+      .filter(f => f.endsWith(".md"))
+      .map(f => {
+        const content = fs.readFileSync(path.join(dir, f), "utf8");
+        const descMatch = content.match(/Description: (.*)/);
+        return { name: f.replace(".md", ""), description: descMatch ? descMatch[1] : "No description" };
+      });
+  }
+}
+
 class BrowserManager {
   private browser: any;
 
   constructor(private workspaceRoot: string) {}
 
-  public async execute(action: string, url?: string, selector?: string, text?: string): Promise<string> {
-    const puppeteer = require("puppeteer-core");
-    const chromePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"; // Windows default
+  private findChromePath(): string | null {
+    const platform = process.platform;
+    const candidates: string[] = [];
+    if (platform === "win32") {
+      candidates.push(
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        (process.env.LOCALAPPDATA || "") + "\\Google\\Chrome\\Application\\chrome.exe"
+      );
+    } else if (platform === "darwin") {
+      candidates.push(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium"
+      );
+    } else {
+      candidates.push(
+        "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"
+      );
+    }
+    for (const p of candidates) {
+      if (fs.existsSync(p)) { return p; }
+    }
+    return null;
+  }
 
+  public async execute(action: string, url?: string): Promise<string> {
+    const chromePath = this.findChromePath();
+    if (!chromePath) {
+      return "Error: No Chrome/Chromium browser found. Install Chrome or set the path manually.";
+    }
+
+    const puppeteer = require("puppeteer-core");
     if (!this.browser) {
-      this.browser = await puppeteer.launch({
-        executablePath: chromePath,
-        headless: "new"
-      });
+      try {
+        this.browser = await puppeteer.launch({ executablePath: chromePath, headless: "new" });
+      } catch {
+        try {
+          this.browser = await puppeteer.launch({ executablePath: chromePath, headless: true });
+        } catch (e: any) {
+          return `Browser launch error: ${e.message}`;
+        }
+      }
     }
 
     const page = await this.browser.newPage();
     try {
       if (action === "navigate" && url) {
-        await page.goto(url, { waitUntil: "networkidle2" });
+        await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
         const title = await page.title();
         // @ts-ignore
         const content = await page.evaluate(() => document.body.innerText.substring(0, 5000));
         return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}`;
       } else if (action === "screenshot" && url) {
-        await page.goto(url, { waitUntil: "networkidle2" });
+        await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
         const id = Date.now().toString();
         const artifactDir = path.join(this.workspaceRoot, ".codepartner", "artifacts");
-        if (!fs.existsSync(artifactDir)) {
-          fs.mkdirSync(artifactDir, { recursive: true });
-        }
+        if (!fs.existsSync(artifactDir)) { fs.mkdirSync(artifactDir, { recursive: true }); }
         const fileName = `screenshot_${id}.png`;
         const screenshotPath = path.join(artifactDir, fileName);
         await page.screenshot({ path: screenshotPath });
-
-        // Add to artifacts
-        const artifact = {
-          id,
-          title: `Browser Screenshot: ${url}`,
-          type: "screenshot",
-          content: fileName,
-          filePath: screenshotPath,
-          timestamp: Date.now()
-        };
+        const artifact = { id, title: `Browser Screenshot: ${url}`, type: "screenshot", content: fileName, filePath: screenshotPath, timestamp: Date.now() };
         return JSON.stringify(artifact);
       }
       return `Action ${action} not implemented or missing URL.`;
@@ -164,65 +227,75 @@ class BrowserManager {
   }
 }
 
-// ─── System Prompt ────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are CodePartner, a high-level agentic assistant capable of complex orchestration.
-Your workflow for every task involves:
-1. **Plan Phase**: For non-trivial requests, always start by generating a formal "Plan" (markdown list or JSON).
-2. **Execute Phase**: Dispatch specialized SubAgents for sub-tasks or use tools directly.
-3. **Artifact Phase**: Save meaningful code snippets, docs, or screenshots as "Artifacts".
-4. **Iterate**: Observe outcomes and refine the plan.
-
+// ─── System Prompts ───────────────────────────────────────────────────────────
+const BASE_SYSTEM = `You are CodePartner, a high-level agentic coding assistant.
 Capabilities:
-- **Task Planning**: Break down complex requests into manageable tasks.
-- **Multi-Agent Orchestration**: Delegate to SubAgents (Researcher, CodeExpert, Tester) via tool.
-- **Browser Control**: Navigate and interact with the web directly.
-- **Artifacts**: Persistent storage for outputs.
+- **File Operations**: Read, edit (search/replace), and create files.
+- **Shell Commands**: Run terminal commands in the workspace.
+- **Multi-Agent**: Delegate to SubAgents (researcher, code_expert, tester, writer).
+- **Browser**: Navigate and screenshot web pages.
+- **Artifacts**: Save code, docs, or logs as persistent artifacts.
+- **Web Search**: Search the web for information.
 
-IMPORTANT: Always prioritize direct tool usage for local operations and SubAgents for parallelizable or deep-dive research.
-Never truncate code blocks. Provide full, working solutions.`;
+IMPORTANT RULES:
+- For edit_file: provide the EXACT text to search for and the replacement. Do NOT guess — read the file first.
+- For new files: use create_file, not edit_file.
+- Never truncate code blocks. Provide full, working solutions.
+- Always read a file before editing it.`;
+
+const PLANNING_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## PLANNING MODE
+You MUST start every response with a structured Implementation Plan before taking any action.
+Format your plan as:
+
+## Implementation Plan
+1. Step one description
+2. Step two description
+...
+
+After presenting the plan, proceed to execute it step by step using tools.
+Update the user on progress after each step.`;
+
+const FAST_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## FAST MODE
+Skip planning. Directly address the user's request using tools as needed.
+Be concise and action-oriented. Do not generate implementation plans.`;
 
 const TOOLS = [
   {
     name: "run_command",
     description: "Run a shell command in the workspace root.",
-    parameters: {
-      type: "object",
-      properties: {
-        command: { type: "string", description: "The command to run." },
-      },
-      required: ["command"],
-    },
+    parameters: { type: "object", properties: { command: { type: "string", description: "The command to run." } }, required: ["command"] },
   },
   {
     name: "list_dir",
     description: "List contents of a directory.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Relative path to the directory." },
-      },
-      required: ["path"],
-    },
+    parameters: { type: "object", properties: { path: { type: "string", description: "Relative path to the directory." } }, required: ["path"] },
   },
   {
     name: "read_file",
     description: "Read the contents of a file.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Relative path to the file." },
-      },
-      required: ["path"],
-    },
+    parameters: { type: "object", properties: { path: { type: "string", description: "Relative path to the file." } }, required: ["path"] },
   },
   {
     name: "edit_file",
-    description: "Replace or update content in a file.",
+    description: "Edit a file using search/replace. The search string must match exactly. Always read_file first.",
     parameters: {
       type: "object",
       properties: {
         path: { type: "string", description: "Relative path to the file." },
-        content: { type: "string", description: "The new content for the file." },
+        search: { type: "string", description: "Exact text block to find (must match file content exactly, including whitespace)." },
+        replace: { type: "string", description: "Replacement text block." },
+      },
+      required: ["path", "search", "replace"],
+    },
+  },
+  {
+    name: "create_file",
+    description: "Create a new file or overwrite an existing file entirely.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative path to the file." },
+        content: { type: "string", description: "Full content for the file." },
       },
       required: ["path", "content"],
     },
@@ -230,13 +303,7 @@ const TOOLS = [
   {
     name: "web_search",
     description: "Search the web for information using DuckDuckGo.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "The search query." },
-      },
-      required: ["query"],
-    },
+    parameters: { type: "object", properties: { query: { type: "string", description: "The search query." } }, required: ["query"] },
   },
   {
     name: "call_subagent",
@@ -244,11 +311,7 @@ const TOOLS = [
     parameters: {
       type: "object",
       properties: {
-        agent_type: {
-          type: "string",
-          enum: ["researcher", "code_expert", "tester", "writer"],
-          description: "Type of specialized agent."
-        },
+        agent_type: { type: "string", enum: ["researcher", "code_expert", "tester", "writer"], description: "Type of specialized agent." },
         task: { type: "string", description: "Specific instruction for the sub-agent." },
       },
       required: ["agent_type", "task"],
@@ -266,6 +329,35 @@ const TOOLS = [
       },
       required: ["title", "content", "type"],
     },
+  },
+  {
+    name: "create_skill",
+    description: "Save a reusable set of instructions or workflow as a skill.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Name of the skill." },
+        description: { type: "string", description: "What this skill does." },
+        instructions: { type: "string", description: "The actual prompt or instructions for this skill." },
+      },
+      required: ["name", "description", "instructions"],
+    },
+  },
+  {
+    name: "use_skill",
+    description: "Retrieve instructions from a previously saved skill.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The name of the skill to use." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "list_skills",
+    description: "List all currently available skills.",
+    parameters: { type: "object", properties: {} },
   },
   {
     name: "browser_control",
@@ -328,17 +420,21 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private browserManager?: BrowserManager;
   private currentPlan: { task: string, done: boolean }[] = [];
   private currentArtifacts: any[] = [];
+  private executionMode: "planning" | "fast" = "fast";
+  private skillManager?: SkillManager;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly output: vscode.OutputChannel
   ) {
     this.currentChatId = Date.now().toString();
-    this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+    this.messageHistory = [{ role: "system", content: FAST_SYSTEM_PROMPT }];
     this.agentManager = new AgentManager();
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    this.artifactRegistry = new ArtifactRegistry();
+    this.skillManager = new SkillManager(root || os.homedir());
+    
     if (root) {
-      this.artifactRegistry = new ArtifactRegistry(root);
       this.browserManager = new BrowserManager(root);
     }
 
@@ -463,6 +559,11 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           this.selectedModelId = data.value;
           this.output.appendLine(`[CodePartner] Model changed to: ${this.selectedModelId}`);
           break;
+        case "changeMode":
+          this.executionMode = data.value === "planning" ? "planning" : "fast";
+          this.messageHistory[0] = { role: "system", content: this.executionMode === "planning" ? PLANNING_SYSTEM_PROMPT : FAST_SYSTEM_PROMPT };
+          this.output.appendLine(`[CodePartner] Mode changed to: ${this.executionMode}`);
+          break;
         case "listChats":
           this.sendChatsToWebview();
           break;
@@ -527,8 +628,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     this.sendChatsToWebview();
   }
 
-  private loadChat(id: string) {
-    // Save current if it has history
+  private async loadChat(id: string) {
     if (this.messageHistory.length > 1) {
       this.saveCurrentChat();
     }
@@ -540,12 +640,23 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       this.messageHistory = chat.messages;
       this.currentPlan = chat.plan || [];
       this.currentArtifacts = chat.artifacts || [];
-      this._view?.webview.postMessage({ type: "loadMessages", value: this.messageHistory });
+
+      // Add hiddenFromUI flag to context-heavy messages for UI reloading
+      const uiHistory = this.messageHistory.map((m, idx) => ({
+        ...m,
+        hiddenFromUI: idx > 0 && (m.role === "tool" || m.role === "system")
+      }));
+
+      this._view?.webview.postMessage({ type: "loadMessages", value: uiHistory });
       this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
       this.currentArtifacts.forEach(a => this._view?.webview.postMessage({ type: "artifact", value: a }));
       this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
+      
+      if (this.skillManager) {
+        this._view?.webview.postMessage({ type: "skills", value: this.skillManager.listSkills() });
+      }
     }
-  }
+  };
 
   private deleteChat(id: string) {
     let chats = this.context.workspaceState.get<any[]>("cp-chats", []);
@@ -575,7 +686,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     }
 
     this.currentChatId = Date.now().toString();
-    this.messageHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+    this.messageHistory = [{ role: "system", content: this.executionMode === "planning" ? PLANNING_SYSTEM_PROMPT : FAST_SYSTEM_PROMPT }];
     this.currentPlan = [];
     this.currentArtifacts = [];
     this._view?.webview.postMessage({ type: "loadMessages", value: [] });
@@ -1053,7 +1164,38 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     try {
       const files = await vscode.workspace.findFiles("**/*", "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}", 200);
       const paths = files.map((f) => vscode.workspace.asRelativePath(f)).sort();
-      return `\n--- Workspace Structure (${paths.length} files) ---\n${paths.join("\n")}\n\n`;
+      let context = `\n--- Workspace Structure (${paths.length} files) ---\n${paths.join("\n")}\n\n`;
+
+      // Content-aware search: extract keywords and find relevant files
+      const keywords = prompt.replace(/@workspace/gi, "").trim().split(/\s+/).filter(w => w.length > 2);
+      if (keywords.length > 0) {
+        const relevantFiles: { path: string; matches: string[] }[] = [];
+        for (const file of files.slice(0, 100)) {
+          try {
+            const doc = await vscode.workspace.openTextDocument(file);
+            const text = doc.getText();
+            if (text.length > 500000) { continue; }
+            const lines = text.split("\n");
+            const matchingLines = lines.filter(line =>
+              keywords.some(kw => line.toLowerCase().includes(kw.toLowerCase()))
+            );
+            if (matchingLines.length > 0) {
+              relevantFiles.push({
+                path: vscode.workspace.asRelativePath(file),
+                matches: matchingLines.slice(0, 3).map(l => l.trim())
+              });
+            }
+          } catch { /* skip binary/large */ }
+        }
+        if (relevantFiles.length > 0) {
+          context += `\n--- Relevant Content (keywords: ${keywords.join(", ")}) ---\n`;
+          relevantFiles.slice(0, 10).forEach(r => {
+            context += `\nFile: ${r.path}\n${r.matches.map(m => `  > ${m}`).join("\n")}\n`;
+          });
+          context += "\n";
+        }
+      }
+      return context;
     } catch {
       return "";
     }
@@ -1071,7 +1213,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
-    const maxTokens = config.get<number>("maxTokens") || 4096;
+    let maxTokens = config.get<number>("maxTokens") || 4096;
 
     if (!apiEndpoint || !apiKey || !modelId) {
       this._view.webview.postMessage({
@@ -1121,13 +1263,15 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     }
 
     this.messageHistory.push({ role: "user", content: attachments.length > 0 ? contentParts : finalPromptText });
-
+    
     // Clear stats for the new message
     this.fileChangeStats.clear();
     this.modifiedFiles.clear();
 
     let iteration = 0;
     const maxIterations = 10;
+    let useTools = true;
+    let useSystemRole = true;
 
     while (iteration < maxIterations) {
       iteration++;
@@ -1150,14 +1294,16 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
       const body: Record<string, unknown> = {
         messages: this.messageHistory.map((m) => {
-          const msg: any = { role: m.role, content: m.content };
+          const msg: any = { role: m.role === "system" && !useSystemRole ? "user" : m.role, content: m.content };
           if (m.tool_calls) {
             msg.tool_calls = m.tool_calls;
           }
           if (m.tool_call_id) {
             msg.tool_call_id = m.tool_call_id;
+            // The tool result message needs 'name' if it was a function call
+            if (m.name) msg.name = m.name;
           }
-          if (m.name && msg.role !== "tool") {
+          if (m.name && m.role !== "tool") {
             msg.name = m.name;
           }
           return msg;
@@ -1165,9 +1311,13 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         max_tokens: maxTokens,
         temperature: 0.1,
         stream: true,
-        tools: TOOLS.map((t) => ({ type: "function", function: t })),
-        tool_choice: "auto",
       };
+
+      if (useTools) {
+        body.tools = TOOLS.map((t) => ({ type: "function", function: t }));
+        body.tool_choice = "auto";
+      }
+
       if (providerType !== "azure") {
         body.model = modelId;
       }
@@ -1231,17 +1381,23 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
         // Extract and send plan if present
         if (iteration === 1) {
-          const planRegex = /(?:^|\n)(?:Plan|Tasks?|Todo|Roadmap):\s*\n?((?:(?:[*-]|\d+\.)\s*.*(?:\n|$))+)/i;
-          const planMatch = fullResponse.match(planRegex);
-          if (planMatch) {
-            const planTextLines = planMatch[1].trim().split("\n");
-            const newPlan = planTextLines
-              .map(line => line.replace(/^[*-]|\d+\.\s*/, "").trim())
-              .filter(t => t.length > 0)
-              .map(t => ({ task: t, done: false }));
-            
-            this.currentPlan = newPlan;
+          const extractedPlan = this.extractPlan(fullResponse);
+          if (extractedPlan.length > 0) {
+            this.currentPlan = extractedPlan;
             this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
+          }
+          // In planning mode, also send the full plan document to the Plan tab
+          if (this.executionMode === "planning") {
+            const planDocMatch = fullResponse.match(/## Implementation Plan[\s\S]*?(?=\n## [^I]|$)/i);
+            if (planDocMatch) {
+              this._view?.webview.postMessage({ type: "planDocument", value: planDocMatch[0] });
+              // Also save as artifact
+              if (this.artifactRegistry) {
+                const art = this.artifactRegistry.create("Implementation Plan", planDocMatch[0], "markdown");
+                this.currentArtifacts.push(art);
+                this._view?.webview.postMessage({ type: "artifact", value: art });
+              }
+            }
           }
         }
 
@@ -1290,7 +1446,50 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           break;
         }
         const status = err?.response?.status;
-        const msg = err?.response?.data?.error?.message || err?.message || String(err);
+        let msg = err?.message || String(err);
+
+        if (err?.response?.data && typeof err.response.data.on === "function") {
+          try {
+            const dataBuffer = await new Promise<Buffer>((resolve, reject) => {
+              const chunks: Buffer[] = [];
+              err.response.data.on("data", (c: Buffer) => chunks.push(c));
+              err.response.data.on("end", () => resolve(Buffer.concat(chunks)));
+              err.response.data.on("error", reject);
+            });
+            const errorData = JSON.parse(dataBuffer.toString());
+            msg = errorData?.error?.message || msg;
+          } catch (e) {
+            // ignore error while parsing stream
+          }
+        } else if (err?.response?.data?.error?.message) {
+          msg = err.response.data.error.message;
+        }
+        
+        if (status === 400) {
+          // Check if max_tokens is too large
+          const maxTokensMatch = msg.match(/at most (\d+) completion tokens/i);
+          if (maxTokensMatch && maxTokens > parseInt(maxTokensMatch[1], 10)) {
+            maxTokens = parseInt(maxTokensMatch[1], 10);
+            this.output.appendLine(`[CodePartner] API indicated max_tokens too high. Adjusting to ${maxTokens} and retrying...`);
+            iteration--;
+            continue;
+          }
+
+          // Fallback sequence for 400 errors: progressively disable features
+          if (useTools) {
+            this.output.appendLine(`[CodePartner] 400 API Error: ${msg}. Retrying without tools as fallback...`);
+            useTools = false;
+            iteration--;
+            continue;
+          }
+          if (useSystemRole) {
+            this.output.appendLine(`[CodePartner] 400 API Error: ${msg}. Retrying without system role as fallback...`);
+            useSystemRole = false;
+            iteration--;
+            continue;
+          }
+        }
+
         this._view?.webview.postMessage({ type: "error", value: `❌ **Error${status ? ` (${status})` : ""}:** ${msg}` });
         break;
       } finally {
@@ -1299,6 +1498,29 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       }
     }
     this._view?.webview.postMessage({ type: "done" });
+  }
+
+  private extractPlan(response: string): { task: string; done: boolean }[] {
+    const lines = response.split("\n");
+    let inPlan = false;
+    const tasks: { task: string; done: boolean }[] = [];
+    for (const line of lines) {
+      if (/^#{1,3}\s*(implementation\s*plan|plan|tasks?|todo|roadmap|steps)/i.test(line)) {
+        inPlan = true;
+        continue;
+      }
+      if (inPlan && /^#{1,3}\s/.test(line) && !/plan|task|step/i.test(line)) {
+        break;
+      }
+      if (inPlan) {
+        const taskMatch = line.match(/^[\s]*(?:[-*]|\d+\.)\s*(?:\[[ x]\]\s*)?(.+)/);
+        if (taskMatch) {
+          const done = /\[x\]/i.test(line);
+          tasks.push({ task: taskMatch[1].trim(), done });
+        }
+      }
+    }
+    return tasks;
   }
 
   private async executeTool(name: string, args: any): Promise<any> {
@@ -1310,7 +1532,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       case "read_file":
         return this.readFile(args.path);
       case "edit_file":
-        return this.editFile(args.path, args.content);
+        return this.editFile(args.path, args.search, args.replace);
+      case "create_file":
+        return this.createFile(args.path, args.content);
       case "web_search":
         return this.getWebSearchContext(`@web ${args.query}`);
       case "call_subagent":
@@ -1329,12 +1553,22 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         }
         const result = await this.browserManager.execute(args.action, args.url);
         if (args.action === "screenshot" && !result.startsWith("Error")) {
-          const art = JSON.parse(result);
-          this.currentArtifacts.push(art);
-          this._view?.webview.postMessage({ type: "artifact", value: art });
-          return `Screenshot artifact created: ${art.title}`;
+          try {
+            const art = JSON.parse(result);
+            this.currentArtifacts.push(art);
+            this._view?.webview.postMessage({ type: "artifact", value: art });
+            return `Screenshot artifact created: ${art.title}`;
+          } catch { return result; }
         }
         return result;
+      case "create_skill":
+        return this.skillManager?.createSkill(args.name, args.description, args.instructions) || "No workspace open.";
+      case "use_skill":
+        return this.skillManager?.useSkill(args.name) || "No workspace open.";
+      case "list_skills":
+        const skills = this.skillManager?.listSkills() || [];
+        this._view?.webview.postMessage({ type: "skills", value: skills });
+        return `Found ${skills.length} skills. Sent to UI.`;
       default:
         return `Error: Tool not found: ${name}`;
     }
@@ -1390,40 +1624,70 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     }
   }
 
-  private async editFile(relPath: string, content: string): Promise<string> {
+  private async editFile(relPath: string, search: string, replace: string): Promise<string> {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!root) {
-      return "Error: No workspace folder open.";
-    }
+    if (!root) { return "Error: No workspace folder open."; }
     const fullPath = path.join(root, relPath);
     try {
-      const dir = path.dirname(fullPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      if (!fs.existsSync(fullPath)) {
+        return `Error: File does not exist: ${relPath}. Use create_file for new files.`;
+      }
+      const originalContent = fs.readFileSync(fullPath, "utf8");
+      if (!this.fileBackups.has(relPath)) {
+        this.fileBackups.set(relPath, originalContent);
       }
 
-      let originalContent = "";
-      if (fs.existsSync(fullPath)) {
-        originalContent = fs.readFileSync(fullPath, "utf8");
-        // Back up for revert if not already backed up this session
-        if (!this.fileBackups.has(relPath)) {
-          this.fileBackups.set(relPath, originalContent);
+      // Exact match first
+      let newContent: string;
+      if (originalContent.includes(search)) {
+        newContent = originalContent.replace(search, replace);
+      } else {
+        // Fuzzy fallback: trim whitespace on each line and try matching
+        const searchTrimmed = search.split("\n").map(l => l.trim()).join("\n");
+        const contentLines = originalContent.split("\n");
+        const contentTrimmed = contentLines.map(l => l.trim()).join("\n");
+        const idx = contentTrimmed.indexOf(searchTrimmed);
+        if (idx === -1) {
+          return `Error: Could not find the search text in ${relPath}. Please read_file first and use the exact text.`;
         }
+        // Find the original line range
+        const beforeTrimmed = contentTrimmed.substring(0, idx);
+        const startLine = beforeTrimmed.split("\n").length - 1;
+        const searchLineCount = searchTrimmed.split("\n").length;
+        const beforeLines = contentLines.slice(0, startLine);
+        const afterLines = contentLines.slice(startLine + searchLineCount);
+        newContent = [...beforeLines, replace, ...afterLines].join("\n");
       }
 
-      // Simple line diff for summary
       const oldLines = originalContent.split(/\r?\n/).filter(l => l.trim() !== "");
-      const newLines = content.split(/\r?\n/).filter(l => l.trim() !== "");
-
+      const newLines = newContent.split(/\r?\n/).filter(l => l.trim() !== "");
       const removed = oldLines.filter(l => !newLines.includes(l)).length;
       const added = newLines.filter(l => !oldLines.includes(l)).length;
-
       this.fileChangeStats.set(relPath, { added, removed });
 
-      fs.writeFileSync(fullPath, content, "utf8");
+      fs.writeFileSync(fullPath, newContent, "utf8");
       return `File ${relPath} updated successfully. +${added} -${removed} lines.`;
     } catch (e: any) {
       return `Error editing file: ${e.message}`;
+    }
+  }
+
+  private async createFile(relPath: string, content: string): Promise<string> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) { return "Error: No workspace folder open."; }
+    const fullPath = path.join(root, relPath);
+    try {
+      const dir = path.dirname(fullPath);
+      if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
+      if (fs.existsSync(fullPath) && !this.fileBackups.has(relPath)) {
+        this.fileBackups.set(relPath, fs.readFileSync(fullPath, "utf8"));
+      }
+      fs.writeFileSync(fullPath, content, "utf8");
+      const lines = content.split(/\r?\n/).filter(l => l.trim() !== "").length;
+      this.fileChangeStats.set(relPath, { added: lines, removed: 0 });
+      return `File ${relPath} created successfully. ${lines} lines.`;
+    } catch (e: any) {
+      return `Error creating file: ${e.message}`;
     }
   }
 
@@ -1496,6 +1760,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
 </head>
 <body>
   <div id="app">
+
     <div id="header">
       <div id="header-title">
         <svg class="logo" viewBox="0 0 16 16"><path fill="currentColor" d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 2a5 5 0 1 1 0 10A5 5 0 0 1 8 3zm-.5 2v3.25l2.6 1.5.5-.87L8.5 7.5V5h-1z"/></svg>
@@ -1518,13 +1783,14 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       <button class="tab-btn active" data-tab="chat">Chat</button>
       <button class="tab-btn" data-tab="plan">Plan</button>
       <button class="tab-btn" data-tab="artifacts">Artifacts</button>
+      <button class="tab-btn" data-tab="skills">Skills</button>
     </div>
 
     <div id="main-content">
       <div id="history-panel" class="hidden">
         <div class="panel-header">
           <span>Saved Chats</span>
-          <button id="close-history" class="icon-btn" title="Close"><svg viewBox="0 0 16 16"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/></svg></button>
+          <button id="close-history" class="icon-btn" title="Close"><svg viewBox="0 0 16 16"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/></svg></button>
         </div>
         <div id="chat-list"></div>
       </div>
@@ -1543,6 +1809,16 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
                   <button id="attach-btn" class="icon-btn" title="Attach Files">
                     <svg viewBox="0 0 16 16"><path d="M4.496 6.675l.66 6.623C5.336 14.445 6.297 16 7.494 16h4c1.197 0 2.158-1.445 2.338-2.552l.66-6.623a.75.75 0 0 0-1.492-.15l-.66 6.623a.853.853 0 0 1-.845.727H7.494a.853.853 0 0 1-.845-.727l-.66-6.623a.75.75 0 0 0-1.492-.15zM2.75 3.5h10.5a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5z"/></svg>
                   </button>
+                  <div class="mode-toggle">
+                    <button id="mode-fast" class="mode-btn active" title="Fast Mode (no planning)">
+                      <svg viewBox="0 0 16 16"><path d="M11.251.068a.999.999 0 0 1 .697 1.39L9.07 6h4.18a1 1 0 0 1 .75 1.664l-7.25 8.25a1 1 0 0 1-1.697-1.054L7.93 10H3.75a1 1 0 0 1-.75-1.664l7.25-8.25a1 1 0 0 1 1.001-.018z"/></svg>
+                      Fast
+                    </button>
+                    <button id="mode-plan" class="mode-btn" title="Planning Mode (creates implementation plan)">
+                      <svg viewBox="0 0 16 16"><path d="M2 2h12v12H2V2zm1 1v10h10V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7zm0 2h4v1H5V9z"/></svg>
+                      Plan
+                    </button>
+                  </div>
                 </div>
                 <button id="send-btn" title="Send (Enter)">
                   <svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>
@@ -1554,16 +1830,23 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       </div>
 
       <div id="tab-plan" class="tab-content">
-        <div class="pane-header">Project Roadmap</div>
+        <div class="pane-header">Implementation Plan <span class="plan-progress"></span></div>
         <div id="plan-list">
-          <div class="empty-state">No active plan. Mention a complex task to generate one.</div>
+          <div class="empty-state"><svg viewBox="0 0 16 16"><path d="M2 2h12v12H2V2zm1 1v10h10V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7zm0 2h4v1H5V9z"/></svg>No active plan. Use Planning mode for complex tasks.</div>
         </div>
       </div>
 
       <div id="tab-artifacts" class="tab-content">
         <div class="pane-header">Stored Artifacts</div>
         <div id="artifact-list">
-          <div class="empty-state">No artifacts created yet.</div>
+          <div class="empty-state"><svg viewBox="0 0 16 16"><path d="M4 1.75V14h8V4.75L9.25 1.75H4zM3.25 0h6a.75.75 0 0 1 .53.22l3.5 3.5a.75.75 0 0 1 .22.53v10.5A1.25 1.25 0 0 1 12.25 16H3.75A1.25 1.25 0 0 1 2.5 14.75V1.25C2.5.56 3.06 0 3.75 0h-.5z"/></svg>No artifacts created yet.</div>
+        </div>
+      </div>
+
+      <div id="tab-skills" class="tab-content">
+        <div class="pane-header">Learned Skills</div>
+        <div id="skill-list">
+          <div class="empty-state"><svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>No skills learned yet. Ask to "save a skill".</div>
         </div>
       </div>
     </div>
