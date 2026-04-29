@@ -11,7 +11,7 @@ class SingleContentProvider implements vscode.TextDocumentContentProvider {
   private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidChange: vscode.Event<vscode.Uri> = this._onDidChange.event;
 
-  constructor(private content: string) {}
+  constructor(private content: string) { }
 
   provideTextDocumentContent(
     uri: vscode.Uri,
@@ -49,6 +49,7 @@ interface SubAgentTask {
   id: string;
   agentType: string;
   task: string;
+  personality?: string;
   status: "pending" | "running" | "done" | "error";
   result?: string;
 }
@@ -89,9 +90,9 @@ class ArtifactRegistry {
 class AgentManager {
   private subagents: Map<string, SubAgentTask> = new Map();
 
-  public async dispatch(agentType: string, task: string, provider: CodePartnerSidebarProvider): Promise<string> {
+  public async dispatch(agentType: string, task: string, provider: CodePartnerSidebarProvider, personality?: string): Promise<string> {
     const id = Math.random().toString(36).substring(7);
-    const subtask: SubAgentTask = { id, agentType, task, status: "pending" };
+    const subtask: SubAgentTask = { id, agentType, task, personality, status: "pending" };
     this.subagents.set(id, subtask);
 
     provider.updateStatus(`Agent ${agentType} starting task: ${task.substring(0, 30)}...`);
@@ -100,7 +101,7 @@ class AgentManager {
     // Simulate complex sub-agent logic (In reality, this would be a separate LLM call)
     // For now, we'll use a basic internal prompt or delegate back to handlePrompt with a "subagent" flag
     try {
-      const result = await provider.runInternalAgent(agentType, task);
+      const result = await provider.runInternalAgent(agentType, task, personality);
       subtask.status = "done";
       subtask.result = result;
       return result;
@@ -112,7 +113,7 @@ class AgentManager {
 }
 
 class SkillManager {
-  constructor(private workspaceRoot: string) {}
+  constructor(private workspaceRoot: string) { }
 
   private getSkillsDir(): string {
     const homeDir = os.homedir();
@@ -151,8 +152,9 @@ class SkillManager {
 
 class BrowserManager {
   private browser: any;
+  private currentPage: any;
 
-  constructor(private workspaceRoot: string) {}
+  constructor(private workspaceRoot: string) { }
 
   private findChromePath(): string | null {
     const platform = process.platform;
@@ -180,7 +182,7 @@ class BrowserManager {
     return null;
   }
 
-  public async execute(action: string, url?: string): Promise<string> {
+  public async execute(action: string, url?: string, selector?: string, text?: string): Promise<string> {
     const chromePath = this.findChromePath();
     if (!chromePath) {
       return "Error: No Chrome/Chromium browser found. Install Chrome or set the path manually.";
@@ -199,30 +201,59 @@ class BrowserManager {
       }
     }
 
-    const page = await this.browser.newPage();
+    // Use persistent page for interactive actions
+    if (!this.currentPage || action === "navigate") {
+      if (this.currentPage) { await this.currentPage.close().catch(() => { }); }
+      this.currentPage = await this.browser.newPage();
+    }
+    const page = this.currentPage;
+
     try {
-      if (action === "navigate" && url) {
-        await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
-        const title = await page.title();
-        // @ts-ignore
-        const content = await page.evaluate(() => document.body.innerText.substring(0, 5000));
-        return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}`;
-      } else if (action === "screenshot" && url) {
-        await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
-        const id = Date.now().toString();
-        const artifactDir = path.join(this.workspaceRoot, ".codepartner", "artifacts");
-        if (!fs.existsSync(artifactDir)) { fs.mkdirSync(artifactDir, { recursive: true }); }
-        const fileName = `screenshot_${id}.png`;
-        const screenshotPath = path.join(artifactDir, fileName);
-        await page.screenshot({ path: screenshotPath });
-        const artifact = { id, title: `Browser Screenshot: ${url}`, type: "screenshot", content: fileName, filePath: screenshotPath, timestamp: Date.now() };
-        return JSON.stringify(artifact);
+      switch (action) {
+        case "navigate": {
+          if (!url) { return "Error: URL required for navigate."; }
+          await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
+          const title = await page.title();
+          // @ts-ignore
+          const content = await page.evaluate(() => document.body.innerText.substring(0, 5000));
+          return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}`;
+        }
+        case "screenshot": {
+          if (url) { await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 }); }
+          const id = Date.now().toString();
+          const artifactDir = path.join(this.workspaceRoot, ".codepartner", "artifacts");
+          if (!fs.existsSync(artifactDir)) { fs.mkdirSync(artifactDir, { recursive: true }); }
+          const fileName = `screenshot_${id}.png`;
+          const screenshotPath = path.join(artifactDir, fileName);
+          await page.screenshot({ path: screenshotPath });
+          const artifact = { id, title: `Screenshot: ${url || 'current page'}`, type: "screenshot", content: fileName, filePath: screenshotPath, timestamp: Date.now() };
+          return JSON.stringify(artifact);
+        }
+        case "click": {
+          if (!selector) { return "Error: selector required for click."; }
+          await page.waitForSelector(selector, { timeout: 5000 });
+          await page.click(selector);
+          await page.waitForNetworkIdle({ timeout: 3000 }).catch(() => { });
+          // @ts-ignore
+          const clickContent = await page.evaluate(() => document.body.innerText.substring(0, 3000));
+          return `Clicked "${selector}". Page content after click:\n${clickContent}`;
+        }
+        case "type": {
+          if (!selector || !text) { return "Error: selector and text required for type."; }
+          await page.waitForSelector(selector, { timeout: 5000 });
+          await page.type(selector, text);
+          return `Typed "${text}" into "${selector}".`;
+        }
+        case "wait_for": {
+          if (!selector) { return "Error: selector required for wait_for."; }
+          await page.waitForSelector(selector, { timeout: 10000 });
+          return `Element "${selector}" found on page.`;
+        }
+        default:
+          return `Unknown browser action: ${action}`;
       }
-      return `Action ${action} not implemented or missing URL.`;
     } catch (e: any) {
       return `Browser error: ${e.message}`;
-    } finally {
-      await page.close();
     }
   }
 }
@@ -243,21 +274,48 @@ IMPORTANT RULES:
 - Never truncate code blocks. Provide full, working solutions.
 - Always read a file before editing it.`;
 
-const PLANNING_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## PLANNING MODE
-You MUST start every response with a structured Implementation Plan before taking any action.
-Format your plan as:
+const PLANNING_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## PLANNING MODE WORKFLOW (ANTIGRAVITY STYLE)
+You must follow this exact workflow when in planning mode:
 
-## Implementation Plan
-1. Step one description
-2. Step two description
-...
+### 1. Research Phase
+- Thoroughly research the task using read/search tools.
+- DO NOT make any source code changes or run modifying commands during this phase.
 
-After presenting the plan, proceed to execute it step by step using tools.
-Update the user on progress after each step.`;
+### 2. Implementation Plan Phase
+- Create the "implementation_plan.md" artifact.
+- Use this format:
+  # [Goal Description]
+  ## User Review Required (Highlight critical items)
+  ## Open Questions (Any clarifying questions)
+  ## Proposed Changes
+  ### [Component Name]
+  #### [MODIFY] file_name.ext
+  #### [NEW] new_file.ext
+  #### [DELETE] old_file.ext
+  ## Verification Plan
+- **CRITICAL:** STOP and wait for the user's explicit approval before proceeding to execution. Do not execute code until approved.
+
+### 3. Execution Phase (Tasks)
+- Once approved, create the "task.md" artifact.
+- Format: Use \`[ ]\` for uncompleted tasks, \`[/]\` for in-progress tasks, and \`[x]\` for completed tasks.
+- Execute your plan, updating "task.md" frequently to track your progress (mark items \`[/]\` when starting, \`[x]\` when done).
+
+### 4. Verification & Walkthrough Phase
+- Verify that your changes have the desired effects (run tests, etc.).
+- Create the "walkthrough.md" artifact to summarize:
+  - Changes made
+  - What was tested
+  - Validation results
+  - (Embed screenshots/recordings if applicable)`;
 
 const FAST_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## FAST MODE
 Skip planning. Directly address the user's request using tools as needed.
 Be concise and action-oriented. Do not generate implementation plans.`;
+
+const ARCHITECT_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## ARCHITECT MODE
+You are in Architect Mode. You MUST use the "edit_file" tool to draft changes.
+These changes will be collected as drafts and NOT applied immediately. The user will review them.
+Do NOT use "run_command" unless explicitly asked. Focus on generating code changes.`;
 
 const TOOLS = [
   {
@@ -313,6 +371,7 @@ const TOOLS = [
       properties: {
         agent_type: { type: "string", enum: ["researcher", "code_expert", "tester", "writer"], description: "Type of specialized agent." },
         task: { type: "string", description: "Specific instruction for the sub-agent." },
+        personality: { type: "string", description: "Optional persona trait (e.g. 'Strict Reviewer', 'Creative Prototyper') to modify behavior." },
       },
       required: ["agent_type", "task"],
     },
@@ -361,14 +420,62 @@ const TOOLS = [
   },
   {
     name: "browser_control",
-    description: "Control a browser to navigate, search, and take screenshots.",
+    description: "Control a browser: navigate to URLs, take screenshots, click elements, type text, and wait for elements.",
     parameters: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["navigate", "screenshot"], description: "Action to perform." },
-        url: { type: "string", description: "Target URL." },
+        action: { type: "string", enum: ["navigate", "screenshot", "click", "type", "wait_for"], description: "Browser action to perform." },
+        url: { type: "string", description: "Target URL (for navigate/screenshot)." },
+        selector: { type: "string", description: "CSS selector for the target element (for click/type/wait_for)." },
+        text: { type: "string", description: "Text to type (for type action)." },
       },
-      required: ["action", "url"],
+      required: ["action"],
+    },
+  },
+  {
+    name: "grep_search",
+    description: "Search for a text pattern across files in the workspace. Returns matching lines with file paths and line numbers. Use this for finding function usages, variable references, or any text pattern.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "The text or regex pattern to search for." },
+        path: { type: "string", description: "Relative path to search in (directory or file). Defaults to workspace root." },
+        include: { type: "string", description: "File glob filter, e.g. '*.ts' or '*.py'. Defaults to all files." },
+      },
+      required: ["pattern"],
+    },
+  },
+  {
+    name: "run_tests",
+    description: "Run the project's test suite. Auto-detects the test runner (jest, vitest, mocha, pytest, etc.) or accepts a custom command. Use this to verify changes.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "Custom test command. If omitted, auto-detects from package.json or project structure." },
+      },
+    },
+  },
+  {
+    name: "index_docs",
+    description: "Index a web documentation URL for later querying. Scrapes the page and saves it to local knowledge base.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The URL of the documentation to index." },
+        title: { type: "string", description: "A friendly name for this documentation." },
+      },
+      required: ["url", "title"],
+    },
+  },
+  {
+    name: "query_knowledge",
+    description: "Search across indexed documentation and knowledge. Uses keyword matching to find relevant excerpts.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The search query or keyword." },
+      },
+      required: ["query"],
     },
   },
 ];
@@ -394,7 +501,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   output.appendLine("CodePartner: Registered codepartner-sidebar provider.");
-  
+
   context.subscriptions.push(
     vscode.commands.registerCommand("codepartner.focus", () => {
       vscode.commands.executeCommand("workbench.view.extension.codepartner-view-container");
@@ -402,7 +509,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 }
 
-export function deactivate() {}
+export function deactivate() { }
 
 // ─── Sidebar Provider ─────────────────────────────────────────────────────────
 class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
@@ -420,8 +527,12 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private browserManager?: BrowserManager;
   private currentPlan: { task: string, done: boolean }[] = [];
   private currentArtifacts: any[] = [];
-  private executionMode: "planning" | "fast" = "fast";
+  private timelineEvents: any[] = [];
+  private suggestedWorkflows: Set<string> = new Set();
+  private suggestedSkillsCount: number = 0;
+  private executionMode: "planning" | "fast" | "architect" = "fast";
   private skillManager?: SkillManager;
+  private architectDrafts: Map<string, string> = new Map();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -433,7 +544,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     this.artifactRegistry = new ArtifactRegistry();
     this.skillManager = new SkillManager(root || os.homedir());
-    
+
     if (root) {
       this.browserManager = new BrowserManager(root);
     }
@@ -456,7 +567,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ type: "status", value: msg });
   }
 
-  public async runInternalAgent(agentType: string, task: string): Promise<string> {
+  public async runInternalAgent(agentType: string, task: string, personality?: string): Promise<string> {
     // This is a specialized sub-call to the LLM
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
@@ -465,7 +576,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
 
-    const subPrompt = `You are a specialized SubAgent: ${agentType}.
+    const personalityText = personality ? `\nAdopt this personality trait: ${personality}` : "";
+    const subPrompt = `You are a specialized SubAgent: ${agentType}.${personalityText}
 Your task is: ${task}
 Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
@@ -560,9 +672,15 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           this.output.appendLine(`[CodePartner] Model changed to: ${this.selectedModelId}`);
           break;
         case "changeMode":
-          this.executionMode = data.value === "planning" ? "planning" : "fast";
-          this.messageHistory[0] = { role: "system", content: this.executionMode === "planning" ? PLANNING_SYSTEM_PROMPT : FAST_SYSTEM_PROMPT };
+          this.executionMode = data.value;
+          let promptToUse = FAST_SYSTEM_PROMPT;
+          if (this.executionMode === "planning") promptToUse = PLANNING_SYSTEM_PROMPT;
+          else if (this.executionMode === "architect") promptToUse = ARCHITECT_SYSTEM_PROMPT;
+          this.messageHistory[0] = { role: "system", content: promptToUse };
           this.output.appendLine(`[CodePartner] Mode changed to: ${this.executionMode}`);
+          break;
+        case "revertTurn":
+          this.revertTurn(data.value);
           break;
         case "listChats":
           this.sendChatsToWebview();
@@ -587,6 +705,22 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
             this.currentPlan[data.value].done = true;
             this.saveCurrentChat();
           }
+          break;
+        case "listTimeline":
+          this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
+          break;
+        case "saveSkillFromSuggestion":
+          if (this.skillManager) {
+            const skillResult = this.skillManager.createSkill(data.name, data.description, data.instructions);
+            this._view?.webview.postMessage({ type: "status", value: `✅ ${skillResult}` });
+            this._view?.webview.postMessage({ type: "skills", value: this.skillManager.listSkills() });
+          }
+          break;
+        case "applyArchitectDrafts":
+          this.applyArchitectDrafts();
+          break;
+        case "revertTimelineAction":
+          this.revertTimelineAction(data.chatId, data.timestamp);
           break;
       }
     });
@@ -614,6 +748,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       messages: this.messageHistory,
       plan: this.currentPlan,
       artifacts: this.currentArtifacts,
+      timeline: this.timelineEvents,
       timestamp: Date.now()
     };
 
@@ -640,6 +775,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       this.messageHistory = chat.messages;
       this.currentPlan = chat.plan || [];
       this.currentArtifacts = chat.artifacts || [];
+      this.timelineEvents = chat.timeline || [];
 
       // Add hiddenFromUI flag to context-heavy messages for UI reloading
       const uiHistory = this.messageHistory.map((m, idx) => ({
@@ -650,8 +786,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       this._view?.webview.postMessage({ type: "loadMessages", value: uiHistory });
       this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
       this.currentArtifacts.forEach(a => this._view?.webview.postMessage({ type: "artifact", value: a }));
+      this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
       this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
-      
+
       if (this.skillManager) {
         this._view?.webview.postMessage({ type: "skills", value: this.skillManager.listSkills() });
       }
@@ -686,43 +823,80 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     }
 
     this.currentChatId = Date.now().toString();
-    this.messageHistory = [{ role: "system", content: this.executionMode === "planning" ? PLANNING_SYSTEM_PROMPT : FAST_SYSTEM_PROMPT }];
+    let sysPrompt = FAST_SYSTEM_PROMPT;
+    if (this.executionMode === "planning") sysPrompt = PLANNING_SYSTEM_PROMPT;
+    else if (this.executionMode === "architect") sysPrompt = ARCHITECT_SYSTEM_PROMPT;
+    this.messageHistory = [{ role: "system", content: sysPrompt }];
     this.currentPlan = [];
     this.currentArtifacts = [];
+    this.timelineEvents = [];
+    this.architectDrafts.clear();
     this._view?.webview.postMessage({ type: "loadMessages", value: [] });
     this._view?.webview.postMessage({ type: "plan", value: [] });
+    this._view?.webview.postMessage({ type: "timeline", value: [] });
     this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
     this.sendChatsToWebview();
   }
 
-  private async suggestFiles(query: string) {
+  private async suggestFiles(data: any) {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return;
     }
 
+    const type = typeof data === 'string' ? '@' : (data.type || '@');
+    const query = typeof data === 'string' ? data : (data.query || '');
     const q = query.toLowerCase();
-    const suggestions: any[] = [
-      { label: "@web", detail: "Search the web", type: "special" },
-      { label: "@workspace", detail: "Entire workspace context", type: "special" },
-    ];
+    const suggestions: any[] = [];
 
     try {
-      // Find files
-      const files = await vscode.workspace.findFiles(
-        `**/*${q}*`,
-        "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}",
-        20
-      );
+      if (type === '/') {
+        // Add Skills
+        if (this.skillManager) {
+          const skills = this.skillManager.listSkills();
+          for (const s of skills) {
+            if (s.name.toLowerCase().includes(q) || q === "") {
+              suggestions.push({
+                label: "/" + s.name,
+                detail: "Skill: " + s.description,
+                type: "skill"
+              });
+            }
+          }
+        }
+      } else if (type === '@') {
+        suggestions.push({ label: "@web", detail: "Search the web", type: "special" });
+        suggestions.push({ label: "@workspace", detail: "Entire workspace context", type: "special" });
 
-      for (const f of files) {
-        suggestions.push({
-          label: "@" + vscode.workspace.asRelativePath(f),
-          detail: f.fsPath,
-          type: "file"
-        });
+        // Find files
+        const files = await vscode.workspace.findFiles(
+          `**/*${q}*`,
+          "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}",
+          20
+        );
+
+        for (const f of files) {
+          suggestions.push({
+            label: "@" + vscode.workspace.asRelativePath(f),
+            detail: f.fsPath,
+            type: "file"
+          });
+        }
+
+        // Find folders (manual list shared root)
+        const dirs = fs.readdirSync(root, { withFileTypes: true })
+          .filter(d => d.isDirectory() && !d.name.startsWith(".") && d.name !== "node_modules");
+
+        for (const d of dirs) {
+          if (d.name.toLowerCase().includes(q)) {
+            suggestions.push({
+              label: "@" + d.name + "/",
+              detail: "Folder",
+              type: "folder"
+            });
+          }
+        }
       }
-
       // Find folders (manual list shared root)
       const dirs = fs.readdirSync(root, { withFileTypes: true })
         .filter(d => d.isDirectory() && !d.name.startsWith(".") && d.name !== "node_modules");
@@ -753,19 +927,19 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     if (provider === "azure") {
       const deployments = config.get<string[]>("azureDeployments") || [];
       this.availableModels = deployments.map(d => ({ id: d, name: d }));
-      
+
       // If none set, fallback to current or default
       if (this.availableModels.length === 0) {
         this.availableModels = [{ id: currentModel || "gpt-4o", name: currentModel || "gpt-4o" }];
       }
-      
+
       // Ensure current is in the list
       if (currentModel && !this.availableModels.find(m => m.id === currentModel)) {
         this.availableModels.unshift({ id: currentModel, name: currentModel });
       } else if (!currentModel) {
         currentModel = this.availableModels[0].id;
       }
-      
+
       this.sendModelsToWebview(currentModel);
       return;
     }
@@ -787,7 +961,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           id: typeof m === "string" ? m : m.id,
           name: typeof m === "string" ? m : (m.id || m.name)
         }));
-        
+
         // Slightly smarter filter: prefer LLMs over embeddings if many exist
         const llmKeywords = ["gpt", "claude", "gemini", "llama", "mistral", "phi"];
         const filtered = this.availableModels.filter(m => llmKeywords.some(kw => m.id.toLowerCase().includes(kw)));
@@ -1263,15 +1437,17 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     }
 
     this.messageHistory.push({ role: "user", content: attachments.length > 0 ? contentParts : finalPromptText });
-    
+
     // Clear stats for the new message
     this.fileChangeStats.clear();
     this.modifiedFiles.clear();
 
     let iteration = 0;
-    const maxIterations = 10;
+    const maxIterations = 15;
     let useTools = true;
     let useSystemRole = true;
+    let toolUsedInThisTurn = false;
+    const turnId = Date.now().toString();
 
     while (iteration < maxIterations) {
       iteration++;
@@ -1379,27 +1555,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           response.data.on("error", reject);
         });
 
-        // Extract and send plan if present
-        if (iteration === 1) {
-          const extractedPlan = this.extractPlan(fullResponse);
-          if (extractedPlan.length > 0) {
-            this.currentPlan = extractedPlan;
-            this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
-          }
-          // In planning mode, also send the full plan document to the Plan tab
-          if (this.executionMode === "planning") {
-            const planDocMatch = fullResponse.match(/## Implementation Plan[\s\S]*?(?=\n## [^I]|$)/i);
-            if (planDocMatch) {
-              this._view?.webview.postMessage({ type: "planDocument", value: planDocMatch[0] });
-              // Also save as artifact
-              if (this.artifactRegistry) {
-                const art = this.artifactRegistry.create("Implementation Plan", planDocMatch[0], "markdown");
-                this.currentArtifacts.push(art);
-                this._view?.webview.postMessage({ type: "artifact", value: art });
-              }
-            }
-          }
-        }
+        let shouldBreakLoop = false;
 
         if (toolCalls.length > 0) {
           const assistantMessage = { role: "assistant", content: fullResponse || null, tool_calls: toolCalls };
@@ -1409,12 +1565,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
             this.output.appendLine(`[CodePartner] Calling tool: ${tc.function.name}`);
             this._view.webview.postMessage({ type: "status", value: `Executing ${tc.function.name}...` });
             let result;
+            const toolStartTime = Date.now();
             try {
               const args = JSON.parse(tc.function.arguments);
               result = await this.executeTool(tc.function.name, args);
-
-              // Map tool completion to plan tasks (progressive)
-              this._view?.webview.postMessage({ type: "completeTask", value: iteration - 1 });
 
               if (tc.function.name === "edit_file" && !result.startsWith("Error")) {
                 this.modifiedFiles.add(args.path);
@@ -1424,8 +1578,38 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
                 }));
                 this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
               }
+
+              // Timeline tracking
+              let revertContent: string | undefined;
+              if (tc.function.name === "edit_file" && !result.startsWith("Error")) {
+                revertContent = this.fileBackups.get(args.path);
+              } else if (tc.function.name === "create_file" && !result.startsWith("Error")) {
+                revertContent = ""; // Empty string indicates file should be deleted on revert
+              }
+
+              const argsSummary = Object.entries(args).map(([k, v]) => `${k}: ${String(v).substring(0, 40)}`).join(", ");
+              const evt = {
+                chatId: this.currentChatId,
+                tool: tc.function.name,
+                argsSummary,
+                resultPreview: (typeof result === "string" ? result : JSON.stringify(result)).substring(0, 120),
+                success: !(typeof result === "string" && result.startsWith("Error")),
+                timestamp: toolStartTime,
+                duration: Date.now() - toolStartTime,
+                revertContent,
+                path: args.path, // Store path for reverting
+                turnId // Store turnId for reverting multiple changes
+              };
+              this.timelineEvents.push(evt);
+              toolUsedInThisTurn = true;
+              this._view?.webview.postMessage({ type: "timelineEvent", value: evt });
             } catch (e: any) {
               result = `Error executing tool: ${e.message}`;
+              this.timelineEvents.push({
+                chatId: this.currentChatId, tool: tc.function.name, argsSummary: "parse error",
+                resultPreview: result.substring(0, 120), success: false,
+                timestamp: toolStartTime, duration: Date.now() - toolStartTime,
+              });
             }
             this.messageHistory.push({
               role: "tool",
@@ -1433,11 +1617,31 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
               name: tc.function.name,
               content: typeof result === "string" ? result : JSON.stringify(result),
             });
+
+            // Enforce stop in planning mode if an implementation plan was created
+            if (this.executionMode === "planning" && tc.function.name === "create_artifact") {
+              try {
+                const parsedArgs = JSON.parse(tc.function.arguments);
+                const title = parsedArgs.title || "";
+                if (title.toLowerCase().includes("implementation_plan") || title.toLowerCase().includes("plan.md")) {
+                  shouldBreakLoop = true;
+                  const waitMsg = "I have created the implementation plan. Please review it in the Artifacts tab and reply with 'proceed' to execute.";
+                  this.messageHistory.push({ role: "assistant", content: waitMsg, turnId });
+                  this._view?.webview.postMessage({ type: "partial", value: waitMsg });
+                  this._view?.webview.postMessage({ type: "status", value: "Waiting for user approval..." });
+                }
+              } catch (e) { }
+            }
           }
+
+          if (shouldBreakLoop) {
+            break;
+          }
+
           continue;
         } else {
           if (fullResponse) {
-            this.messageHistory.push({ role: "assistant", content: fullResponse });
+            this.messageHistory.push({ role: "assistant", content: fullResponse, turnId });
           }
           break;
         }
@@ -1464,7 +1668,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         } else if (err?.response?.data?.error?.message) {
           msg = err.response.data.error.message;
         }
-        
+
         if (status === 400) {
           // Check if max_tokens is too large
           const maxTokensMatch = msg.match(/at most (\d+) completion tokens/i);
@@ -1497,7 +1701,22 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         this.saveCurrentChat();
       }
     }
-    this._view?.webview.postMessage({ type: "done" });
+    // Proactive Skill Discovery - Only if tools were used THIS turn and not recently suggested
+    const recentToolCalls = this.timelineEvents.filter(e => e.chatId === this.currentChatId);
+    const toolSummary = recentToolCalls.map(e => e.tool).join(" \u2192 ");
+
+    if (toolUsedInThisTurn && recentToolCalls.length >= 3 && this.suggestedSkillsCount < 3 && !this.suggestedWorkflows.has(toolSummary)) {
+      this._view?.webview.postMessage({
+        type: "suggestSkill",
+        value: { summary: toolSummary, toolCount: recentToolCalls.length }
+      });
+      this.suggestedWorkflows.add(toolSummary);
+      this.suggestedSkillsCount++;
+    }
+    if (iteration >= maxIterations) {
+      this._view?.webview.postMessage({ type: "suggestContinue" });
+    }
+    this._view?.webview.postMessage({ type: "done", turnId });
   }
 
   private extractPlan(response: string): { task: string; done: boolean }[] {
@@ -1524,6 +1743,13 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
   }
 
   private async executeTool(name: string, args: any): Promise<any> {
+    if (this.executionMode === "planning") {
+      const hasPlan = this.currentArtifacts.some(a => a.title.toLowerCase().includes("plan"));
+      if (!hasPlan && (name === "edit_file" || name === "create_file")) {
+        return `Error: You are in PLANNING MODE but have not created the "implementation_plan.md" artifact yet. You MUST create the implementation plan and get user approval BEFORE executing code modifications. Use the create_artifact tool.`;
+      }
+    }
+
     switch (name) {
       case "run_command":
         return this.runCommand(args.command);
@@ -1538,7 +1764,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       case "web_search":
         return this.getWebSearchContext(`@web ${args.query}`);
       case "call_subagent":
-        return this.agentManager.dispatch(args.agent_type, args.task, this);
+        return this.agentManager.dispatch(args.agent_type, args.task, this, args.personality);
       case "create_artifact":
         if (this.artifactRegistry) {
           const art = this.artifactRegistry.create(args.title, args.content, args.type);
@@ -1551,7 +1777,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         if (!this.browserManager) {
           return "Error: Workspace not open, browser control disabled.";
         }
-        const result = await this.browserManager.execute(args.action, args.url);
+        const result = await this.browserManager.execute(args.action, args.url, args.selector, args.text);
         if (args.action === "screenshot" && !result.startsWith("Error")) {
           try {
             const art = JSON.parse(result);
@@ -1569,6 +1795,14 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         const skills = this.skillManager?.listSkills() || [];
         this._view?.webview.postMessage({ type: "skills", value: skills });
         return `Found ${skills.length} skills. Sent to UI.`;
+      case "grep_search":
+        return this.grepSearch(args.pattern, args.path, args.include);
+      case "run_tests":
+        return this.runTests(args.command);
+      case "index_docs":
+        return this.indexDocs(args.url, args.title);
+      case "query_knowledge":
+        return this.queryKnowledge(args.query);
       default:
         return `Error: Tool not found: ${name}`;
     }
@@ -1632,9 +1866,13 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       if (!fs.existsSync(fullPath)) {
         return `Error: File does not exist: ${relPath}. Use create_file for new files.`;
       }
-      const originalContent = fs.readFileSync(fullPath, "utf8");
+
+      const originalContent = this.executionMode === "architect" && this.architectDrafts.has(relPath)
+        ? this.architectDrafts.get(relPath)!
+        : fs.readFileSync(fullPath, "utf8");
+
       if (!this.fileBackups.has(relPath)) {
-        this.fileBackups.set(relPath, originalContent);
+        this.fileBackups.set(relPath, fs.readFileSync(fullPath, "utf8"));
       }
 
       // Exact match first
@@ -1665,6 +1903,12 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       const added = newLines.filter(l => !oldLines.includes(l)).length;
       this.fileChangeStats.set(relPath, { added, removed });
 
+      if (this.executionMode === "architect") {
+        this.architectDrafts.set(relPath, newContent);
+        this.sendArchitectDrafts();
+        return `[Architect Draft] File ${relPath} updated. +${added} -${removed} lines. Pending Apply.`;
+      }
+
       fs.writeFileSync(fullPath, newContent, "utf8");
       return `File ${relPath} updated successfully. +${added} -${removed} lines.`;
     } catch (e: any) {
@@ -1682,13 +1926,132 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       if (fs.existsSync(fullPath) && !this.fileBackups.has(relPath)) {
         this.fileBackups.set(relPath, fs.readFileSync(fullPath, "utf8"));
       }
-      fs.writeFileSync(fullPath, content, "utf8");
+
       const lines = content.split(/\r?\n/).filter(l => l.trim() !== "").length;
       this.fileChangeStats.set(relPath, { added: lines, removed: 0 });
+
+      if (this.executionMode === "architect") {
+        this.architectDrafts.set(relPath, content);
+        this.sendArchitectDrafts();
+        return `[Architect Draft] File ${relPath} created. ${lines} lines. Pending Apply.`;
+      }
+
+      fs.writeFileSync(fullPath, content, "utf8");
       return `File ${relPath} created successfully. ${lines} lines.`;
     } catch (e: any) {
       return `Error creating file: ${e.message}`;
     }
+  }
+
+  private grepSearch(pattern: string, searchPath?: string, include?: string): string {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) { return "No workspace open."; }
+    const targetPath = searchPath ? path.join(root, searchPath) : root;
+    try {
+      const isWin = process.platform === "win32";
+      let command: string;
+      if (isWin) {
+        const searchDir = fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory() ? targetPath : path.dirname(targetPath);
+        const fileFilter = include || "*.*";
+        command = `findstr /S /N /I /C:"${pattern.replace(/"/g, '\\"')}" "${searchDir}\\${fileFilter}"`;
+      } else {
+        const includeFlag = include ? `--include="${include}"` : "";
+        command = `grep -rnI ${includeFlag} "${pattern}" "${targetPath}"`;
+      }
+      const output = cp.execSync(command, { cwd: root, encoding: "utf8", timeout: 15000, maxBuffer: 1024 * 1024 });
+      const lines = output.split("\n").filter(l => l.trim()).slice(0, 50);
+      return lines.length > 0 ? lines.join("\n") : "No matches found.";
+    } catch (e: any) {
+      if (e.status === 1) { return "No matches found."; }
+      return `Search error: ${e.message}`;
+    }
+  }
+
+  private runTests(customCommand?: string): string {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) { return "No workspace open."; }
+    let command = customCommand;
+    if (!command) {
+      const pkgPath = path.join(root, "package.json");
+      if (fs.existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+          if (pkg.scripts?.test && pkg.scripts.test !== 'echo "Error: no test specified" && exit 1') {
+            command = "npm test";
+          } else if (pkg.devDependencies?.jest || pkg.dependencies?.jest) {
+            command = "npx jest --no-coverage";
+          } else if (pkg.devDependencies?.vitest || pkg.dependencies?.vitest) {
+            command = "npx vitest run";
+          } else if (pkg.devDependencies?.mocha || pkg.dependencies?.mocha) {
+            command = "npx mocha";
+          }
+        } catch { /* ignore */ }
+      }
+      if (!command) {
+        if (fs.existsSync(path.join(root, "pytest.ini")) || fs.existsSync(path.join(root, "setup.py"))) {
+          command = "python -m pytest --tb=short -q";
+        } else if (fs.existsSync(path.join(root, "manage.py"))) {
+          command = "python manage.py test";
+        }
+      }
+      if (!command) {
+        return "Could not auto-detect test runner. Please provide a command (e.g., 'npm test', 'pytest').";
+      }
+    }
+    this._view?.webview.postMessage({ type: "status", value: `🧪 Running tests: ${command}` });
+    try {
+      const output = cp.execSync(command, { cwd: root, encoding: "utf8", timeout: 60000, maxBuffer: 1024 * 1024 * 5 });
+      return `✅ Tests passed.\n\n${output}`;
+    } catch (e: any) {
+      return `❌ Tests failed.\n\nSTDOUT:\n${e.stdout || "(none)"}\n\nSTDERR:\n${e.stderr || "(none)"}`;
+    }
+  }
+
+  private async indexDocs(url: string, title: string): Promise<string> {
+    const knowledgeDir = path.join(os.homedir(), ".codepartner", "knowledge");
+    if (!fs.existsSync(knowledgeDir)) { fs.mkdirSync(knowledgeDir, { recursive: true }); }
+
+    this._view?.webview.postMessage({ type: "status", value: `📖 Indexing docs: ${url}...` });
+
+    try {
+      if (!this.browserManager) return "Error: Browser manager not initialized.";
+      const result = await this.browserManager.execute("navigate", url);
+      if (result.startsWith("Error")) return result;
+
+      const content = result.split("Content Preview: ")[1] || "";
+      const fileName = `${title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.md`;
+      const filePath = path.join(knowledgeDir, fileName);
+
+      fs.writeFileSync(filePath, `# ${title}\nSource: ${url}\n\n${content}`, "utf8");
+      return `Successfully indexed "${title}" to ${fileName}. You can now use query_knowledge to search it.`;
+    } catch (e: any) {
+      return `Error indexing docs: ${e.message}`;
+    }
+  }
+
+  private queryKnowledge(query: string): string {
+    const knowledgeDir = path.join(os.homedir(), ".codepartner", "knowledge");
+    if (!fs.existsSync(knowledgeDir) || fs.readdirSync(knowledgeDir).length === 0) {
+      return "No documentation indexed yet. Use index_docs first.";
+    }
+
+    const keywords = query.toLowerCase().split(/\s+/).filter(k => k.length > 2);
+    const files = fs.readdirSync(knowledgeDir).filter(f => f.endsWith(".md"));
+    let results = "";
+
+    for (const file of files) {
+      const content = fs.readFileSync(path.join(knowledgeDir, file), "utf8");
+      const lines = content.split("\n");
+      const matches = lines.filter(line =>
+        keywords.some(kw => line.toLowerCase().includes(kw))
+      );
+
+      if (matches.length > 0) {
+        results += `\n--- From: ${file} ---\n${matches.slice(0, 5).join("\n")}\n`;
+      }
+    }
+
+    return results || `No relevant information found for "${query}" in indexed documentation.`;
   }
 
   private async showDiff(relPath: string) {
@@ -1744,6 +2107,101 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     vscode.window.showWarningMessage(`Reverted changes in ${relPath}.`);
   }
 
+  private sendArchitectDrafts() {
+    const drafts = Array.from(this.architectDrafts.entries()).map(([path, content]) => ({
+      path,
+      lines: content.split(/\r?\n/).length
+    }));
+    this._view?.webview.postMessage({ type: "architectDrafts", value: drafts });
+  }
+
+  private applyArchitectDrafts() {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) { return; }
+
+    let count = 0;
+    for (const [relPath, content] of this.architectDrafts.entries()) {
+      const fullPath = path.join(root, relPath);
+      const dir = path.dirname(fullPath);
+      if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
+      fs.writeFileSync(fullPath, content, "utf8");
+      this.modifiedFiles.add(relPath);
+      count++;
+    }
+
+    this.architectDrafts.clear();
+    this.sendArchitectDrafts();
+
+    const stats = Array.from(this.modifiedFiles).map(f => ({
+      path: f,
+      ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
+    }));
+    this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
+    this._view?.webview.postMessage({ type: "status", value: `🏗️ Architect Mode: Applied ${count} drafted files.` });
+    vscode.window.showInformationMessage(`Applied ${count} drafted files.`);
+  }
+
+  private revertTimelineAction(chatId: string, timestamp: number) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) return;
+
+    const event = this.timelineEvents.find(e => e.chatId === chatId && e.timestamp === timestamp);
+    if (!event || event.revertContent === undefined || !event.path) {
+      vscode.window.showErrorMessage("Cannot revert this action: No backup found.");
+      return;
+    }
+
+    const fullPath = path.join(root, event.path);
+    try {
+      if (event.revertContent === "") {
+        // Was created by agent, so reverting means deleting it
+        if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+      } else {
+        // Was edited, revert to previous content
+        fs.writeFileSync(fullPath, event.revertContent, "utf8");
+      }
+
+      // Update UI
+      event.reverted = true;
+      this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
+      vscode.window.showInformationMessage(`Reverted changes to ${event.path}.`);
+    } catch (e: any) {
+      vscode.window.showErrorMessage(`Failed to revert: ${e.message}`);
+    }
+  }
+
+  private revertTurn(turnId: string) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) return;
+
+    const eventsToRevert = this.timelineEvents.filter(e => e.turnId === turnId && !e.reverted && e.revertContent !== undefined);
+    eventsToRevert.sort((a, b) => b.timestamp - a.timestamp);
+
+    let revertedCount = 0;
+    for (const event of eventsToRevert) {
+      if (!event.path) continue;
+      const fullPath = path.join(root, event.path);
+      try {
+        if (event.revertContent === "") {
+          if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+        } else {
+          fs.writeFileSync(fullPath, event.revertContent, "utf8");
+        }
+        event.reverted = true;
+        revertedCount++;
+      } catch (e: any) {
+        this.output.appendLine(`[CodePartner] Failed to revert ${event.path}: ${e.message}`);
+      }
+    }
+
+    if (revertedCount > 0) {
+      this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
+      vscode.window.showInformationMessage(`Reverted ${revertedCount} file changes from that turn.`);
+    } else {
+      vscode.window.showInformationMessage("No file changes to revert for this turn.");
+    }
+  }
+
   private getHtmlForWebview() {
     const webview = this._view!.webview;
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "main.js"));
@@ -1780,10 +2238,18 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     </div>
 
     <div id="tab-bar">
-      <button class="tab-btn active" data-tab="chat">Chat</button>
-      <button class="tab-btn" data-tab="plan">Plan</button>
-      <button class="tab-btn" data-tab="artifacts">Artifacts</button>
-      <button class="tab-btn" data-tab="skills">Skills</button>
+      <button class="tab-btn active" data-tab="chat" title="Chat">
+        <svg viewBox="0 0 16 16"><path d="M14.5 2h-13a.5.5 0 0 0-.5.5v10a.5.5 0 0 0 .5.5H3.1l2.5 2.5a.5.5 0 0 0 .707 0l2.5-2.5h5.693a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5zM14 12H8.5a.5.5 0 0 0-.354.146L6 14.293 3.854 12.146A.5.5 0 0 0 3.5 12H2V3h12v9z"/></svg>
+      </button>
+      <button class="tab-btn" data-tab="timeline" title="Timeline">
+        <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 2a5 5 0 1 1 0 10A5 5 0 0 1 8 3zm-.5 2v3.25l2.6 1.5.5-.87L8.5 7.5V5h-1z"/></svg>
+      </button>
+      <button class="tab-btn" data-tab="artifacts" title="Artifacts">
+        <svg viewBox="0 0 16 16"><path d="M4 1.75V14h8V4.75L9.25 1.75H4zM3.25 0h6a.75.75 0 0 1 .53.22l3.5 3.5a.75.75 0 0 1 .22.53v10.5A1.25 1.25 0 0 1 12.25 16H3.75A1.25 1.25 0 0 1 2.5 14.75V1.25C2.5.56 3.06 0 3.75 0h-.5z"/></svg>
+      </button>
+      <button class="tab-btn" data-tab="skills" title="Skills">
+        <svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>
+      </button>
     </div>
 
     <div id="main-content">
@@ -1800,9 +2266,15 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           <div id="chat-history"></div>
           <div id="status-bar"><div id="status-text"></div></div>
           <div id="input-outer">
+            <div id="architect-drafts" class="hidden">
+              <div class="drafts-header">Architect Drafts Pending</div>
+              <div id="drafts-list"></div>
+              <button id="apply-drafts-btn">Apply All Drafts</button>
+            </div>
             <div id="suggestion-list" class="hidden"></div>
             <div id="attachment-chips" class="hidden"></div>
             <div id="input-container">
+              <div id="prompt-overlay"></div>
               <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
               <div class="input-footer">
                 <div class="tag-hints">
@@ -1812,11 +2284,12 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
                   <div class="mode-toggle">
                     <button id="mode-fast" class="mode-btn active" title="Fast Mode (no planning)">
                       <svg viewBox="0 0 16 16"><path d="M11.251.068a.999.999 0 0 1 .697 1.39L9.07 6h4.18a1 1 0 0 1 .75 1.664l-7.25 8.25a1 1 0 0 1-1.697-1.054L7.93 10H3.75a1 1 0 0 1-.75-1.664l7.25-8.25a1 1 0 0 1 1.001-.018z"/></svg>
-                      Fast
                     </button>
                     <button id="mode-plan" class="mode-btn" title="Planning Mode (creates implementation plan)">
                       <svg viewBox="0 0 16 16"><path d="M2 2h12v12H2V2zm1 1v10h10V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7zm0 2h4v1H5V9z"/></svg>
-                      Plan
+                    </button>
+                    <button id="mode-architect" class="mode-btn" title="Architect Mode (drafts changes without applying)">
+                      <svg viewBox="0 0 16 16"><path d="M8 1L2 5v6l6 4 6-4V5L8 1zm0 2.2l4 2.6-4 2.6L4 5.8l4-2.6zM3 10.3l4.5 3v-3.8L3 6.9v3.4zm9.5 0V6.9l-4.5 2.6v3.8l4.5-3z"/></svg>
                     </button>
                   </div>
                 </div>
@@ -1829,24 +2302,21 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         </div>
       </div>
 
-      <div id="tab-plan" class="tab-content">
-        <div class="pane-header">Implementation Plan <span class="plan-progress"></span></div>
-        <div id="plan-list">
-          <div class="empty-state"><svg viewBox="0 0 16 16"><path d="M2 2h12v12H2V2zm1 1v10h10V3H3zm2 2h6v1H5V5zm0 2h6v1H5V7zm0 2h4v1H5V9z"/></svg>No active plan. Use Planning mode for complex tasks.</div>
-        </div>
-      </div>
-
       <div id="tab-artifacts" class="tab-content">
-        <div class="pane-header">Stored Artifacts</div>
         <div id="artifact-list">
-          <div class="empty-state"><svg viewBox="0 0 16 16"><path d="M4 1.75V14h8V4.75L9.25 1.75H4zM3.25 0h6a.75.75 0 0 1 .53.22l3.5 3.5a.75.75 0 0 1 .22.53v10.5A1.25 1.25 0 0 1 12.25 16H3.75A1.25 1.25 0 0 1 2.5 14.75V1.25C2.5.56 3.06 0 3.75 0h-.5z"/></svg>No artifacts created yet.</div>
+          <div class="empty-state">No artifacts created yet.</div>
         </div>
       </div>
 
       <div id="tab-skills" class="tab-content">
-        <div class="pane-header">Learned Skills</div>
         <div id="skill-list">
-          <div class="empty-state"><svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>No skills learned yet. Ask to "save a skill".</div>
+          <div class="empty-state">No skills learned yet. Ask to "save a skill".</div>
+        </div>
+      </div>
+
+      <div id="tab-timeline" class="tab-content">
+        <div id="timeline-list">
+          <div class="empty-state">No tool executions yet.</div>
         </div>
       </div>
     </div>
