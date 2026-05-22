@@ -1,9 +1,9 @@
 {
   "name": "codepartner",
   "displayName": "CodePartner",
-  "description": "A user-friendly AI co-pilot to help build code, find bugs, and give solutions.",
+  "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/AnandShah10/CodePartner.git"
@@ -13,7 +13,8 @@
   },
   "categories": [
     "AI",
-    "Chat"
+    "Chat",
+    "Programming Languages"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -25,6 +26,49 @@
         "command": "codepartner.focus",
         "title": "CodePartner: Focus on Chat Sidebar",
         "icon": "$(robot)"
+      },
+      {
+        "command": "codepartner.toggleInlineCompletions",
+        "title": "CodePartner: Toggle Inline Completions"
+      },
+      {
+        "command": "codepartner.explainSelection",
+        "title": "CodePartner: Explain Selected Code"
+      },
+      {
+        "command": "codepartner.fixErrors",
+        "title": "CodePartner: Fix Errors in File"
+      },
+      {
+        "command": "codepartner.generateTests",
+        "title": "CodePartner: Generate Tests for File"
+      },
+      {
+        "command": "codepartner.showDebugLog",
+        "title": "CodePartner: Show Debug Log"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codepartner.focus",
+        "key": "ctrl+l",
+        "mac": "cmd+l"
+      },
+      {
+        "command": "codepartner.toggleInlineCompletions",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i"
+      },
+      {
+        "command": "codepartner.explainSelection",
+        "key": "ctrl+shift+;",
+        "mac": "cmd+shift+;",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "codepartner.fixErrors",
+        "key": "ctrl+shift+'",
+        "mac": "cmd+shift+'"
       }
     ],
     "viewsContainers": {
@@ -54,7 +98,10 @@
           "type": "string",
           "enum": [
             "openai",
-            "azure"
+            "azure",
+            "anthropic",
+            "google",
+            "ollama"
           ],
           "default": "openai",
           "description": "LLM provider type"
@@ -76,7 +123,7 @@
         },
         "codepartner.maxTokens": {
           "type": "number",
-          "default": 1024,
+          "default": 4096,
           "description": "Max output tokens."
         },
         "codepartner.azureApiVersion": {
@@ -89,6 +136,38 @@
           "items": { "type": "string" },
           "default": ["gpt-4o-mini", "gpt-4o"],
           "description": "List of Azure OpenAI deployment names to show in the dropdown."
+        },
+        "codepartner.inlineCompletions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable inline code completions (ghost text). Uses API tokens on each keystroke (debounced)."
+        },
+        "codepartner.inlineCompletionDebounce": {
+          "type": "number",
+          "default": 500,
+          "minimum": 200,
+          "maximum": 3000,
+          "description": "Debounce delay (ms) before triggering inline completion requests."
+        },
+        "codepartner.addAICoAuthor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Append a Co-authored-by trailer to commits made through CodePartner."
+        },
+        "codepartner.mcpServers": {
+          "type": "object",
+          "default": {},
+          "description": "MCP server configurations. Keys are server names, values are objects with 'command', 'args', 'env', and 'cwd' fields.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string", "description": "Command to start the MCP server." },
+              "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for the command." },
+              "env": { "type": "object", "description": "Environment variables." },
+              "cwd": { "type": "string", "description": "Working directory." }
+            },
+            "required": ["command"]
+          }
         }
       }
     }

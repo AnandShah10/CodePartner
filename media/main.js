@@ -18,6 +18,7 @@
   const artifactList = document.getElementById('artifact-list');
   const skillList = document.getElementById('skill-list');
   const timelineList = document.getElementById('timeline-list');
+  const planList = document.getElementById('plan-list');
   const tabBtns = document.querySelectorAll('.tab-btn');
   const tabContents = document.querySelectorAll('.tab-content');
 
@@ -512,6 +513,74 @@
     vscode.postMessage({ type: 'clearChat' });
   };
 
+  const feedbackBtn = document.getElementById('feedback-btn');
+  if (feedbackBtn) {
+    feedbackBtn.onclick = () => {
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+  
+      const modal = document.createElement('div');
+      modal.className = 'modal-content';
+  
+      modal.innerHTML = `
+        <div class="modal-header">
+          <div style="background:var(--accent-dim); color:var(--accent); padding:4px; border-radius:6px; display:flex;">${ICONS.FILE}</div>
+          <div class="modal-title">Send Feedback / Report Bug</div>
+          <button class="icon-btn modal-close" id="close-modal-btn">${ICONS.CLOSE}</button>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:12px;">
+          <div>
+            <label style="display:block; font-size:11px; opacity:0.7; margin-bottom:4px;">Feedback Type</label>
+            <select id="feedback-type" class="skill-form-input">
+              <option value="Bug">🐞 Report a Bug</option>
+              <option value="Improvement">✨ Suggest Improvement</option>
+              <option value="Feature">💡 Feature Request</option>
+              <option value="Other">❓ Other</option>
+            </select>
+          </div>
+          <div>
+            <label style="display:block; font-size:11px; opacity:0.7; margin-bottom:4px;">Description</label>
+            <textarea id="feedback-desc" class="skill-form-textarea" placeholder="Tell us more..." style="min-height:100px;"></textarea>
+          </div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" id="include-code" style="cursor:pointer;">
+            <label for="include-code" style="font-size:11px; opacity:0.9; cursor:pointer;">Attach current file code</label>
+          </div>
+          <div class="modal-footer" style="display:flex; justify-content:flex-end; gap:10px; margin-top:8px;">
+            <button id="cancel-feedback-btn" class="skill-cancel-btn">Cancel</button>
+            <button id="send-feedback-btn" class="skill-save-btn">Send via Email</button>
+          </div>
+        </div>
+      `;
+  
+      overlay.appendChild(modal);
+      document.body.appendChild(overlay);
+  
+      const closeModal = () => overlay.remove();
+      overlay.onclick = (e) => { if (e.target === overlay) closeModal(); };
+      modal.querySelector('#close-modal-btn').onclick = closeModal;
+      modal.querySelector('#cancel-feedback-btn').onclick = closeModal;
+  
+      modal.querySelector('#send-feedback-btn').onclick = () => {
+        const feedbackType = modal.querySelector('#feedback-type').value;
+        const desc = modal.querySelector('#feedback-desc').value.trim();
+        const includeCode = modal.querySelector('#include-code').checked;
+  
+        if (desc) {
+          vscode.postMessage({
+            type: 'submitFeedback',
+            feedbackType: feedbackType,
+            description: desc,
+            includeCode: includeCode
+          });
+          closeModal();
+        } else {
+          modal.querySelector('#feedback-desc').style.borderColor = 'var(--vscode-errorForeground)';
+        }
+      };
+    };
+  }
+
   function insertTag(tag) {
     const pos = promptInput.selectionStart;
     const val = promptInput.value;
@@ -530,15 +599,35 @@
   });
 
   function renderPlan(tasks) {
+    if (!planList) return;
     planList.innerHTML = '';
     if (!tasks || tasks.length === 0) {
       planList.innerHTML = '<div class="empty-state">No active plan. Use Planning mode for complex tasks.</div>';
+      // Remove progress bar if exists
+      const existingProgress = document.querySelector('.plan-progress-bar-container');
+      if (existingProgress) existingProgress.remove();
       return;
     }
-    // Progress counter
+
+    // Progress bar
     const doneCount = tasks.filter(t => t.done).length;
+    const percent = Math.round((doneCount / tasks.length) * 100);
     const progressEl = document.querySelector('.plan-progress');
-    if (progressEl) progressEl.textContent = `${doneCount}/${tasks.length} done`;
+    if (progressEl) progressEl.textContent = `${doneCount}/${tasks.length}`;
+
+    // Add/update progress bar above the list
+    let progressContainer = document.querySelector('.plan-progress-bar-container');
+    if (!progressContainer) {
+      progressContainer = document.createElement('div');
+      progressContainer.className = 'plan-progress-bar-container';
+      planList.parentElement.insertBefore(progressContainer, planList);
+    }
+    progressContainer.innerHTML = `
+      <div class="plan-progress-bar">
+        <div class="plan-progress-bar-fill" style="width: ${percent}%"></div>
+      </div>
+      <div class="plan-progress-text">${doneCount} of ${tasks.length} complete (${percent}%)</div>
+    `;
 
     tasks.forEach((taskObj, index) => {
       const task = typeof taskObj === 'string' ? taskObj : taskObj.task;
@@ -583,6 +672,12 @@
 
       planList.appendChild(item);
     });
+
+    // Auto-switch to plan tab when plan is received
+    const planTabBtn = document.querySelector('[data-tab="plan"]');
+    if (planTabBtn && tasks.length > 0) {
+      planTabBtn.classList.add('has-content');
+    }
   }
 
   function completeTask(index) {
@@ -934,7 +1029,8 @@
 
       case 'plan':
         renderPlan(msg.value);
-        const planTabBtn = document.querySelector('[data-tab="plan"]');
+        break;
+
       case 'artifact':
         renderArtifact(msg.value);
         break;

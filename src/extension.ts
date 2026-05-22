@@ -6,6 +6,10 @@ import * as path from "path";
 import * as fs from "fs";
 import * as cp from "child_process";
 import * as os from "os";
+import { GitManager } from "./git";
+import { CodePartnerInlineCompletionProvider } from "./inlineCompletion";
+import { SemanticSearch } from "./semanticSearch";
+import { MCPManager } from "./mcp";
 
 class SingleContentProvider implements vscode.TextDocumentContentProvider {
   private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
@@ -258,55 +262,72 @@ class BrowserManager {
   }
 }
 
-// ─── System Prompts ───────────────────────────────────────────────────────────
-const BASE_SYSTEM = `You are CodePartner, a high-level agentic coding assistant.
+// â”€â”€â”€ System Prompts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const BASE_SYSTEM = `You are CodePartner, a powerful agentic AI coding assistant.
+
 Capabilities:
-- **File Operations**: Read, edit (search/replace), and create files.
+- **File Operations**: Read, edit (search/replace), create, and grep across files.
 - **Shell Commands**: Run terminal commands in the workspace.
 - **Multi-Agent**: Delegate to SubAgents (researcher, code_expert, tester, writer).
 - **Browser**: Navigate and screenshot web pages.
 - **Artifacts**: Save code, docs, or logs as persistent artifacts.
 - **Web Search**: Search the web for information.
+- **Git**: Check status, stage changes, create branches, and commit.
 
-IMPORTANT RULES:
-- For edit_file: provide the EXACT text to search for and the replacement. Do NOT guess — read the file first.
-- For new files: use create_file, not edit_file.
-- Never truncate code blocks. Provide full, working solutions.
-- Always read a file before editing it.`;
+CRITICAL RULES:
+1. **Always read before editing**: Use read_file before edit_file. Provide the EXACT text to search for.
+2. **New files**: Use create_file, never edit_file for new files.
+3. **Complete solutions**: Never truncate code blocks. Provide full, working implementations.
+4. **Explain your reasoning**: Before making changes, briefly explain what you're doing and why.
+5. **Use markdown**: Format responses with headers, code blocks, lists, and emphasis for readability.
+6. **Error handling**: When a tool fails, explain the error and try an alternative approach.
+7. **Be thorough**: Read relevant files, understand the codebase structure, then make targeted changes.
+8. **Verify changes**: After editing files, consider running tests or reading the file to verify.
+9. **Context matters**: Pay attention to the user's current file, selection, and workspace structure.
+10. **Be proactive**: If you see related issues while working on a task, mention them.`;
 
-const PLANNING_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## PLANNING MODE WORKFLOW (ANTIGRAVITY STYLE)
-You must follow this exact workflow when in planning mode:
+const PLANNING_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## PLANNING MODE WORKFLOW
+You MUST follow this exact multi-phase workflow. Each phase must complete before moving to the next.
 
-### 1. Research Phase
-- Thoroughly research the task using read/search tools.
-- DO NOT make any source code changes or run modifying commands during this phase.
+### Phase 1: RESEARCH (Mandatory First Step)
+Before proposing ANY changes, you MUST thoroughly research:
+- Use \`list_dir\` to understand project structure
+- Use \`read_file\` to examine relevant source files
+- Use \`grep_search\` to find related code, usages, and patterns
+- Use \`web_search\` if external documentation or APIs are involved
+- DO NOT make any code changes (no edit_file or create_file) during this phase
 
-### 2. Implementation Plan Phase
-- Create the "implementation_plan.md" artifact.
-- Use this format:
+### Phase 2: IMPLEMENTATION PLAN (Create Before Any Code Changes)
+After research, create a detailed plan using \`create_artifact\` with:
+- Title: Include "implementation_plan" in the title
+- Type: "markdown"
+- Content structure:
   # [Goal Description]
-  ## User Review Required (Highlight critical items)
-  ## Open Questions (Any clarifying questions)
+  Brief problem description and background context.
+
   ## Proposed Changes
-  ### [Component Name]
-  #### [MODIFY] file_name.ext
-  #### [NEW] new_file.ext
-  #### [DELETE] old_file.ext
+  ### [Component/Area Name]
+  #### [MODIFY] filename.ext - What will change and why
+  #### [NEW] new_filename.ext - Purpose of the new file
+  #### [DELETE] old_filename.ext - Why this file should be removed
+
   ## Verification Plan
-- **CRITICAL:** STOP and wait for the user's explicit approval before proceeding to execution. Do not execute code until approved.
+  How to verify the changes work correctly.
 
-### 3. Execution Phase (Tasks)
-- Once approved, create the "task.md" artifact.
-- Format: Use \`[ ]\` for uncompleted tasks, \`[/]\` for in-progress tasks, and \`[x]\` for completed tasks.
-- Execute your plan, updating "task.md" frequently to track your progress (mark items \`[/]\` when starting, \`[x]\` when done).
+**CRITICAL: After creating the implementation plan, you MUST STOP and tell the user:**
+"I have created the implementation plan. Please review it in the Artifacts tab and reply with 'proceed' to execute."
+DO NOT execute any code changes until the user explicitly approves.
 
-### 4. Verification & Walkthrough Phase
-- Verify that your changes have the desired effects (run tests, etc.).
-- Create the "walkthrough.md" artifact to summarize:
-  - Changes made
-  - What was tested
-  - Validation results
-  - (Embed screenshots/recordings if applicable)`;
+### Phase 3: EXECUTION (Only After User Approval)
+Once the user says 'proceed', 'approved', 'go ahead', 'yes', or similar:
+- Create a "task" artifact to track progress
+- Execute changes one by one, marking tasks as complete
+- Use \`[x]\` for done, \`[ ]\` for pending, \`[/]\` for in-progress
+
+### Phase 4: VERIFICATION & WALKTHROUGH
+- Run tests if applicable using \`run_tests\`
+- Read modified files to verify correctness
+- Create a "walkthrough" artifact summarizing changes made, what was tested, and validation results`;
 
 const FAST_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## FAST MODE
 Skip planning. Directly address the user's request using tools as needed.
@@ -478,13 +499,50 @@ const TOOLS = [
       required: ["query"],
     },
   },
+  {
+    name: "generate_commit_message",
+    description: "Generates a conventional commit message based on staged git changes.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "get_git_status",
+    description: "Returns the current git status of the workspace.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "create_git_branch",
+    description: "Creates a new git branch.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The name of the new branch." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "stage_git_changes",
+    description: "Stages all current changes in the git repository.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "commit_git_changes",
+    description: "Commits staged changes to the git repository.",
+    parameters: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "The commit message." },
+      },
+      required: ["message"],
+    },
+  },
 ];
 
 // ─── Activate ─────────────────────────────────────────────────────────────────
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("CodePartner");
   context.subscriptions.push(output);
-  output.appendLine("CodePartner extension activated.");
+  output.appendLine("CodePartner v2.0 extension activated.");
 
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(
@@ -499,14 +557,65 @@ export function activate(context: vscode.ExtensionContext) {
       webviewOptions: { retainContextWhenHidden: true },
     })
   );
+  
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("codepartner")) {
+        provider.refreshModels();
+      }
+    })
+  );
 
-  output.appendLine("CodePartner: Registered codepartner-sidebar provider.");
+  // ── Inline Completion Provider ──
+  const inlineProvider = new CodePartnerInlineCompletionProvider(output);
+  context.subscriptions.push(
+    vscode.languages.registerInlineCompletionItemProvider(
+      { pattern: "**" },
+      inlineProvider
+    )
+  );
 
+  // ── Commands ──
   context.subscriptions.push(
     vscode.commands.registerCommand("codepartner.focus", () => {
       vscode.commands.executeCommand("workbench.view.extension.codepartner-view-container");
     })
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.toggleInlineCompletions", () => {
+      const config = vscode.workspace.getConfiguration("codepartner");
+      const current = config.get<boolean>("inlineCompletions", false);
+      config.update("inlineCompletions", !current, vscode.ConfigurationTarget.Global);
+      vscode.window.showInformationMessage(`CodePartner: Inline completions ${!current ? "enabled" : "disabled"}.`);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.explainSelection", () => {
+      provider.executeSlashCommand("explain");
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.fixErrors", () => {
+      provider.executeSlashCommand("fix");
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.generateTests", () => {
+      provider.executeSlashCommand("test");
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.showDebugLog", () => {
+      output.show(true);
+    })
+  );
+
+  output.appendLine("CodePartner: All providers and commands registered.");
 }
 
 export function deactivate() { }
@@ -533,6 +642,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private executionMode: "planning" | "fast" | "architect" = "fast";
   private skillManager?: SkillManager;
   private architectDrafts: Map<string, string> = new Map();
+  private terminal?: vscode.Terminal;
+  private gitManager: GitManager;
+  private semanticSearch: SemanticSearch;
+  private mcpManager: MCPManager;
+  private customInstructions: string = "";
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -544,10 +658,24 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     this.artifactRegistry = new ArtifactRegistry();
     this.skillManager = new SkillManager(root || os.homedir());
+    this.gitManager = new GitManager();
+    this.semanticSearch = new SemanticSearch(output);
+    this.mcpManager = new MCPManager(output);
 
     if (root) {
       this.browserManager = new BrowserManager(root);
     }
+
+    // Load custom agent definitions (.codepartner.md)
+    this.loadCustomInstructions();
+
+    // Initialize MCP servers
+    this.mcpManager.loadConfigs().catch((e: any) => {
+      this.output.appendLine(`[CodePartner] MCP init error: ${e.message}`);
+    });
+
+    // Build semantic search index in the background
+    this.semanticSearch.buildIndex().catch(() => {});
 
     // Try to restore last chat
     const lastChatId = this.context.workspaceState.get<string>("cp-last-chat-id");
@@ -561,6 +689,40 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         this.currentArtifacts = chat.artifacts || [];
       }
     }
+  }
+
+  /**
+   * Load custom instructions from .codepartner.md and global config.
+   */
+  private loadCustomInstructions(): void {
+    let instructions = "";
+    // Global instructions
+    const globalPath = path.join(os.homedir(), ".codepartner", "global_instructions.md");
+    if (fs.existsSync(globalPath)) {
+      instructions += fs.readFileSync(globalPath, "utf8") + "\n\n";
+      this.output.appendLine("[CodePartner] Loaded global custom instructions.");
+    }
+    // Workspace instructions
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root) {
+      const wsPath = path.join(root, ".codepartner.md");
+      if (fs.existsSync(wsPath)) {
+        instructions += fs.readFileSync(wsPath, "utf8") + "\n\n";
+        this.output.appendLine("[CodePartner] Loaded workspace .codepartner.md instructions.");
+      }
+    }
+    this.customInstructions = instructions.trim();
+  }
+
+  /**
+   * Execute a slash command programmatically (from keybindings or command palette).
+   */
+  public async executeSlashCommand(command: string): Promise<void> {
+    // Ensure the sidebar is visible
+    await vscode.commands.executeCommand("workbench.view.extension.codepartner-view-container");
+    // Small delay to let webview initialize
+    await new Promise(r => setTimeout(r, 300));
+    this.handleSlashCommand(command);
   }
 
   public updateStatus(msg: string) {
@@ -581,15 +743,51 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 Your task is: ${task}
 Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
-    const body = {
-      model: modelId,
-      messages: [{ role: "system", content: subPrompt }],
-      max_tokens: 2048,
-    };
+    let url = "";
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    let body: any = {};
 
-    const res = await axios.post(`${apiEndpoint}/chat/completions`, body, {
-      headers: { "Authorization": `Bearer ${apiKey}` }
-    });
+    const endpoint = apiEndpoint.replace(/\/$/, "");
+
+    if (providerType === "azure") {
+      url = `${endpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
+      headers["api-key"] = apiKey;
+      body = {
+        messages: [{ role: "system", content: subPrompt }],
+        max_tokens: 2048,
+      };
+    } else if (providerType === "anthropic") {
+      url = apiEndpoint || "https://api.anthropic.com/v1/messages";
+      headers["x-api-key"] = apiKey;
+      headers["anthropic-version"] = "2023-06-01";
+      body = {
+        model: modelId,
+        system: subPrompt,
+        messages: [{ role: "user", content: "Begin your task." }],
+        max_tokens: 2048,
+      };
+    } else if (providerType === "google") {
+      url = `${apiEndpoint || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`;
+      headers["Authorization"] = `Bearer ${apiKey}`;
+      body = {
+        model: modelId,
+        messages: [{ role: "system", content: subPrompt }],
+        max_tokens: 2048,
+      };
+    } else {
+      url = `${endpoint || "https://api.openai.com/v1"}/chat/completions`;
+      headers["Authorization"] = `Bearer ${apiKey}`;
+      body = {
+        model: modelId,
+        messages: [{ role: "system", content: subPrompt }],
+        max_tokens: 2048,
+      };
+    }
+
+    const res = await axios.post(url, body, { headers });
+    if (providerType === "anthropic") {
+      return res.data.content[0].text;
+    }
     return res.data.choices[0].message.content;
   }
 
@@ -674,8 +872,11 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         case "changeMode":
           this.executionMode = data.value;
           let promptToUse = FAST_SYSTEM_PROMPT;
-          if (this.executionMode === "planning") promptToUse = PLANNING_SYSTEM_PROMPT;
-          else if (this.executionMode === "architect") promptToUse = ARCHITECT_SYSTEM_PROMPT;
+          if (this.executionMode === "planning") {
+            promptToUse = PLANNING_SYSTEM_PROMPT;
+          } else if (this.executionMode === "architect") {
+            promptToUse = ARCHITECT_SYSTEM_PROMPT;
+          }
           this.messageHistory[0] = { role: "system", content: promptToUse };
           this.output.appendLine(`[CodePartner] Mode changed to: ${this.executionMode}`);
           break;
@@ -722,6 +923,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         case "revertTimelineAction":
           this.revertTimelineAction(data.chatId, data.timestamp);
           break;
+        case "submitFeedback":
+          this.handleFeedbackSubmission(data.feedbackType, data.description, data.includeCode);
+          break;
       }
     });
   }
@@ -729,6 +933,52 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
   private sendChatsToWebview() {
     const chats = this.context.workspaceState.get<any[]>("cp-chats", []);
     this._view?.webview.postMessage({ type: "chatHistory", value: chats });
+  }
+
+  private async handleFeedbackSubmission(type: string, description: string, includeCode: boolean) {
+    let codeContent = "";
+    if (includeCode) {
+      const editor = vscode.window.activeTextEditor;
+      if (editor) {
+        const doc = editor.document;
+        codeContent = `\n\n**Attached Code** (\`${path.basename(doc.fileName)}\`):\n\`\`\`\n${doc.getText().substring(0, 3000)}\n\`\`\``;
+      }
+    }
+
+    const title = `[${type}] ${description.substring(0, 80)}`;
+    const body = `**Type:** ${type}\n\n**Description:**\n${description}${codeContent}\n\n---\n*Submitted via CodePartner extension*`;
+
+    // Use GitHub Issues URL instead of mailto (fixes the Chrome/email bug)
+    const issueUrl = `https://github.com/AnandShah10/CodePartner/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}&labels=${encodeURIComponent(type.toLowerCase())}`;
+
+    // GitHub Issues URLs have a practical limit of ~8000 chars
+    if (issueUrl.length > 8000) {
+      // Truncate body for URL but copy full content to clipboard
+      const shortBody = `**Type:** ${type}\n\n**Description:**\n${description}\n\n*(Code attachment was too long for URL — pasted from clipboard)*`;
+      const shortUrl = `https://github.com/AnandShah10/CodePartner/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(shortBody)}&labels=${encodeURIComponent(type.toLowerCase())}`;
+
+      await vscode.env.clipboard.writeText(body);
+      try {
+        await vscode.env.openExternal(vscode.Uri.parse(shortUrl));
+        this._view?.webview.postMessage({ type: "status", value: "✅ GitHub issue opened! Full content copied to clipboard — paste it in the issue body." });
+      } catch {
+        this._view?.webview.postMessage({ type: "status", value: "⚠️ Couldn't open browser. Feedback copied to clipboard." });
+      }
+      return;
+    }
+
+    try {
+      const success = await vscode.env.openExternal(vscode.Uri.parse(issueUrl));
+      if (success) {
+        this._view?.webview.postMessage({ type: "status", value: "âœ… Feedback prepared in your email client! Please click 'Send'." });
+      } else {
+        throw new Error("Could not open email client.");
+      }
+    } catch (e) {
+      await vscode.env.clipboard.writeText(`To: ${email}\nSubject: ${subject}\n\n${body}`);
+      this._view?.webview.postMessage({ type: "status", value: "âš ï¸ Couldn't open mail client. Feedback copied to clipboard instead!" });
+      vscode.window.showWarningMessage("Could not open your email client. The feedback has been copied to your clipboard.");
+    }
   }
 
   private saveCurrentChat() {
@@ -824,8 +1074,11 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
     this.currentChatId = Date.now().toString();
     let sysPrompt = FAST_SYSTEM_PROMPT;
-    if (this.executionMode === "planning") sysPrompt = PLANNING_SYSTEM_PROMPT;
-    else if (this.executionMode === "architect") sysPrompt = ARCHITECT_SYSTEM_PROMPT;
+    if (this.executionMode === "planning") {
+      sysPrompt = PLANNING_SYSTEM_PROMPT;
+    } else if (this.executionMode === "architect") {
+      sysPrompt = ARCHITECT_SYSTEM_PROMPT;
+    }
     this.messageHistory = [{ role: "system", content: sysPrompt }];
     this.currentPlan = [];
     this.currentArtifacts = [];
@@ -836,6 +1089,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     this._view?.webview.postMessage({ type: "timeline", value: [] });
     this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
     this.sendChatsToWebview();
+
+    const welcomeMsg = "ðŸ‘‹ **Hello! I'm CodePartner.** How can I help you with your code today?\n\nI can help you:\n- ðŸš€ **Build features** and write code\n- ðŸž **Debug issues** and fix errors\n- ðŸ“ **Manage files** and workspace structure\n- ðŸ™ **Automate Git** (diffs, commits, branches)\n- âš¡ **Run commands** in the terminal\n\nWhat are we working on?";
+    this._view?.webview.postMessage({ type: "partial", value: md.render(welcomeMsg) });
+    this.messageHistory.push({ role: "assistant", content: welcomeMsg });
   }
 
   private async suggestFiles(data: any) {
@@ -917,6 +1174,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     }
   }
 
+  public refreshModels() {
+    this.fetchModels();
+  }
+
   private async fetchModels() {
     const config = vscode.workspace.getConfiguration("codepartner");
     const provider = config.get<string>("provider") || "openai";
@@ -944,6 +1205,70 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       return;
     }
 
+    if (provider === "anthropic") {
+      this.availableModels = [
+        { id: "claude-3-7-sonnet-20250219", name: "Claude 3.7 Sonnet" },
+        { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet (New)" },
+        { id: "claude-3-5-sonnet-20240620", name: "Claude 3.5 Sonnet" },
+        { id: "claude-3-5-haiku-20241022", name: "Claude 3.5 Haiku" },
+        { id: "claude-3-opus-20240229", name: "Claude 3 Opus" },
+        { id: "claude-3-sonnet-20240229", name: "Claude 3 Sonnet" },
+        { id: "claude-3-haiku-20240307", name: "Claude 3 Haiku" }
+      ];
+      this.sendModelsToWebview(currentModel || this.availableModels[0].id);
+      return;
+    }
+
+    if (provider === "google") {
+      try {
+        if (apiKey) {
+          const res = await axios.get(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+          if (res.data && res.data.models) {
+            this.availableModels = res.data.models
+              .filter((m: any) => m.name.includes('models/') && (m.supportedGenerationMethods?.includes('generateContent')))
+              .map((m: any) => ({
+                id: m.name.replace('models/', ''),
+                name: m.displayName || m.name.replace('models/', '')
+              }));
+          }
+        }
+      } catch (e) {
+        // Fallback if API key is invalid or request fails
+      }
+      
+      if (this.availableModels.length === 0) {
+        this.availableModels = [
+          { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
+          { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+          { id: "gemini-2.0-pro-exp-02-05", name: "Gemini 2.0 Pro Experimental" },
+          { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" },
+          { id: "gemini-1.5-pro-latest", name: "Gemini 1.5 Pro" },
+          { id: "gemini-1.5-flash-latest", name: "Gemini 1.5 Flash" }
+        ];
+      }
+      this.sendModelsToWebview(currentModel || this.availableModels[0].id);
+      return;
+    }
+
+    if (provider === "ollama") {
+      try {
+        const ollamaEndpoint = apiEndpoint || "http://localhost:11434";
+        const res = await axios.get(`${ollamaEndpoint}/api/tags`);
+        if (res.data && Array.isArray(res.data.models)) {
+          this.availableModels = res.data.models.map((m: any) => ({
+            id: m.name,
+            name: m.name
+          }));
+        } else {
+          this.availableModels = [{ id: "llama3", name: "Llama 3" }];
+        }
+      } catch {
+        this.availableModels = [{ id: "llama3", name: "Llama 3" }];
+      }
+      this.sendModelsToWebview(currentModel || this.availableModels[0].id);
+      return;
+    }
+
     if (!apiEndpoint || !apiKey) {
       this.availableModels = [{ id: currentModel || "gpt-4", name: currentModel || "gpt-4" }];
       this.sendModelsToWebview(currentModel || "gpt-4");
@@ -962,9 +1287,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           name: typeof m === "string" ? m : (m.id || m.name)
         }));
 
-        // Slightly smarter filter: prefer LLMs over embeddings if many exist
-        const llmKeywords = ["gpt", "claude", "gemini", "llama", "mistral", "phi"];
-        const filtered = this.availableModels.filter(m => llmKeywords.some(kw => m.id.toLowerCase().includes(kw)));
+        // Filter out obvious non-LLMs like audio/image models, but keep everything else
+        const excludeKeywords = ["embedding", "tts", "whisper", "dall-e", "text-to-speech", "audio", "vision-only"];
+        const filtered = this.availableModels.filter(m => !excludeKeywords.some(kw => m.id.toLowerCase().includes(kw)));
         if (filtered.length > 0) {
           this.availableModels = filtered;
         }
@@ -1184,7 +1509,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         await editor.edit((editBuilder) => {
           editBuilder.replace(fullRange, aiCode);
         });
-        vscode.window.showInformationMessage("✅ CodePartner: File updated with AI changes.");
+        vscode.window.showInformationMessage("âœ… CodePartner: File updated with AI changes.");
       }
     } catch (err) {
       vscode.window.showErrorMessage("Failed to apply changes: " + err);
@@ -1216,7 +1541,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         "vscode.diff",
         originalUri,
         proposedUri,
-        "CodePartner: Review Changes (Selection) ← Original | AI Proposal →"
+        "CodePartner: Review Changes (Selection) â† Original | AI Proposal â†’"
       );
 
       setTimeout(() => {
@@ -1234,7 +1559,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         "vscode.diff",
         originalUri,
         proposedUri,
-        `CodePartner: Review Changes ← ${document.fileName} | AI Suggestion →`
+        `CodePartner: Review Changes â† ${document.fileName} | AI Suggestion â†’`
       );
     }
     vscode.window.showInformationMessage("Review the diff. Use the buttons in the diff editor to Accept or Revert changes.");
@@ -1284,7 +1609,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       return "";
     }
 
-    this._view?.webview.postMessage({ type: "status", value: "🔍 Searching the web..." });
+    this._view?.webview.postMessage({ type: "status", value: "ðŸ” Searching the web..." });
 
     try {
       this.output.appendLine(`[CodePartner] Web search: ${query}`);
@@ -1334,7 +1659,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     if (!prompt.includes("@workspace")) {
       return "";
     }
-    this._view?.webview.postMessage({ type: "status", value: "📂 Scanning workspace..." });
+    this._view?.webview.postMessage({ type: "status", value: "ðŸ“‚ Scanning workspace..." });
     try {
       const files = await vscode.workspace.findFiles("**/*", "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}", 200);
       const paths = files.map((f) => vscode.workspace.asRelativePath(f)).sort();
@@ -1388,16 +1713,24 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
     let maxTokens = config.get<number>("maxTokens") || 4096;
+    if (modelId.includes("claude-3-5") || modelId.includes("claude-3-7")) {
+      maxTokens = Math.max(maxTokens, 8192);
+    }
 
-    if (!apiEndpoint || !apiKey || !modelId) {
+    const isOllama = providerType === "ollama";
+    const needsEndpoint = !["anthropic", "google", "ollama"].includes(providerType);
+    const needsKey = !isOllama;
+
+    if ((needsEndpoint && !apiEndpoint) || (needsKey && !apiKey) || !modelId) {
       this._view.webview.postMessage({
         type: "error",
-        value: "⚠️ **CodePartner not configured.**\\n\\nOpen **Settings** and set:\\n- `codepartner.provider`\\n- `codepartner.apiEndpoint`\\n- `codepartner.apiKey`\\n- `codepartner.model`"
+        value: "âš ï¸ **CodePartner not configured.**\\n\\nOpen **Settings** and set:\\n- `codepartner.provider`\\n- `codepartner.apiEndpoint`\\n- `codepartner.apiKey`\\n- `codepartner.model`"
       });
       return;
     }
 
-    let contextHeader = "";
+    try {
+      let contextHeader = "";
     contextHeader += await this.getWebSearchContext(prompt);
     contextHeader += await this.getWorkspaceContext(prompt);
     contextHeader += await this.getFileMentionsContext(prompt);
@@ -1412,7 +1745,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nSelected Code:\n\`\`\`\n${code}\n\`\`\`\n`;
       } else {
         const text = document.getText();
-        const capped = text.length > 8000 ? text.substring(0, 8000) + "\n… (truncated)" : text;
+        const capped = text.length > 8000 ? text.substring(0, 8000) + "\nâ€¦ (truncated)" : text;
         contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nContent:\n\`\`\`\n${capped}\n\`\`\`\n`;
       }
     }
@@ -1463,7 +1796,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       if (providerType === "azure") {
         url = `${endpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
         headers["api-key"] = apiKey;
-      } else {
+      } else if (providerType !== "anthropic") {
         url = `${endpoint}/chat/completions`;
         headers["Authorization"] = `Bearer ${apiKey}`;
       }
@@ -1477,7 +1810,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           if (m.tool_call_id) {
             msg.tool_call_id = m.tool_call_id;
             // The tool result message needs 'name' if it was a function call
-            if (m.name) msg.name = m.name;
+            if (m.name) {
+              msg.name = m.name;
+            }
           }
           if (m.name && m.role !== "tool") {
             msg.name = m.name;
@@ -1485,7 +1820,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           return msg;
         }),
         max_tokens: maxTokens,
-        temperature: 0.1,
+        temperature: 0.4,
         stream: true,
       };
 
@@ -1494,7 +1829,47 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         body.tool_choice = "auto";
       }
 
-      if (providerType !== "azure") {
+      if (providerType === "anthropic") {
+        url = apiEndpoint || "https://api.anthropic.com/v1/messages";
+        headers["x-api-key"] = apiKey;
+        headers["anthropic-version"] = "2023-06-01";
+        headers["anthropic-beta"] = "max-tokens-3-5-sonnet-2024-07-15"; // Allow 8k tokens for Claude 3.5
+        // Anthropic has a different body structure
+        const anthropicBody: any = {
+          model: modelId,
+          max_tokens: maxTokens,
+          messages: this.messageHistory.filter(m => m.role !== "system").map(m => ({
+            role: m.role === "assistant" ? "assistant" : "user",
+            content: typeof m.content === "string" ? m.content : JSON.stringify(m.content)
+          })),
+          stream: true
+        };
+        const sysMsg = this.messageHistory.find(m => m.role === "system");
+        if (sysMsg) {
+          anthropicBody.system = sysMsg.content;
+        }
+        
+        // Map tools if present
+        if (useTools) {
+          anthropicBody.tools = TOOLS.map(t => ({
+            name: t.name,
+            description: t.description,
+            input_schema: {
+              type: "object",
+              properties: t.parameters.properties,
+              required: t.parameters.required
+            }
+          }));
+        }
+        Object.assign(body, anthropicBody);
+      } else if (providerType === "google") {
+        url = `${apiEndpoint || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`;
+        headers["Authorization"] = `Bearer ${apiKey}`;
+        body.model = modelId;
+      } else if (providerType === "ollama") {
+        url = `${apiEndpoint || "http://localhost:11434/v1"}/chat/completions`;
+        body.model = modelId;
+      } else if (providerType !== "azure") {
         body.model = modelId;
       }
 
@@ -1513,35 +1888,53 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
             }
             try {
               const parsed = JSON.parse(event.data);
-              const delta = parsed.choices?.[0]?.delta;
-              if (!delta) {
-                return;
-              }
-              if (delta.reasoning_content || delta.thought) {
-                const reasoning = delta.reasoning_content || delta.thought;
-                fullReasoning += reasoning;
-                this._view?.webview.postMessage({ type: "thought", value: md.render(fullReasoning) });
-              }
-              if (delta.content) {
-                fullResponse += delta.content;
+              
+              // Anthropic format
+              if (parsed.type === "content_block_delta" && parsed.delta?.text) {
+                fullResponse += parsed.delta.text;
                 this._view?.webview.postMessage({ type: "partial", value: md.render(fullResponse) });
+              } else if (parsed.type === "message_start") {
+                // message start info
+              } else if (parsed.type === "content_block_start" && parsed.content_block?.type === "tool_use") {
+                const index = parsed.index;
+                if (!toolCalls[index]) {
+                  toolCalls[index] = { id: parsed.content_block.id, type: "function", function: { name: parsed.content_block.name, arguments: "" } };
+                }
+              } else if (parsed.type === "content_block_delta" && parsed.delta?.type === "input_json_delta") {
+                const index = parsed.index;
+                if (toolCalls[index]) {
+                  toolCalls[index].function.arguments += parsed.delta.partial_json;
+                }
               }
-              if (delta.tool_calls) {
-                delta.tool_calls.forEach((tc: any) => {
-                  const index = tc.index;
-                  if (!toolCalls[index]) {
-                    toolCalls[index] = { id: tc.id, type: "function", function: { name: "", arguments: "" } };
-                  }
-                  if (tc.id) {
-                    toolCalls[index].id = tc.id;
-                  }
-                  if (tc.function?.name) {
-                    toolCalls[index].function.name += tc.function.name;
-                  }
-                  if (tc.function?.arguments) {
-                    toolCalls[index].function.arguments += tc.function.arguments;
-                  }
-                });
+              // OpenAI / Azure / Google format
+              const delta = parsed.choices?.[0]?.delta;
+              if (delta) {
+                if (delta.reasoning_content || delta.thought) {
+                  const reasoning = delta.reasoning_content || delta.thought;
+                  fullReasoning += reasoning;
+                  this._view?.webview.postMessage({ type: "thought", value: md.render(fullReasoning) });
+                }
+                if (delta.content) {
+                  fullResponse += delta.content;
+                  this._view?.webview.postMessage({ type: "partial", value: md.render(fullResponse) });
+                }
+                if (delta.tool_calls) {
+                  delta.tool_calls.forEach((tc: any) => {
+                    const index = tc.index;
+                    if (!toolCalls[index]) {
+                      toolCalls[index] = { id: tc.id, type: "function", function: { name: "", arguments: "" } };
+                    }
+                    if (tc.id) {
+                      toolCalls[index].id = tc.id;
+                    }
+                    if (tc.function?.name) {
+                      toolCalls[index].function.name += tc.function.name;
+                    }
+                    if (tc.function?.arguments) {
+                      toolCalls[index].function.arguments += tc.function.arguments;
+                    }
+                  });
+                }
               }
             } catch {
               // ignore
@@ -1558,6 +1951,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         let shouldBreakLoop = false;
 
         if (toolCalls.length > 0) {
+          toolCalls = toolCalls.filter(Boolean); // Remove sparse array empty slots
           const assistantMessage = { role: "assistant", content: fullResponse || null, tool_calls: toolCalls };
           this.messageHistory.push(assistantMessage);
 
@@ -1694,7 +2088,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           }
         }
 
-        this._view?.webview.postMessage({ type: "error", value: `❌ **Error${status ? ` (${status})` : ""}:** ${msg}` });
+        this._view?.webview.postMessage({ type: "error", value: `âŒ **Error${status ? ` (${status})` : ""}:** ${msg}` });
         break;
       } finally {
         this.abortController = undefined;
@@ -1713,10 +2107,14 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       this.suggestedWorkflows.add(toolSummary);
       this.suggestedSkillsCount++;
     }
-    if (iteration >= maxIterations) {
-      this._view?.webview.postMessage({ type: "suggestContinue" });
+      if (iteration >= maxIterations) {
+        this._view?.webview.postMessage({ type: "suggestContinue" });
+      }
+      this._view?.webview.postMessage({ type: "done", turnId });
+    } catch (globalErr: any) {
+      this.output.appendLine(`[CodePartner] Fatal Error in handlePrompt: ${globalErr.message || globalErr}`);
+      this._view?.webview.postMessage({ type: "error", value: `❌ **Error:** ${globalErr.message || globalErr}` });
     }
-    this._view?.webview.postMessage({ type: "done", turnId });
   }
 
   private extractPlan(response: string): { task: string; done: boolean }[] {
@@ -1803,22 +2201,68 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         return this.indexDocs(args.url, args.title);
       case "query_knowledge":
         return this.queryKnowledge(args.query);
+      case "generate_commit_message":
+        const diff = await this.gitManager.getDiff();
+        return `Draft a commit message for these changes:\n\n${diff}`;
+      case "get_git_status":
+        return this.gitManager.getStatus();
+      case "create_git_branch":
+        return this.gitManager.createBranch(args.name);
+      case "stage_git_changes":
+        return this.gitManager.stageAll();
+      case "commit_git_changes":
+        return this.gitManager.commit(args.message);
       default:
         return `Error: Tool not found: ${name}`;
     }
   }
 
-  private runCommand(command: string): string {
+  private async runCommand(command: string): Promise<string> {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return "No workspace open.";
     }
-    try {
-      const output = cp.execSync(command, { cwd: root, encoding: "utf8", timeout: 30000 });
-      return output || "(Done, no output)";
-    } catch (e: any) {
-      return `Command failed: ${e.message}\nSTDOUT: ${e.stdout}\nSTDERR: ${e.stderr}`;
+
+    if (!this.terminal || (this.terminal as any).exitStatus !== undefined) {
+      this.terminal = vscode.window.createTerminal({
+        name: "CodePartner Agent",
+        cwd: root
+      });
     }
+    this.terminal.show(true);
+
+    const tempOutputFile = path.join(os.tmpdir(), `cp_output_${Date.now()}.txt`);
+    const isWin = process.platform === "win32";
+    
+    // Use a slightly different redirection for Windows PowerShell vs Bash
+    const fullCommand = isWin 
+      ? `${command} | Out-File -FilePath "${tempOutputFile}" -Encoding utf8; Get-Content "${tempOutputFile}"`
+      : `${command} > "${tempOutputFile}" 2>&1; cat "${tempOutputFile}"`;
+
+    this.terminal.sendText(fullCommand);
+
+    // Wait for the file to be created and populated
+    // This is a simple polling mechanism. In a real production app, we might use a more robust watcher.
+    return new Promise((resolve) => {
+      let checks = 0;
+      const interval = setInterval(() => {
+        checks++;
+        if (fs.existsSync(tempOutputFile)) {
+          const stats = fs.statSync(tempOutputFile);
+          // If file hasn't changed in the last 500ms and has content, or we timed out
+          if (stats.size > 0 || checks > 100) {
+            clearInterval(interval);
+            const content = fs.readFileSync(tempOutputFile, "utf8");
+            try { fs.unlinkSync(tempOutputFile); } catch {}
+            resolve(content || "(Command executed, no output captured)");
+          }
+        }
+        if (checks > 200) { // 20 second timeout
+          clearInterval(interval);
+          resolve("Command timed out or produced no output in terminal.");
+        }
+      }, 100);
+    });
   }
 
   private listDir(relPath: string): string {
@@ -1998,25 +2442,31 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         return "Could not auto-detect test runner. Please provide a command (e.g., 'npm test', 'pytest').";
       }
     }
-    this._view?.webview.postMessage({ type: "status", value: `🧪 Running tests: ${command}` });
+    this._view?.webview.postMessage({ type: "status", value: `ðŸ§ª Running tests: ${command}` });
     try {
       const output = cp.execSync(command, { cwd: root, encoding: "utf8", timeout: 60000, maxBuffer: 1024 * 1024 * 5 });
-      return `✅ Tests passed.\n\n${output}`;
+      return `âœ… Tests passed.\n\n${output}`;
     } catch (e: any) {
-      return `❌ Tests failed.\n\nSTDOUT:\n${e.stdout || "(none)"}\n\nSTDERR:\n${e.stderr || "(none)"}`;
+      return `âŒ Tests failed.\n\nSTDOUT:\n${e.stdout || "(none)"}\n\nSTDERR:\n${e.stderr || "(none)"}`;
     }
   }
 
   private async indexDocs(url: string, title: string): Promise<string> {
     const knowledgeDir = path.join(os.homedir(), ".codepartner", "knowledge");
-    if (!fs.existsSync(knowledgeDir)) { fs.mkdirSync(knowledgeDir, { recursive: true }); }
+    if (!fs.existsSync(knowledgeDir)) {
+      fs.mkdirSync(knowledgeDir, { recursive: true });
+    }
 
-    this._view?.webview.postMessage({ type: "status", value: `📖 Indexing docs: ${url}...` });
+    this._view?.webview.postMessage({ type: "status", value: `ðŸ“– Indexing docs: ${url}...` });
 
     try {
-      if (!this.browserManager) return "Error: Browser manager not initialized.";
+      if (!this.browserManager) {
+        return "Error: Browser manager not initialized.";
+      }
       const result = await this.browserManager.execute("navigate", url);
-      if (result.startsWith("Error")) return result;
+      if (result.startsWith("Error")) {
+        return result;
+      }
 
       const content = result.split("Content Preview: ")[1] || "";
       const fileName = `${title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.md`;
@@ -2073,7 +2523,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       "vscode.diff",
       originalUri,
       currentUri,
-      `${relPath} (Original ↔ Agentic Change)`
+      `${relPath} (Original â†” Agentic Change)`
     );
   }
 
@@ -2137,7 +2587,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
     }));
     this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
-    this._view?.webview.postMessage({ type: "status", value: `🏗️ Architect Mode: Applied ${count} drafted files.` });
+    this._view?.webview.postMessage({ type: "status", value: `ðŸ—ï¸ Architect Mode: Applied ${count} drafted files.` });
     vscode.window.showInformationMessage(`Applied ${count} drafted files.`);
   }
 
@@ -2155,7 +2605,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     try {
       if (event.revertContent === "") {
         // Was created by agent, so reverting means deleting it
-        if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+        if (fs.existsSync(fullPath)) {
+          fs.unlinkSync(fullPath);
+        }
       } else {
         // Was edited, revert to previous content
         fs.writeFileSync(fullPath, event.revertContent, "utf8");
@@ -2183,7 +2635,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       const fullPath = path.join(root, event.path);
       try {
         if (event.revertContent === "") {
-          if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+          if (fs.existsSync(fullPath)) {
+            fs.unlinkSync(fullPath);
+          }
         } else {
           fs.writeFileSync(fullPath, event.revertContent, "utf8");
         }
@@ -2231,6 +2685,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         <button id="history-btn" class="icon-btn" title="Saved Chats">
           <svg viewBox="0 0 16 16"><path d="M14.5 13.5V12a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v1.5a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5zM2 3V2a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1h1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3h1zm11 0V2H3v1h10zM2 12h12V4H2v8z"/></svg>
         </button>
+        <button id="feedback-btn" class="icon-btn" title="Send Feedback / Report Bug">
+          <svg viewBox="0 0 16 16"><path d="M1 2a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H5l-3 3V2z"/></svg>
+        </button>
         <button id="new-chat-btn" class="icon-btn" title="New Chat">
           <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm3 8H9v2H7V9H5V7h2V5h2v2h2v2z"/></svg>
         </button>
@@ -2246,6 +2703,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       </button>
       <button class="tab-btn" data-tab="artifacts" title="Artifacts">
         <svg viewBox="0 0 16 16"><path d="M4 1.75V14h8V4.75L9.25 1.75H4zM3.25 0h6a.75.75 0 0 1 .53.22l3.5 3.5a.75.75 0 0 1 .22.53v10.5A1.25 1.25 0 0 1 12.25 16H3.75A1.25 1.25 0 0 1 2.5 14.75V1.25C2.5.56 3.06 0 3.75 0h-.5z"/></svg>
+      </button>
+      <button class="tab-btn" data-tab="plan" title="Plan">
+        <svg viewBox="0 0 16 16"><path d="M3.5 2a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5h-9zM5 5h6v1H5V5zm0 2.5h6v1H5v-1zm0 2.5h4v1H5v-1z"/></svg>
       </button>
       <button class="tab-btn" data-tab="skills" title="Skills">
         <svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>
@@ -2311,6 +2771,16 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       <div id="tab-skills" class="tab-content">
         <div id="skill-list">
           <div class="empty-state">No skills learned yet. Ask to "save a skill".</div>
+        </div>
+      </div>
+
+      <div id="tab-plan" class="tab-content">
+        <div class="pane-header">
+          <span>Implementation Plan</span>
+          <span class="plan-progress"></span>
+        </div>
+        <div id="plan-list">
+          <div class="empty-state">No active plan. Use Planning mode for complex tasks.</div>
         </div>
       </div>
 
