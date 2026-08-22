@@ -961,12 +961,27 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     const title = `[${type}] ${description.substring(0, 80)}`;
     const body = `**Type:** ${type}\n\n**Description:**\n${description}${codeContent}\n\n---\n*Submitted via CodePartner extension*`;
 
-    // Use GitHub Issues URL instead of mailto (fixes the Chrome/email bug)
+    // If user is logged in to GitHub in the IDE, prefer email using their account email
+    let githubSession = null;
+    try {
+      githubSession = await vscode.authentication.getSession("github", ["user:email"], { createIfNone: false });
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] GitHub auth check skipped: ${e.message}`);
+    }
+    if (githubSession?.account?.label?.includes("@")) {
+      const userEmail = githubSession.account.label;
+      const mailtoUri = `mailto:${encodeURIComponent(userEmail)}?subject=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+      const success = await vscode.env.openExternal(vscode.Uri.parse(mailtoUri));
+      if (success) {
+        this._view?.webview.postMessage({ type: "status", value: "✅ Feedback opened in your default email client!" });
+        return;
+      }
+    }
+
+    // Fallback to GitHub Issues (original behavior)
     const issueUrl = `https://github.com/AnandShah10/CodePartner/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}&labels=${encodeURIComponent(type.toLowerCase())}`;
 
-    // GitHub Issues URLs have a practical limit of ~8000 chars
     if (issueUrl.length > 8000) {
-      // Truncate body for URL but copy full content to clipboard
       const shortBody = `**Type:** ${type}\n\n**Description:**\n${description}\n\n*(Code attachment was too long for URL — pasted from clipboard)*`;
       const shortUrl = `https://github.com/AnandShah10/CodePartner/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(shortBody)}&labels=${encodeURIComponent(type.toLowerCase())}`;
 
@@ -983,15 +998,15 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     try {
       const success = await vscode.env.openExternal(vscode.Uri.parse(issueUrl));
       if (success) {
-        this._view?.webview.postMessage({ type: "status", value: "âœ… Feedback prepared in your email client! Please click 'Send'." });
+        this._view?.webview.postMessage({ type: "status", value: "✅ GitHub issue opened in browser for feedback." });
       } else {
-        throw new Error("Could not open email client.");
+        throw new Error("Could not open browser.");
       }
     } catch (e) {
       const fullText = `Title: ${title}\n\n${body}`;
       await vscode.env.clipboard.writeText(fullText);
-      this._view?.webview.postMessage({ type: "status", value: "âš ï¸ Couldn't open mail client. Feedback copied to clipboard instead!" });
-      vscode.window.showWarningMessage("Could not open your email client. The feedback has been copied to your clipboard.");
+      this._view?.webview.postMessage({ type: "status", value: "⚠️ Feedback copied to clipboard. Please create a GitHub issue manually." });
+      vscode.window.showWarningMessage("Could not open browser. Feedback copied to clipboard.");
     }
   }
 
@@ -2993,7 +3008,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         <svg viewBox="0 0 16 16"><path d="M3.5 2a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5h-9zM5 5h6v1H5V5zm0 2.5h6v1H5v-1zm0 2.5h4v1H5v-1z"/></svg>
       </button>
       <button class="tab-btn" data-tab="skills" title="Skills">
-        <svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 9.27a3.25 3.25 0 0 0-3.47-8.752L4.5 7.022a5.045 5.045 0 0 0-4.624 3.2 5.052 5.052 0 0 0 1.352 2.766l2.128-2.128a.75.75 0 0 1 1.06 1.06l-2.127 2.129A5.05 5.05 0 0 0 5.28 15.4c.94.417 1.954.542 2.92.368L14.7 9.27zM7.222 8.444L11.23 4.437a1.75 1.75 0 1 1 2.474 2.475l-4.007 4.007-2.475-2.475z"/></svg>
       </button>
     </div>
 

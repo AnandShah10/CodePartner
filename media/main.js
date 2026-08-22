@@ -766,8 +766,9 @@
   }
 
   function syncOverlay() {
-    promptOverlay.innerHTML = formatMentionsForOverlay(promptInput.value);
-    promptOverlay.style.height = promptInput.style.height;
+    if (!promptOverlay || !promptInput) return;
+    promptOverlay.innerHTML = formatMentionsForOverlay(promptInput.value || '');
+    promptOverlay.style.height = promptInput.style.height || '44px';
     promptOverlay.scrollTop = promptInput.scrollTop;
   }
 
@@ -776,6 +777,13 @@
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 200) + 'px';
     syncOverlay();
+
+    // Preserve cursor position (fixes cursor jumping bug with overlay/mentions)
+    const cursorPos = this.selectionStart;
+    // Force layout to ensure cursor position is correct after overlay sync
+    void this.offsetWidth;
+    this.selectionStart = cursorPos;
+    this.selectionEnd = cursorPos;
 
     const pos = promptInput.selectionStart;
     const val = promptInput.value;
@@ -825,6 +833,34 @@
     }
   });
 
+  // Image paste support for chatbox
+  promptInput.addEventListener('paste', (e) => {
+    const items = (e.clipboardData || window.clipboardData)?.items || [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        e.preventDefault();
+        const file = items[i].getAsFile();
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const base64 = event.target.result.toString().split(',')[1];
+            const attached = [{
+              name: `pasted-image-${Date.now()}.png`,
+              mimeType: 'image/png',
+              data: base64
+            }];
+            attachedFiles.push(...attached);
+            renderAttachmentChips();
+            statusText.innerText = '📎 Image pasted and attached!';
+            setTimeout(() => { if (statusText) statusText.innerText = ''; }, 2500);
+          };
+          reader.readAsDataURL(file);
+          return;
+        }
+      }
+    }
+  });
+
   modelSelector.onchange = () => {
     vscode.postMessage({ type: 'changeModel', value: modelSelector.value });
   };
@@ -833,12 +869,7 @@
     vscode.postMessage({ type: 'attachFiles' });
   };
 
-  const applyDraftsBtn = document.getElementById('apply-drafts-btn');
-  if (applyDraftsBtn) {
-    applyDraftsBtn.onclick = () => {
-      vscode.postMessage({ type: 'applyDrafts' });
-    };
-  }
+  // Architect drafts button is already wired above with correct message type 'applyArchitectDrafts'
 
   // Handle Send/Stop click
   sendBtn.addEventListener('click', () => {
@@ -1339,5 +1370,10 @@
     chatHistory.parentElement.prepend(banner);
     setTimeout(() => { if (banner.parentElement) banner.remove(); }, 30000);
   }
+
+  // Ensure overlay is initialized (fixes text visibility in input)
+  setTimeout(() => {
+    syncOverlay();
+  }, 50);
 
 })();

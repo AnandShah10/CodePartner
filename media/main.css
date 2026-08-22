@@ -74,6 +74,17 @@ html, body {
   display: flex; background: var(--vscode-sideBar-background);
   border-bottom: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
   height: var(--tab-height); flex-shrink: 0; position: relative;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+#tab-bar::-webkit-scrollbar {
+  display: none;
+}
+.tab-btn {
+  flex: 0 0 auto;
+  min-width: 48px;
+  padding: 0 12px;
 }
 .tab-btn {
   flex: 1; background: transparent; border: none;

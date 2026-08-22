@@ -1,6 +1,6 @@
-# CodePartner vs. Antigravity / Claude Code / GitHub Copilot
+# CodePartner vs. Competitors (Antigravity, Claude Code, GitHub Copilot)
 
-A deep-dive comparison based on CodePartner v1.2.2 source code analysis and current competitor capabilities (May 2026).
+A deep-dive comparison based on CodePartner v2.0.2 capabilities (October 2024). Note that the extension has significantly evolved with MCP support, semantic search, architect mode, full Git tools, and inline completions.
 
 ---
 

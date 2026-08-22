@@ -1,62 +1,169 @@
-# CodePartner AI — The Premiere Agentic AI Coding Companion
+# CodePartner AI
+
+[![Version](https://img.shields.io/badge/version-2.0.2-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ![CodePartner Hero](media/hero.png)
 
-**CodePartner** is a powerful, agentic AI co-pilot designed to transform how you build software. Unlike traditional chat extensions, CodePartner is built from the ground up with an "agent-first" philosophy—meaning it doesn't just suggest code; it plans, executes, and iterates on complex tasks directly in your workspace.
+**CodePartner AI** is a powerful **agentic** AI coding co-pilot that goes far beyond simple chat. Built with an "agent-first" philosophy, it autonomously plans, researches, edits code safely, runs commands, controls a browser, manages Git, and learns reusable **Skills** — all while following strict engineering best practices.
 
-Whether you're refactoring a legacy codebase, building a new feature from scratch, or researching complex documentation, CodePartner is your autonomous partner in the editor.
-
----
-
-## ✨ Why CodePartner?
-
-In a world of simple "chat-with-file" extensions, CodePartner stands out by offering:
-
-- **🎨 Premium Visual Experience**: A stunning, VS Code-native sidebar using modern glassmorphism design. It's not just a tool; it's a premium extension of your workflow.
-- **⚡ Two Ways to Work**: 
-  - **Fast Mode**: For quick questions, snippets, and bug fixes.
-  - **Planning Mode**: For complex architectural changes. CodePartner will generate a full roadmap before touching a single line of code.
-- **🧠 Reusable Skills**: Teach CodePartner your unique workflows. Save any set of instructions as a "Skill" and reuse it globally across all your projects.
-- **🛠️ Safe & Precise Editing**: CodePartner uses advanced Search/Replace semantics. No more worrying about the AI overwriting your entire file with a partial snippet.
-- **🌐 Autonomous Research**: Built-in browser control allows the AI to search the web, read documentation, and even take screenshots to verify UI changes.
-- **📂 Content-Aware Search**: Mention `@workspace` and CodePartner will intelligently find the most relevant files by scanning contents, not just filenames.
+It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **inline completions**, **MCP tools**, semantic search, multi-agent collaboration, and a beautiful glassmorphism UI with tabs for Plan, Timeline, Artifacts, and Skills.
 
 ---
 
-## 🚀 Getting Started
+## ✨ Key Features
 
-CodePartner is designed to be up and running in seconds:
+### 🧠 Agentic Capabilities
+- **Three Operating Modes**:
+  - **Fast Mode**: Direct, concise responses and immediate actions
+  - **Planning Mode**: Generates detailed implementation plans + artifacts; waits for approval before editing
+  - **Architect Mode**: Drafts changes in-memory for review before bulk application
+- **Multi-Agent System**: Automatically dispatches to specialized sub-agents (`researcher`, `code_expert`, `tester`, `writer`)
+- **Proactive Skill Discovery**: Suggests saving repeated workflows as reusable global **Skills**
+- **Timeline & Revert**: Full audit trail of every tool action with one-click undo
 
-1. **Install**: Click the **Install** button on this Marketplace page.
-2. **Configure**: Open VS Code Settings (`Ctrl+,`) and search for `CodePartner`.
-   - Set your **API Provider** (`openai` or `azure`).
-   - Enter your **API Key** and **Model ID** (e.g., `gpt-4o`).
-3. **Open the Sidebar**: Click the CodePartner icon in the Activity Bar.
-4. **Build**: Toggle to **Plan** mode and try asking: *"Refactor this project to use a modular structure and add unit tests."*
+### 🛠️ Powerful Tools
+- **Safe File Operations**: `read_file` (always first), precise `search/replace` editing, `create_file`, `grep_search`
+- **Terminal & Testing**: Runs shell commands, auto-detects and runs tests (`run_tests`)
+- **Browser Control**: Navigate, click, type, screenshot web pages for research (cross-platform via Puppeteer)
+- **Git Integration**: Status, stage, AI commit messages, branches, and GitHub PR creation
+- **Web & Knowledge**: DuckDuckGo search, document indexing (`index_docs` + `query_knowledge`)
+- **MCP Support**: Connect to external Model Context Protocol servers for custom tools
+- **Artifacts**: Persistent storage of code, markdown, logs, and screenshots in `~/.codepartner`
+
+### 🔍 Smart Context
+- `@workspace` - Semantic TF-IDF search across your codebase
+- `@web` - Real-time web search
+- `@file` mentions and automatic context from active file + open tabs
+- Context compaction for long conversations
+- Image/file attachments support
+
+### 🎨 Premium UX
+- Beautiful glassmorphism sidebar with tabs (Chat, Plan, Timeline, Artifacts, Skills)
+- Inline ghost text completions (toggle with `Ctrl+Shift+I`)
+- Diff views, apply/insert/copy actions on code blocks
+- Model selector, mode switcher, chat history with rename/delete
+- Feedback button for bugs/features
 
 ---
 
-## ⚙️ Configuration Options
+## 🚀 Quick Start
 
-| Setting | Description |
-| :--- | :--- |
-| `codepartner.provider` | API provider (`openai`, `azure`) |
-| `codepartner.apiEndpoint` | Your LLM endpoint URL |
-| `codepartner.apiKey` | Your API authentication key |
-| `codepartner.model` | The model ID or deployment name to use |
-| `codepartner.maxTokens` | Maximum response length (default: 1024) |
-| `codepartner.azureApiVersion` | Azure OpenAI API version (e.g., `2024-02-15-preview`) |
-| `codepartner.azureDeployments` | List of Azure deployment names to show in the UI |
+1. **Install** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+2. **Configure API**:
+   - Open Command Palette (`Ctrl+Shift+P`) → "Preferences: Open Settings (UI)"
+   - Search for "CodePartner"
+   - Set:
+     - `provider` (e.g. `openai`, `anthropic`, `ollama`)
+     - `apiKey`
+     - `model` (e.g. `gpt-4o`, `claude-3-5-sonnet-20241022`, `llama3`)
+3. **Open Sidebar**: Click the robot icon in Activity Bar or press `Ctrl+L` / `Cmd+L`
+4. **Try it**:
+   - **Fast**: "Explain this function"
+   - **Plan**: Switch to Planning mode and ask "Add user authentication with JWT"
+   - Use slash commands: `/fix`, `/explain`, `/test`
+
+**Tip**: Use `@workspace` for project-wide awareness and `@web` for research.
 
 ---
 
-## 📦 Global Persistence
+## ⌨️ Commands & Keybindings
 
-Your learned **Skills** and generated **Artifacts** are stored globally in `~/.codepartner`. This ensures that a skill you teach CodePartner in one project is immediately available in all your others.
+| Command | Title | Keybinding | Description |
+|---------|-------|------------|-------------|
+| `codepartner.focus` | Focus on Chat Sidebar | `Ctrl+L` / `Cmd+L` | Open the sidebar |
+| `codepartner.toggleInlineCompletions` | Toggle Inline Completions | `Ctrl+Shift+I` / `Cmd+Shift+I` | Enable/disable ghost text |
+| `codepartner.explainSelection` | Explain Selected Code | `Ctrl+Shift+;` / `Cmd+Shift+;` (when selection) | Context-aware explanation |
+| `codepartner.fixErrors` | Fix Errors in File | `Ctrl+Shift+'` / `Cmd+Shift+'` | Auto-fix diagnostics |
+| `codepartner.generateTests` | Generate Tests for File | - | Create unit tests |
+| `codepartner.showDebugLog` | Show Debug Log | - | Open output channel |
+
+**Slash Commands in Chat**: `/fix`, `/explain`, `/test`, `/compact`, `/clear`
+
+---
+
+## ⚙️ Configuration
+
+Key settings (full list in VS Code Settings):
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `codepartner.provider` | `openai` | `openai`, `azure`, `anthropic`, `google`, `ollama` |
+| `codepartner.apiKey` | `` | Your API key |
+| `codepartner.model` | `gpt-4` | Model name/deployment |
+| `codepartner.apiEndpoint` | `https://api.openai.com/v1` | Custom endpoint |
+| `codepartner.inlineCompletions` | `false` | Enable ghost text completions |
+| `codepartner.inlineCompletionDebounce` | `500` | Debounce ms for completions |
+| `codepartner.mcpServers` | `{}` | MCP server configurations |
+| `codepartner.addAICoAuthor` | `true` | Add Co-authored-by to Git commits |
+| `codepartner.maxTokens` | `4096` | Max output tokens |
+
+---
+
+## 📁 Global Persistence (`~/.codepartner`)
+
+- **Skills**: Reusable instruction sets (`.md` files)
+- **Artifacts**: Generated plans, code snippets, screenshots, logs
+- **Knowledge**: Indexed documentation via `index_docs`
+- **Global Instructions**: `global_instructions.md` applied to every chat
+
+Skills and knowledge travel with you across all projects.
+
+---
+
+## 📸 Screenshots
+
+*(Screenshots will be added to the marketplace listing. Current assets in `/media`)*
+
+- Glassmorphism Sidebar with multiple tabs
+- Planning Mode with task tracker
+- Timeline showing tool executions and revert options
+- Artifact gallery with screenshots
+- Inline completions in editor
+- Diff review workflow
+
+---
+
+## 🔄 How It Works (Agent Rules)
+
+CodePartner follows strict internal guidelines:
+1. Always `read_file` before `edit_file`
+2. Use exact text matching for search/replace
+3. Create full, complete implementations (no truncated code)
+4. In Planning Mode: Research → Create Plan Artifact → Wait for "proceed" → Execute → Verify with tests
+5. Explains reasoning in responses
+6. Uses markdown formatting
+
+See full system prompt and tool definitions in `src/extension.ts`.
+
+---
+
+## 🤖 vs Other Tools
+
+CodePartner excels in:
+- **Broadest provider support** including local Ollama (no subscription required)
+- **Global reusable Skills** and proactive suggestions
+- **Browser automation** (unique vs Copilot)
+- **Timeline with undo** and Architect drafting mode
+- **Zero lock-in** — bring your own keys
+
+For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
+
+**Note**: Inline completions were added in v2.0.2. Semantic search and MCP bring it closer to industry leaders.
+
+---
 
 ## 📄 License
 
-CodePartner is released under the [MIT License](https://github.com/AnandShah10/CodePartner/blob/master/LICENSE).
+This project is licensed under the [MIT License](LICENSE).
 
 ---
-Developed with ❤️ by **AnandShah** — [GitHub](https://github.com/AnandShah10)
+
+**Developed with ❤️ by [AnandShah](https://github.com/AnandShah10)**
+
+[GitHub Repository](https://github.com/AnandShah10/CodePartner) | [Report Issue](https://github.com/AnandShah10/CodePartner/issues) | [Marketplace Page](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+
+---
+
+**Happy Coding!** Try asking CodePartner to "build a full-featured todo app with tests" in Planning mode.
