@@ -46,7 +46,7 @@ class CodePartnerDiffProvider implements vscode.TextDocumentContentProvider {
   }
 }
 
-const diffProvider = new CodePartne5rDiffProvider();
+const diffProvider = new CodePartnerDiffProvider();
 
 // ─── Agent & Artifact Managers ────────────────────────────────────────────────
 interface SubAgentTask {
