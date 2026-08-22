@@ -1,0 +1,231 @@
+{
+  "name": "codepartner-ai",
+  "displayName": "CodePartner AI",
+  "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
+  "publisher": "AnandShah",
+  "version": "2.0.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AnandShah10/CodePartner.git"
+  },
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Azure"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codepartner.focus",
+        "title": "CodePartner: Focus on Chat Sidebar",
+        "icon": "$(robot)"
+      },
+      {
+        "command": "codepartner.toggleInlineCompletions",
+        "title": "CodePartner: Toggle Inline Completions"
+      },
+      {
+        "command": "codepartner.explainSelection",
+        "title": "CodePartner: Explain Selected Code"
+      },
+      {
+        "command": "codepartner.fixErrors",
+        "title": "CodePartner: Fix Errors in File"
+      },
+      {
+        "command": "codepartner.generateTests",
+        "title": "CodePartner: Generate Tests for File"
+      },
+      {
+        "command": "codepartner.showDebugLog",
+        "title": "CodePartner: Show Debug Log"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codepartner.focus",
+        "key": "ctrl+l",
+        "mac": "cmd+l"
+      },
+      {
+        "command": "codepartner.toggleInlineCompletions",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i"
+      },
+      {
+        "command": "codepartner.explainSelection",
+        "key": "ctrl+shift+;",
+        "mac": "cmd+shift+;",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "codepartner.fixErrors",
+        "key": "ctrl+shift+'",
+        "mac": "cmd+shift+'"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codepartner-view-container",
+          "title": "CodePartner",
+          "icon": "$(robot)"
+        }
+      ]
+    },
+    "views": {
+      "codepartner-view-container": [
+        {
+          "type": "webview",
+          "id": "codepartner-sidebar",
+          "name": "CodePartner Chat",
+          "icon": "$(robot)",
+          "contextualTitle": "CodePartner Chat AI"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CodePartner",
+      "properties": {
+        "codepartner.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "azure",
+            "anthropic",
+            "google",
+            "ollama"
+          ],
+          "default": "openai",
+          "description": "LLM provider type"
+        },
+        "codepartner.apiEndpoint": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "LLM API endpoint"
+        },
+        "codepartner.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the LLM provider."
+        },
+        "codepartner.model": {
+          "type": "string",
+          "default": "gpt-4",
+          "description": "Model name (OpenAI) or Deployment name (Azure)"
+        },
+        "codepartner.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "description": "Max output tokens."
+        },
+        "codepartner.azureApiVersion": {
+          "type": "string",
+          "default": "2024-02-15-preview",
+          "description": "Azure OpenAI API version (only used when provider=azure)"
+        },
+        "codepartner.azureDeployments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "gpt-4o-mini",
+            "gpt-4o"
+          ],
+          "description": "List of Azure OpenAI deployment names to show in the dropdown."
+        },
+        "codepartner.inlineCompletions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable inline code completions (ghost text). Uses API tokens on each keystroke (debounced)."
+        },
+        "codepartner.inlineCompletionDebounce": {
+          "type": "number",
+          "default": 500,
+          "minimum": 200,
+          "maximum": 3000,
+          "description": "Debounce delay (ms) before triggering inline completion requests."
+        },
+        "codepartner.addAICoAuthor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Append a Co-authored-by trailer to commits made through CodePartner."
+        },
+        "codepartner.mcpServers": {
+          "type": "object",
+          "default": {},
+          "description": "MCP server configurations. Keys are server names, values are objects with 'command', 'args', 'env', and 'cwd' fields.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "Command to start the MCP server."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments for the command."
+              },
+              "env": {
+                "type": "object",
+                "description": "Environment variables."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory."
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.19.11",
+    "@types/vscode": "^1.86.0",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.27.2",
+    "eslint": "^9.39.2",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.54.0"
+  },
+  "dependencies": {
+    "axios": "^1.13.5",
+    "eventsource-parser": "^3.0.6",
+    "markdown-it": "^14.1.0",
+    "puppeteer-core": "^25.8.0"
+  }
+}
