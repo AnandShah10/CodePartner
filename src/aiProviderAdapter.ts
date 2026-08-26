@@ -210,3 +210,56 @@ export function extractNonStreamedText(providerType: string, responseData: any):
   }
   return responseData?.choices?.[0]?.message?.content || "";
 }
+
+export interface NormalizedToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+/**
+ * Normalizes tool calls from a NON-streamed response into the
+ * {id, type:"function", function:{name, arguments}} shape used
+ * throughout extension.ts (matching what the streaming code path already
+ * builds), regardless of provider. Anthropic's tool_use blocks carry
+ * `input` as an already-parsed object rather than a JSON string, so it's
+ * re-stringified here to match the OpenAI-family shape that
+ * repairJsonParse/executeTool already expect. The `type: "function"`
+ * field must be kept even for Anthropic-originated calls: it isn't read
+ * on the way back into buildAnthropicMessages, but it IS required by
+ * OpenAI-family providers if this same message is round-tripped through
+ * a conversation that later switches provider, and matches what the
+ * existing streaming code already produces.
+ */
+export function extractToolCalls(providerType: string, responseData: any): NormalizedToolCall[] {
+  if (providerType === "anthropic") {
+    const blocks = responseData?.content || [];
+    return blocks
+      .filter((b: any) => b?.type === "tool_use")
+      .map((b: any) => ({ id: b.id, type: "function" as const, function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) } }));
+  }
+  const raw = responseData?.choices?.[0]?.message?.tool_calls || [];
+  return raw.map((tc: any) => ({ id: tc.id, type: "function" as const, function: { name: tc.function.name, arguments: tc.function.arguments } }));
+}
+
+/**
+ * Builds the ProviderMessage to append to conversation history for a
+ * NON-streamed assistant turn, normalized across providers. Combined with
+ * buildAnthropicMessages' existing round-trip handling of {tool_calls},
+ * this means a message list built from this function feeds straight back
+ * into buildProviderRequest for the next turn, for any provider.
+ */
+export function extractAssistantMessage(providerType: string, responseData: any): ProviderMessage {
+  const toolCalls = extractToolCalls(providerType, responseData);
+  if (providerType === "anthropic") {
+    const textBlocks = (responseData?.content || []).filter((b: any) => b?.type === "text").map((b: any) => b.text);
+    const content = textBlocks.length > 0 ? textBlocks.join("\n") : null;
+    const msg: ProviderMessage = { role: "assistant", content };
+    if (toolCalls.length > 0) msg.tool_calls = toolCalls;
+    return msg;
+  }
+  const message = responseData?.choices?.[0]?.message || {};
+  const msg: ProviderMessage = { role: "assistant", content: message.content ?? null };
+  if (toolCalls.length > 0) msg.tool_calls = toolCalls;
+  return msg;
+}

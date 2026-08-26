@@ -16,7 +16,8 @@ import { ApprovalPolicy, GatedCategory, GATED_TOOLS, needsApprovalForPolicy, des
 import { UntrustedContentTracker } from "./promptInjectionGuard";
 import { repairJsonParse } from "./jsonRepair";
 import { isGitRepo, createGitCheckpoint, restoreFileFromCheckpoint } from "./gitCheckpoint";
-import { buildProviderRequest, extractNonStreamedText } from "./aiProviderAdapter";
+import { buildProviderRequest, extractNonStreamedText, extractToolCalls, extractAssistantMessage, ProviderMessage } from "./aiProviderAdapter";
+import { getScopedTools } from "./subAgentTools";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -121,8 +122,8 @@ class AgentManager {
     provider.updateStatus(`Agent ${agentType} starting task: ${task.substring(0, 30)}...`);
     subtask.status = "running";
 
-    // Simulate complex sub-agent logic (In reality, this would be a separate LLM call)
-    // For now, we'll use a basic internal prompt or delegate back to handlePrompt with a "subagent" flag
+    // runInternalAgent now runs a real multi-turn, tool-using loop scoped
+    // to this agentType (Phase 3.1) — see its doc comment in extension.ts.
     try {
       const result = await provider.runInternalAgent(agentType, task, personality);
       subtask.status = "done";
@@ -411,7 +412,7 @@ const TOOLS = [
   },
   {
     name: "call_subagent",
-    description: "Dispatch a specialized SubAgent for a concurrent sub-task.",
+    description: "Dispatch a specialized SubAgent to independently work a sub-task using its own tools and message history, scoped to its type: researcher (web search, docs, read-only file/code search), code_expert (read, edit, create files, run commands), tester (run tests/commands, read files), writer (create files, read files, web search). Request multiple call_subagent calls in one turn to run them concurrently.",
     parameters: {
       type: "object",
       properties: {
@@ -935,8 +936,22 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ type: "status", value: summary });
   }
 
+  /**
+   * Runs a sub-agent's task as a real multi-turn, tool-using loop (Phase
+   * 3.1) — previously this was a single non-tool-using completion, which
+   * is why the system prompt's "Multi-Agent" claim didn't match reality.
+   * Each sub-agent gets its own message history (not shared with the
+   * main conversation) and a tool list scoped to its agentType (see
+   * subAgentTools.ts). Tool execution still goes through the same
+   * executeTool() as the main agent, so approval gating, secret
+   * scanning, and the prompt-injection guard all still apply.
+   *
+   * When the top-level model requests multiple call_subagent calls in
+   * one turn, executeTool's existing Promise.all over that turn's tool
+   * calls already runs them concurrently — this method didn't need its
+   * own concurrency mechanism, just to stop being a single blocking call.
+   */
   public async runInternalAgent(agentType: string, task: string, personality?: string): Promise<string> {
-    // This is a specialized sub-call to the LLM
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
     const apiKey = await this.getApiKey();
@@ -944,21 +959,68 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
 
+    const allTools = [...TOOLS, ...this.mcpManager.getTools()];
+    const scopedTools = getScopedTools(agentType, allTools);
+    const scopedToolNames = new Set(scopedTools.map((t) => t.name));
+
     const personalityText = personality ? `\nAdopt this personality trait: ${personality}` : "";
+    const toolsNote = scopedTools.length > 0
+      ? `\nYou have access to these tools: ${scopedTools.map((t) => t.name).join(", ")}. Use them as needed, then give your final answer as plain text once done.`
+      : `\nYou do not have tool access for this task — answer directly from reasoning.`;
     const subPrompt = `You are a specialized SubAgent: ${agentType}.${personalityText}
-Your task is: ${task}
-Provide a concise, high-quality result. Do not use tools. Just answer.`;
+Your task is: ${task}${toolsNote}
+Provide a concise, high-quality result.`;
 
-    const { url, headers, body } = buildProviderRequest({
-      providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
-      messages: [{ role: "system", content: subPrompt }],
-      useSystemRole: true,
-      maxTokens: 2048,
-      stream: false,
-    });
+    const subMessages: ProviderMessage[] = [{ role: "system", content: subPrompt }];
+    const MAX_SUBAGENT_ITERATIONS = 6; // Smaller than the main loop's 15 — sub-agent tasks should be narrowly scoped.
 
-    const res = await axios.post(url, body, { headers });
-    return extractNonStreamedText(providerType, res.data);
+    for (let i = 0; i < MAX_SUBAGENT_ITERATIONS; i++) {
+      const { url, headers, body } = buildProviderRequest({
+        providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
+        messages: subMessages,
+        tools: scopedTools.length > 0 ? scopedTools : undefined,
+        useSystemRole: true,
+        maxTokens: 2048,
+        stream: false,
+      });
+
+      let res;
+      try {
+        res = await axios.post(url, body, { headers });
+      } catch (e: any) {
+        return `Error in sub-agent (${agentType}): ${e.response?.data?.error?.message || e.message}`;
+      }
+
+      const assistantMsg = extractAssistantMessage(providerType, res.data);
+      subMessages.push(assistantMsg);
+
+      const toolCalls = extractToolCalls(providerType, res.data);
+      if (toolCalls.length === 0) {
+        return (assistantMsg.content as string) || "(Sub-agent returned no content.)";
+      }
+
+      this.updateStatus(`Agent ${agentType}: using ${toolCalls.map((tc) => tc.function.name).join(", ")}...`);
+
+      for (const tc of toolCalls) {
+        let toolResult: string;
+        if (!scopedToolNames.has(tc.function.name)) {
+          // Defense in depth: refuse here too, not just by omitting the
+          // tool from the request — a model can still hallucinate a call
+          // to a tool it wasn't offered.
+          toolResult = `Error: the "${tc.function.name}" tool is not available to the ${agentType} sub-agent.`;
+        } else {
+          const parsed = repairJsonParse(tc.function.arguments);
+          if (parsed === null) {
+            toolResult = `Error: could not parse arguments for "${tc.function.name}". Retry with valid JSON.`;
+          } else {
+            toolResult = await this.executeTool(tc.function.name, parsed.value);
+          }
+        }
+        subMessages.push({ role: "tool", content: typeof toolResult === "string" ? toolResult : JSON.stringify(toolResult), tool_call_id: tc.id, name: tc.function.name });
+      }
+    }
+
+    return `Sub-agent (${agentType}) reached its iteration limit (${MAX_SUBAGENT_ITERATIONS}) without a final answer. It may have made partial progress via tool calls above.`;
   }
 
   public resolveWebviewView(
