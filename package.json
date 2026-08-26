@@ -3,7 +3,7 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
@@ -48,6 +48,10 @@
       {
         "command": "codepartner.showDebugLog",
         "title": "CodePartner: Show Debug Log"
+      },
+      {
+        "command": "codepartner.setApiKey",
+        "title": "CodePartner: Set API Key"
       }
     ],
     "keybindings": [
@@ -116,12 +120,25 @@
         "codepartner.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API key for the LLM provider."
+          "description": "Deprecated: no longer used. API keys are stored securely via the \"CodePartner: Set API Key\" command instead of settings.json. Any value found here is migrated automatically and then cleared.",
+          "deprecationMessage": "Deprecated — use the \"CodePartner: Set API Key\" command. Keys are no longer read from or stored in settings."
         },
         "codepartner.model": {
           "type": "string",
           "default": "gpt-4",
           "description": "Model name (OpenAI) or Deployment name (Azure)"
+        },
+        "codepartner.approvalPolicy": {
+          "type": "string",
+          "enum": ["always-ask", "ask-for-shell", "full-auto", "yolo"],
+          "enumDescriptions": [
+            "Confirm every shell command, file edit/creation, and git commit/branch/PR before running it.",
+            "Only confirm shell commands. File edits and git operations run without a prompt.",
+            "Only confirm git commits, branches, and pull requests. Shell commands and file edits run without a prompt.",
+            "Full Auto — No Confirmations. Nothing prompts, ever (except actions flagged as possible prompt injection). Requires a one-time explicit confirmation to enable."
+          ],
+          "default": "always-ask",
+          "description": "Controls when CodePartner asks before running a shell command, writing a file, or making a git commit/branch/PR. Defaults to confirming everything."
         },
         "codepartner.maxTokens": {
           "type": "number",

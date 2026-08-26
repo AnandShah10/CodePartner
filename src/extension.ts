@@ -10,6 +10,25 @@ import { GitManager } from "./git";
 import { CodePartnerInlineCompletionProvider } from "./inlineCompletion";
 import { SemanticSearch } from "./semanticSearch";
 import { MCPManager } from "./mcp";
+import { applyEdit, NOT_FOUND } from "./editUtils";
+import { scanForSecrets, summarizeFindings } from "./secretScanner";
+import { ApprovalPolicy, GatedCategory, GATED_TOOLS, needsApprovalForPolicy, describeToolCall, commandPrefix, matchesApprovedPrefix } from "./approvals";
+import { UntrustedContentTracker } from "./promptInjectionGuard";
+import { repairJsonParse } from "./jsonRepair";
+import { isGitRepo, createGitCheckpoint, restoreFileFromCheckpoint } from "./gitCheckpoint";
+import { buildProviderRequest, extractNonStreamedText } from "./aiProviderAdapter";
+
+/** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
+const API_KEY_SECRET_KEY = "codepartner.apiKey";
+
+/** Combines a spawned process's stdout/stderr into one trimmed string for display/prompt use. */
+function formatOutput(stdout: string, stderr: string): string {
+  const parts = [stdout.trim()];
+  if (stderr.trim()) {
+    parts.push(`STDERR:\n${stderr.trim()}`);
+  }
+  return parts.filter(Boolean).join("\n\n").trim();
+}
 
 class SingleContentProvider implements vscode.TextDocumentContentProvider {
   private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
@@ -219,7 +238,10 @@ class BrowserManager {
           await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
           const title = await page.title();
           // @ts-ignore
-          const content = await page.evaluate(() => document.body.innerText.substring(0, 5000));
+          const fullContent: string = await page.evaluate(() => document.body.innerText);
+          const content = fullContent.length > 5000
+            ? fullContent.substring(0, 5000) + "\n... (truncated — page content continues, use grep_search or a narrower selector for more)"
+            : fullContent;
           return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}`;
         }
         case "screenshot": {
@@ -239,7 +261,10 @@ class BrowserManager {
           await page.click(selector);
           await page.waitForNetworkIdle({ timeout: 3000 }).catch(() => { });
           // @ts-ignore
-          const clickContent = await page.evaluate(() => document.body.innerText.substring(0, 3000));
+          const fullClickContent: string = await page.evaluate(() => document.body.innerText);
+          const clickContent = fullClickContent.length > 3000
+            ? fullClickContent.substring(0, 3000) + "\n... (truncated — page content continues)"
+            : fullClickContent;
           return `Clicked "${selector}". Page content after click:\n${clickContent}`;
         }
         case "type": {
@@ -262,7 +287,7 @@ class BrowserManager {
   }
 }
 
-// â”€â”€â”€ System Prompts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── System Prompts ───────────────────────────────────────────────────────────
 const BASE_SYSTEM = `You are CodePartner, a powerful agentic AI coding assistant.
 
 Capabilities:
@@ -552,10 +577,110 @@ const TOOLS = [
 ];
 
 // ─── Activate ─────────────────────────────────────────────────────────────────
+/**
+ * One-time migration: if a plaintext API key is still sitting in
+ * settings.json (old versions stored it via codepartner.apiKey), move it
+ * into SecretStorage and blank out the setting everywhere it's set.
+ *
+ * Settings Sync and workspace settings.json are not safe places for a
+ * credential — SecretStorage is backed by the OS keychain and never syncs
+ * as plaintext.
+ */
+async function migrateApiKeyToSecretStorage(context: vscode.ExtensionContext, output: vscode.OutputChannel): Promise<void> {
+  const config = vscode.workspace.getConfiguration("codepartner");
+  const inspected = config.inspect<string>("apiKey");
+  const plaintextValues = [
+    { value: inspected?.globalValue, target: vscode.ConfigurationTarget.Global },
+    { value: inspected?.workspaceValue, target: vscode.ConfigurationTarget.Workspace },
+    { value: inspected?.workspaceFolderValue, target: vscode.ConfigurationTarget.WorkspaceFolder },
+  ].filter((v) => typeof v.value === "string" && v.value.trim() !== "");
+
+  if (plaintextValues.length === 0) {
+    return;
+  }
+
+  // Only move it into SecretStorage if nothing is stored there yet, so we
+  // never clobber a key the user has already set via the new command.
+  const existingSecret = await context.secrets.get(API_KEY_SECRET_KEY);
+  if (!existingSecret) {
+    const newest = plaintextValues[0].value!.trim();
+    await context.secrets.store(API_KEY_SECRET_KEY, newest);
+    output.appendLine("[CodePartner] Migrated API key from settings.json to SecretStorage.");
+  }
+
+  for (const { target } of plaintextValues) {
+    try {
+      await config.update("apiKey", undefined, target);
+    } catch {
+      // Target scope may not apply (e.g. no workspace folder) — safe to ignore.
+    }
+  }
+  output.appendLine("[CodePartner] Cleared plaintext API key from settings.");
+  vscode.window.showInformationMessage(
+    "CodePartner: your API key was moved out of settings.json into secure storage. Use \"CodePartner: Set API Key\" to update it going forward."
+  );
+}
+
+/**
+ * Phase 1.6 — the most permissive autonomy tier ("yolo") is deliberately
+ * hard to enable by accident: every time it's active without having been
+ * confirmed this session, show a blocking modal explaining exactly what
+ * it does. Declining reverts the setting instead of silently proceeding.
+ */
+const YOLO_CONFIRMED_KEY = "codepartner.yoloConfirmedThisSession";
+
+async function confirmYoloModeIfNeeded(context: vscode.ExtensionContext, output: vscode.OutputChannel): Promise<void> {
+  const config = vscode.workspace.getConfiguration("codepartner");
+  const policy = config.get<string>("approvalPolicy");
+  if (policy !== "yolo") {
+    await context.workspaceState.update(YOLO_CONFIRMED_KEY, false);
+    return;
+  }
+  const alreadyConfirmed = context.workspaceState.get<boolean>(YOLO_CONFIRMED_KEY, false);
+  if (alreadyConfirmed) {
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    "CodePartner is set to \"Full Auto — No Confirmations.\" It will run shell commands, edit/create files, and make git commits, branches, and pull requests with NO approval prompts. (Actions whose content matches a web search, indexed doc, or @-mentioned file are still confirmed, as a prompt-injection safeguard.)",
+    { modal: true },
+    "I understand, enable it",
+    "Revert to Always Ask"
+  );
+  if (choice === "I understand, enable it") {
+    await context.workspaceState.update(YOLO_CONFIRMED_KEY, true);
+    output.appendLine("[CodePartner] Full Auto (\"yolo\") mode confirmed by user.");
+  } else {
+    await config.update("approvalPolicy", "always-ask", vscode.ConfigurationTarget.Global);
+    output.appendLine("[CodePartner] Full Auto (\"yolo\") mode declined — reverted to always-ask.");
+  }
+}
+
+/** Shows a persistent status bar warning while approvalPolicy is "yolo". */
+function updateAutonomyStatusBar(item: vscode.StatusBarItem): void {
+  const policy = vscode.workspace.getConfiguration("codepartner").get<string>("approvalPolicy");
+  if (policy === "yolo") {
+    item.text = "$(warning) CodePartner: FULL AUTO";
+    item.tooltip = "No approval prompts for shell commands, file edits, or git operations. Click to review settings.";
+    item.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+    item.command = "workbench.action.openSettings";
+    item.show();
+  } else {
+    item.hide();
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("CodePartner");
   context.subscriptions.push(output);
   output.appendLine("CodePartner v2.0 extension activated.");
+
+  migrateApiKeyToSecretStorage(context, output).catch((e) => {
+    output.appendLine(`[CodePartner] API key migration error: ${e.message}`);
+  });
+
+  const autonomyStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+  context.subscriptions.push(autonomyStatusBarItem);
+  confirmYoloModeIfNeeded(context, output).then(() => updateAutonomyStatusBar(autonomyStatusBarItem));
 
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(
@@ -575,6 +700,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("codepartner")) {
         provider.refreshModels();
+        confirmYoloModeIfNeeded(context, output).then(() => updateAutonomyStatusBar(autonomyStatusBarItem));
       }
     })
   );
@@ -628,6 +754,29 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.setApiKey", async () => {
+      const key = await vscode.window.showInputBox({
+        title: "CodePartner: Set API Key",
+        prompt: "Enter your LLM provider API key. It's stored in your OS keychain, never in settings.json.",
+        password: true,
+        ignoreFocusOut: true,
+        placeHolder: "sk-...",
+      });
+      if (key === undefined) {
+        return; // User cancelled.
+      }
+      if (key.trim() === "") {
+        await context.secrets.delete(API_KEY_SECRET_KEY);
+        vscode.window.showInformationMessage("CodePartner: API key cleared.");
+      } else {
+        await context.secrets.store(API_KEY_SECRET_KEY, key.trim());
+        vscode.window.showInformationMessage("CodePartner: API key saved securely.");
+      }
+      provider.refreshModels();
+    })
+  );
+
   output.appendLine("CodePartner: All providers and commands registered.");
 }
 
@@ -644,6 +793,17 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private modifiedFiles: Set<string> = new Set();
   private fileBackups: Map<string, string> = new Map();
   private fileChangeStats: Map<string, { added: number, removed: number }> = new Map();
+  // Phase 1 — permission model state (session-scoped: resets on window/extension reload).
+  private approvedCommandPrefixes: Set<string> = new Set();
+  private sessionAutoApprove: { fileWrite: boolean; gitWrite: boolean } = { fileWrite: false, gitWrite: false };
+  private untrustedContent = new UntrustedContentTracker();
+  /**
+   * Per-turn git checkpoint fallback (Phase 2.4): turnId -> stash-create
+   * SHA ("" means the tree was clean at checkpoint time, i.e. == HEAD).
+   * Used by revertTimelineAction/revertTurn only when the primary
+   * revertContent backup for a given edit isn't available.
+   */
+  private turnGitCheckpoints: Map<string, string> = new Map();
   private agentManager: AgentManager;
   private artifactRegistry?: ArtifactRegistry;
   private browserManager?: BrowserManager;
@@ -656,6 +816,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private skillManager?: SkillManager;
   private architectDrafts: Map<string, string> = new Map();
   private terminal?: vscode.Terminal;
+  /** The currently in-flight shell command / test run, if any — killed on cancel (Phase 2.1/2.2). */
+  private runningChildProcess?: cp.ChildProcess;
   private gitManager: GitManager;
   private semanticSearch: SemanticSearch;
   private mcpManager: MCPManager;
@@ -700,6 +862,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         this.messageHistory = chat.messages;
         this.currentPlan = chat.plan || [];
         this.currentArtifacts = chat.artifacts || [];
+        // Bug: timelineEvents (and therefore every edit_file/create_file's
+        // revertContent backup) was saved to workspaceState by
+        // saveCurrentChat() but never read back in here, so the Timeline
+        // "revert" button had nothing to revert after a reload even
+        // though the backup data was sitting in storage the whole time.
+        this.timelineEvents = chat.timeline || [];
+        this.turnGitCheckpoints = new Map(chat.gitCheckpoints || []);
       }
     }
   }
@@ -742,11 +911,35 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ type: "status", value: msg });
   }
 
+  /**
+   * Reads the LLM provider API key from SecretStorage. This is the only
+   * supported way to read the key — see migrateApiKeyToSecretStorage() for
+   * why it no longer lives in settings.json.
+   */
+  private async getApiKey(): Promise<string> {
+    const key = await this.context.secrets.get(API_KEY_SECRET_KEY);
+    return (key || "").trim();
+  }
+
+  /**
+   * Scans text that's about to be sent somewhere external (an LLM prompt,
+   * or a GitHub issue in the feedback path) for anything that looks like a
+   * credential, and — if found — warns visibly without stripping it. See
+   * secretScanner.ts for the rationale.
+   */
+  private warnIfSecrets(text: string, sourceLabel: string): void {
+    const findings = scanForSecrets(text);
+    if (findings.length === 0) return;
+    const summary = summarizeFindings(findings, sourceLabel);
+    this.output.appendLine(`[CodePartner] ${summary}`);
+    this._view?.webview.postMessage({ type: "status", value: summary });
+  }
+
   public async runInternalAgent(agentType: string, task: string, personality?: string): Promise<string> {
     // This is a specialized sub-call to the LLM
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const apiKey = config.get<string>("apiKey")?.trim() || "";
+    const apiKey = await this.getApiKey();
     const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
@@ -756,52 +949,16 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 Your task is: ${task}
 Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
-    let url = "";
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    let body: any = {};
-
-    const endpoint = apiEndpoint.replace(/\/$/, "");
-
-    if (providerType === "azure") {
-      url = `${endpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
-      headers["api-key"] = apiKey;
-      body = {
-        messages: [{ role: "system", content: subPrompt }],
-        max_tokens: 2048,
-      };
-    } else if (providerType === "anthropic") {
-      url = apiEndpoint || "https://api.anthropic.com/v1/messages";
-      headers["x-api-key"] = apiKey;
-      headers["anthropic-version"] = "2023-06-01";
-      body = {
-        model: modelId,
-        system: subPrompt,
-        messages: [{ role: "user", content: "Begin your task." }],
-        max_tokens: 2048,
-      };
-    } else if (providerType === "google") {
-      url = `${apiEndpoint || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`;
-      headers["Authorization"] = `Bearer ${apiKey}`;
-      body = {
-        model: modelId,
-        messages: [{ role: "system", content: subPrompt }],
-        max_tokens: 2048,
-      };
-    } else {
-      url = `${endpoint || "https://api.openai.com/v1"}/chat/completions`;
-      headers["Authorization"] = `Bearer ${apiKey}`;
-      body = {
-        model: modelId,
-        messages: [{ role: "system", content: subPrompt }],
-        max_tokens: 2048,
-      };
-    }
+    const { url, headers, body } = buildProviderRequest({
+      providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
+      messages: [{ role: "system", content: subPrompt }],
+      useSystemRole: true,
+      maxTokens: 2048,
+      stream: false,
+    });
 
     const res = await axios.post(url, body, { headers });
-    if (providerType === "anthropic") {
-      return res.data.content[0].text;
-    }
-    return res.data.choices[0].message.content;
+    return extractNonStreamedText(providerType, res.data);
   }
 
   public resolveWebviewView(
@@ -828,6 +985,12 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
         this.currentArtifacts.forEach(a => this._view?.webview.postMessage({ type: "artifact", value: a }));
       }
+      // Restored separately from the messageHistory check above: a chat
+      // can have timeline/revert data worth showing even when this is the
+      // very first webview resolve after a restart.
+      if (this.timelineEvents.length > 0) {
+        this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
+      }
 
       this.output.appendLine("[CodePartner] Webview view resolved successfully.");
     } catch (e: any) {
@@ -848,6 +1011,11 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
             this.abortController.abort();
             this.abortController = undefined;
             this.output.appendLine("[CodePartner] Cancelled by user.");
+          }
+          if (this.runningChildProcess) {
+            this.runningChildProcess.kill();
+            this.output.appendLine("[CodePartner] Killed in-flight command/test run.");
+            this.runningChildProcess = undefined;
           }
           break;
         case "applyDiff":
@@ -954,34 +1122,22 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       const editor = vscode.window.activeTextEditor;
       if (editor) {
         const doc = editor.document;
-        codeContent = `\n\n**Attached Code** (\`${path.basename(doc.fileName)}\`):\n\`\`\`\n${doc.getText().substring(0, 3000)}\n\`\`\``;
+        const snippet = doc.getText().substring(0, 3000);
+        // This snippet goes into a public GitHub issue, so warn loudly.
+        this.warnIfSecrets(snippet, `attached code (${path.basename(doc.fileName)}) — this will be posted to a public GitHub issue`);
+        codeContent = `\n\n**Attached Code** (\`${path.basename(doc.fileName)}\`):\n\`\`\`\n${snippet}\n\`\`\``;
       }
     }
 
     const title = `[${type}] ${description.substring(0, 80)}`;
     const body = `**Type:** ${type}\n\n**Description:**\n${description}${codeContent}\n\n---\n*Submitted via CodePartner extension*`;
 
-    // If user is logged in to GitHub in the IDE, prefer email using their account email
-    let githubSession = null;
-    try {
-      githubSession = await vscode.authentication.getSession("github", ["user:email"], { createIfNone: false });
-    } catch (e: any) {
-      this.output.appendLine(`[CodePartner] GitHub auth check skipped: ${e.message}`);
-    }
-    if (githubSession?.account?.label?.includes("@")) {
-      const userEmail = githubSession.account.label;
-      const mailtoUri = `mailto:${encodeURIComponent(userEmail)}?subject=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
-      const success = await vscode.env.openExternal(vscode.Uri.parse(mailtoUri));
-      if (success) {
-        this._view?.webview.postMessage({ type: "status", value: "✅ Feedback opened in your default email client!" });
-        return;
-      }
-    }
-
-    // Fallback to GitHub Issues (original behavior)
+    // Use GitHub Issues URL instead of mailto (fixes the Chrome/email bug)
     const issueUrl = `https://github.com/AnandShah10/CodePartner/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}&labels=${encodeURIComponent(type.toLowerCase())}`;
 
+    // GitHub Issues URLs have a practical limit of ~8000 chars
     if (issueUrl.length > 8000) {
+      // Truncate body for URL but copy full content to clipboard
       const shortBody = `**Type:** ${type}\n\n**Description:**\n${description}\n\n*(Code attachment was too long for URL — pasted from clipboard)*`;
       const shortUrl = `https://github.com/AnandShah10/CodePartner/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(shortBody)}&labels=${encodeURIComponent(type.toLowerCase())}`;
 
@@ -998,15 +1154,15 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     try {
       const success = await vscode.env.openExternal(vscode.Uri.parse(issueUrl));
       if (success) {
-        this._view?.webview.postMessage({ type: "status", value: "✅ GitHub issue opened in browser for feedback." });
+        this._view?.webview.postMessage({ type: "status", value: "✅ Feedback prepared in your email client! Please click 'Send'." });
       } else {
-        throw new Error("Could not open browser.");
+        throw new Error("Could not open email client.");
       }
     } catch (e) {
       const fullText = `Title: ${title}\n\n${body}`;
       await vscode.env.clipboard.writeText(fullText);
-      this._view?.webview.postMessage({ type: "status", value: "⚠️ Feedback copied to clipboard. Please create a GitHub issue manually." });
-      vscode.window.showWarningMessage("Could not open browser. Feedback copied to clipboard.");
+      this._view?.webview.postMessage({ type: "status", value: "⚠️ Couldn't open mail client. Feedback copied to clipboard instead!" });
+      vscode.window.showWarningMessage("Could not open your email client. The feedback has been copied to your clipboard.");
     }
   }
 
@@ -1028,6 +1184,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       plan: this.currentPlan,
       artifacts: this.currentArtifacts,
       timeline: this.timelineEvents,
+      // Phase 2.4: persist the git checkpoint refs for this chat's turns
+      // too, so the revert fallback still works after a reload, not just
+      // the primary revertContent backups embedded in `timeline` above.
+      gitCheckpoints: Array.from(this.turnGitCheckpoints.entries()),
       timestamp: Date.now()
     };
 
@@ -1055,6 +1215,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       this.currentPlan = chat.plan || [];
       this.currentArtifacts = chat.artifacts || [];
       this.timelineEvents = chat.timeline || [];
+      this.turnGitCheckpoints = new Map(chat.gitCheckpoints || []);
 
       // Add hiddenFromUI flag to context-heavy messages for UI reloading
       const uiHistory = this.messageHistory.map((m, idx) => ({
@@ -1112,6 +1273,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     this.currentPlan = [];
     this.currentArtifacts = [];
     this.timelineEvents = [];
+    this.turnGitCheckpoints.clear();
     this.architectDrafts.clear();
     this._view?.webview.postMessage({ type: "loadMessages", value: [] });
     this._view?.webview.postMessage({ type: "plan", value: [] });
@@ -1119,7 +1281,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
     this.sendChatsToWebview();
 
-    const welcomeMsg = "ðŸ‘‹ **Hello! I'm CodePartner.** How can I help you with your code today?\n\nI can help you:\n- ðŸš€ **Build features** and write code\n- ðŸž **Debug issues** and fix errors\n- ðŸ“ **Manage files** and workspace structure\n- ðŸ™ **Automate Git** (diffs, commits, branches)\n- âš¡ **Run commands** in the terminal\n\nWhat are we working on?";
+    const welcomeMsg = "👋 **Hello! I'm CodePartner.** How can I help you with your code today?\n\nI can help you:\n- 🚀 **Build features** and write code\n- 🐞 **Debug issues** and fix errors\n- 📁 **Manage files** and workspace structure\n- 🐙 **Automate Git** (diffs, commits, branches)\n- ⚡ **Run commands** in the terminal\n\nWhat are we working on?";
     this._view?.webview.postMessage({ type: "partial", value: md.render(welcomeMsg) });
     this.messageHistory.push({ role: "assistant", content: welcomeMsg });
   }
@@ -1211,7 +1373,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     const config = vscode.workspace.getConfiguration("codepartner");
     const provider = config.get<string>("provider") || "openai";
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const apiKey = config.get<string>("apiKey")?.trim() || "";
+    const apiKey = await this.getApiKey();
     let currentModel = this.selectedModelId || config.get<string>("model") || "";
 
     if (provider === "azure") {
@@ -1538,7 +1700,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         await editor.edit((editBuilder) => {
           editBuilder.replace(fullRange, aiCode);
         });
-        vscode.window.showInformationMessage("âœ… CodePartner: File updated with AI changes.");
+        vscode.window.showInformationMessage("✅ CodePartner: File updated with AI changes.");
       }
     } catch (err) {
       vscode.window.showErrorMessage("Failed to apply changes: " + err);
@@ -1570,7 +1732,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         "vscode.diff",
         originalUri,
         proposedUri,
-        "CodePartner: Review Changes (Selection) â† Original | AI Proposal â†’"
+        "CodePartner: Review Changes (Selection) ← Original | AI Proposal →"
       );
 
       setTimeout(() => {
@@ -1588,7 +1750,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         "vscode.diff",
         originalUri,
         proposedUri,
-        `CodePartner: Review Changes â† ${document.fileName} | AI Suggestion â†’`
+        `CodePartner: Review Changes ← ${document.fileName} | AI Suggestion →`
       );
     }
     vscode.window.showInformationMessage("Review the diff. Use the buttons in the diff editor to Accept or Revert changes.");
@@ -1618,7 +1780,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         if (files.length) {
           const doc = await vscode.workspace.openTextDocument(files[0]);
           const rel = vscode.workspace.asRelativePath(files[0]);
-          context += `\n--- File: ${rel} ---\n\`\`\`\n${doc.getText()}\n\`\`\`\n\n`;
+          const text = doc.getText();
+          this.warnIfSecrets(text, rel);
+          this.untrustedContent.track(text);
+          context += `\n--- File: ${rel} ---\n\`\`\`\n${text}\n\`\`\`\n\n`;
           this.output.appendLine(`[CodePartner] Injected file: ${rel}`);
         }
       } catch {
@@ -1638,7 +1803,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       return "";
     }
 
-    this._view?.webview.postMessage({ type: "status", value: "ðŸ” Searching the web..." });
+    this._view?.webview.postMessage({ type: "status", value: "🔍 Searching the web..." });
 
     try {
       this.output.appendLine(`[CodePartner] Web search: ${query}`);
@@ -1664,7 +1829,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       }
 
       if (parts.length > 0) {
-        return `\n--- Web Search Results for "${query}" ---\n` + parts.map((p, i) => `${i + 1}. ${p}`).join("\n\n") + "\n\n";
+        const context = `\n--- Web Search Results for "${query}" ---\n` + parts.map((p, i) => `${i + 1}. ${p}`).join("\n\n") + "\n\n";
+        this.untrustedContent.track(context);
+        return context;
       }
 
       const htmlRes = await axios.get(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, { timeout: 8000, headers: { "User-Agent": "Mozilla/5.0" } });
@@ -1676,7 +1843,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         snippets.push(m[1].replace(/<[^>]+>/g, "").trim());
       }
       if (snippets.length) {
-        return `\n--- Web Search Results for "${query}" ---\n` + snippets.map((s, i) => `${i + 1}. ${s}`).join("\n\n") + "\n\n";
+        const context = `\n--- Web Search Results for "${query}" ---\n` + snippets.map((s, i) => `${i + 1}. ${s}`).join("\n\n") + "\n\n";
+        this.untrustedContent.track(context);
+        return context;
       }
     } catch (e: any) {
       this.output.appendLine(`[CodePartner] Web search error: ${e.message}`);
@@ -1706,6 +1875,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
       let context = `\n--- Semantic Workspace Search for "${query}" ---\n`;
       results.forEach((r, i) => {
+        this.warnIfSecrets(r.excerpt, r.path);
         context += `\n[${i + 1}] File: ${r.path} (Score: ${r.score.toFixed(2)})\n${r.excerpt}\n`;
       });
       return context + "\n";
@@ -1739,46 +1909,22 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       // Call LLM for summary (using fast mode parameters)
       const config = vscode.workspace.getConfiguration("codepartner");
       const providerType = config.get<string>("provider") || "openai";
-      const apiEndpoint = (config.get<string>("apiEndpoint")?.trim() || "").replace(/\/$/, "");
-      const apiKey = config.get<string>("apiKey")?.trim() || "";
+      const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
+      const apiKey = await this.getApiKey();
       const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
       const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
 
-      let url = `${apiEndpoint}/chat/completions`;
-      let headers: any = { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" };
-      let body: any = {
-        model: modelId,
+      const { url, headers, body } = buildProviderRequest({
+        providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
         messages: [{ role: "user", content: prompt }],
-        max_tokens: 1000,
-        temperature: 0.3
-      };
-
-      if (providerType === "anthropic") {
-        url = apiEndpoint || "https://api.anthropic.com/v1/messages";
-        headers = { 
-          "x-api-key": apiKey, 
-          "anthropic-version": "2023-06-01", 
-          "Content-Type": "application/json" 
-        };
-        body = {
-          model: modelId,
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 1000,
-          temperature: 0.3
-        };
-      } else if (providerType === "azure") {
-        url = `${apiEndpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
-        headers = { "api-key": apiKey, "Content-Type": "application/json" };
-      }
+        useSystemRole: true,
+        maxTokens: 1000,
+        temperature: 0.3,
+        stream: false,
+      });
 
       const res = await axios.post(url, body, { headers });
-
-      let summary: string;
-      if (providerType === "anthropic") {
-        summary = res.data?.content?.[0]?.text || "Conversation compacted.";
-      } else {
-        summary = res.data?.choices?.[0]?.message?.content || "Conversation compacted.";
-      }
+      const summary = extractNonStreamedText(providerType, res.data) || "Conversation compacted.";
       
       this.messageHistory = [
         systemMsg,
@@ -1851,6 +1997,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       return;
     }
 
+    // Fresh turn — clear anything tracked for the prompt-injection guard
+    // from the previous turn so stale content can't suppress a real check.
+    this.untrustedContent.reset();
+
     // Check for slash command
     if (prompt.startsWith("/")) {
       this.handleSlashCommand(prompt);
@@ -1866,7 +2016,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const apiKey = config.get<string>("apiKey")?.trim() || "";
+    const apiKey = await this.getApiKey();
     const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
@@ -1882,7 +2032,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     if ((needsEndpoint && !apiEndpoint) || (needsKey && !apiKey) || !modelId) {
       this._view.webview.postMessage({
         type: "error",
-        value: "âš ï¸ **CodePartner not configured.**\\n\\nOpen **Settings** and set:\\n- `codepartner.provider`\\n- `codepartner.apiEndpoint`\\n- `codepartner.apiKey`\\n- `codepartner.model`"
+        value: "⚠️ **CodePartner not configured.**\\n\\nOpen **Settings** and set `codepartner.provider`, `codepartner.apiEndpoint`, and `codepartner.model`, then run **CodePartner: Set API Key** from the Command Palette."
       });
       return;
     }
@@ -1900,10 +2050,12 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const fileName = document.fileName.split(/[/\\]/).pop();
       if (!selection.isEmpty) {
         const code = document.getText(selection);
+        this.warnIfSecrets(code, fileName || "selection");
         contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nSelected Code:\n\`\`\`\n${code}\n\`\`\`\n`;
       } else {
         const text = document.getText();
-        const capped = text.length > 8000 ? text.substring(0, 8000) + "\nâ€¦ (truncated)" : text;
+        this.warnIfSecrets(text, fileName || "active file");
+        const capped = text.length > 8000 ? text.substring(0, 8000) + "\n... (truncated)" : text;
         contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nContent:\n\`\`\`\n${capped}\n\`\`\`\n`;
       }
     }
@@ -1914,6 +2066,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const doc = oe.document;
       const name = path.basename(doc.fileName);
       const text = doc.getText();
+      this.warnIfSecrets(text, name);
       const capped = text.length > 2000 ? text.substring(0, 2000) + "\n... (truncated)" : text;
       contextHeader += `\n--- Context from Open Tab ---\nFile: \`${name}\`\nContent:\n\`\`\`\n${capped}\n\`\`\`\n`;
     }
@@ -1955,6 +2108,18 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     let toolUsedInThisTurn = false;
     const turnId = Date.now().toString();
 
+    // Phase 2.4: capture a git-backed fallback checkpoint for this turn,
+    // in addition to the per-file revertContent backups taken as each
+    // edit happens. Only covers tracked files in a git repo; harmless
+    // no-op otherwise.
+    const checkpointRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (checkpointRoot && isGitRepo(checkpointRoot)) {
+      const ref = createGitCheckpoint(checkpointRoot, `codepartner turn ${turnId}`);
+      if (ref !== null) {
+        this.turnGitCheckpoints.set(turnId, ref);
+      }
+    }
+
     while (iteration < maxIterations) {
       iteration++;
       this.abortController = new AbortController();
@@ -1963,170 +2128,18 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       let toolCalls: any[] = [];
       this.modifiedFiles.clear();
 
-      const endpoint = apiEndpoint.replace(/\/$/, "");
-      let url = "";
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      let body: Record<string, unknown> = {};
+      // Tool definitions in the flat shape buildProviderRequest expects.
+      const toolDefs = useTools ? [...TOOLS, ...this.mcpManager.getTools()] : undefined;
 
-      // Build OpenAI-compatible messages (used by openai, azure, google, ollama)
-      const openaiMessages = this.messageHistory.map((m) => {
-        const msg: any = { role: m.role === "system" && !useSystemRole ? "user" : m.role, content: m.content };
-        if (m.tool_calls) {
-          msg.tool_calls = m.tool_calls;
-        }
-        if (m.tool_call_id) {
-          msg.tool_call_id = m.tool_call_id;
-          if (m.name) {
-            msg.name = m.name;
-          }
-        }
-        if (m.name && m.role !== "tool") {
-          msg.name = m.name;
-        }
-        return msg;
+      const { url, headers, body } = buildProviderRequest({
+        providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
+        messages: this.messageHistory,
+        tools: toolDefs,
+        useSystemRole,
+        maxTokens,
+        temperature: 0.4,
+        stream: true,
       });
-
-      // Build tools in OpenAI format
-      const openaiToolDefs = useTools
-        ? [...TOOLS, ...this.mcpManager.getTools()].map((t) => ({ type: "function" as const, function: t }))
-        : undefined;
-
-      // ─── Provider-specific request construction ─────────────────────────
-      if (providerType === "anthropic") {
-        // Anthropic Messages API
-        url = endpoint || "https://api.anthropic.com/v1/messages";
-        headers["x-api-key"] = apiKey;
-        headers["anthropic-version"] = "2023-06-01";
-        // Don't add invalid beta header for newer models
-        if (modelId.includes("claude-3-5") || modelId.includes("claude-3.5")) {
-          headers["anthropic-beta"] = "max-tokens-3-5-sonnet-2024-07-15";
-        }
-
-        // Convert messages to Anthropic format
-        const anthropicMessages: any[] = [];
-        for (const m of this.messageHistory) {
-          if (m.role === "system") continue;
-
-          if (m.role === "tool") {
-            anthropicMessages.push({
-              role: "user",
-              content: [{
-                type: "tool_result",
-                tool_use_id: m.tool_call_id,
-                content: typeof m.content === "string" ? m.content : JSON.stringify(m.content)
-              }]
-            });
-          } else if (m.role === "assistant" && m.tool_calls) {
-            const contentBlocks: any[] = [];
-            if (m.content) contentBlocks.push({ type: "text", text: m.content });
-            for (const tc of m.tool_calls) {
-              let parsedInput = {};
-              try { parsedInput = JSON.parse(tc.function.arguments); } catch { parsedInput = {}; }
-              contentBlocks.push({
-                type: "tool_use",
-                id: tc.id,
-                name: tc.function.name,
-                input: parsedInput
-              });
-            }
-            anthropicMessages.push({ role: "assistant", content: contentBlocks });
-          } else {
-            anthropicMessages.push({
-              role: m.role === "assistant" ? "assistant" : "user",
-              content: typeof m.content === "string" ? m.content : JSON.stringify(m.content)
-            });
-          }
-        }
-
-        body = {
-          model: modelId,
-          max_tokens: maxTokens,
-          messages: anthropicMessages,
-          stream: true,
-          temperature: 0.4
-        };
-
-        const sysMsg = this.messageHistory.find(m => m.role === "system");
-        if (sysMsg) {
-          body.system = sysMsg.content;
-        }
-
-        if (useTools) {
-          const allToolDefs = [...TOOLS, ...this.mcpManager.getTools()];
-          body.tools = allToolDefs.map(t => {
-            const schema: any = {
-              type: "object",
-              properties: t.parameters.properties || {}
-            };
-            if (t.parameters.required && t.parameters.required.length > 0) {
-              schema.required = t.parameters.required;
-            }
-            return { name: t.name, description: t.description, input_schema: schema };
-          });
-        }
-
-      } else if (providerType === "azure") {
-        // Azure OpenAI
-        url = `${endpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
-        headers["api-key"] = apiKey;
-        body = {
-          messages: openaiMessages,
-          max_tokens: maxTokens,
-          temperature: 0.4,
-          stream: true,
-        };
-        if (openaiToolDefs) {
-          body.tools = openaiToolDefs;
-          body.tool_choice = "auto";
-        }
-
-      } else if (providerType === "google") {
-        // Google Gemini (OpenAI-compatible endpoint)
-        url = `${endpoint || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`;
-        headers["Authorization"] = `Bearer ${apiKey}`;
-        body = {
-          model: modelId,
-          messages: openaiMessages,
-          max_tokens: maxTokens,
-          temperature: 0.4,
-          stream: true,
-        };
-        if (openaiToolDefs) {
-          body.tools = openaiToolDefs;
-          body.tool_choice = "auto";
-        }
-
-      } else if (providerType === "ollama") {
-        // Ollama (OpenAI-compatible endpoint)
-        url = `${endpoint || "http://localhost:11434/v1"}/chat/completions`;
-        body = {
-          model: modelId,
-          messages: openaiMessages,
-          max_tokens: maxTokens,
-          temperature: 0.4,
-          stream: true,
-        };
-        if (openaiToolDefs) {
-          body.tools = openaiToolDefs;
-          body.tool_choice = "auto";
-        }
-
-      } else {
-        // OpenAI / OpenAI-compatible
-        url = `${endpoint || "https://api.openai.com/v1"}/chat/completions`;
-        headers["Authorization"] = `Bearer ${apiKey}`;
-        body = {
-          model: modelId,
-          messages: openaiMessages,
-          max_tokens: maxTokens,
-          temperature: 0.4,
-          stream: true,
-        };
-        if (openaiToolDefs) {
-          body.tools = openaiToolDefs;
-          body.tool_choice = "auto";
-        }
-      }
 
       this.output.appendLine(`[CodePartner] Request: provider=${providerType}, model=${modelId}, url=${url}, tools=${useTools ? (body.tools as any[])?.length || 0 : 'disabled'}, messages=${(body.messages as any[])?.length || 0}`);
 
@@ -2219,7 +2232,17 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
             const toolStartTime = Date.now();
             let result;
             try {
-              const args = JSON.parse(tc.function.arguments);
+              const parsed = repairJsonParse(tc.function.arguments);
+              if (parsed === null) {
+                const errResult = `Error: Could not parse arguments for tool "${tc.function.name}" as JSON, even after attempting basic repair (unterminated string / unbalanced brackets / trailing comma). Raw arguments began with: ${String(tc.function.arguments).substring(0, 200)}\n\nRetry this tool call with strictly valid JSON arguments.`;
+                this.output.appendLine(`[CodePartner] Tool call JSON parse failed for ${tc.function.name}, arguments unrecoverable.`);
+                this._view?.webview.postMessage({ type: "status", value: `⚠️ Malformed arguments for ${tc.function.name} — asked the model to retry.` });
+                return { id: tc.id, name: tc.function.name, content: errResult };
+              }
+              if (parsed.repaired) {
+                this.output.appendLine(`[CodePartner] Repaired malformed JSON arguments for ${tc.function.name}.`);
+              }
+              const args = parsed.value;
               result = await this.executeTool(tc.function.name, args);
 
               if (tc.function.name === "edit_file" && !result.startsWith("Error")) {
@@ -2442,6 +2465,21 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       }
     }
 
+    // Phase 1: permission gate. Architect mode already only drafts file
+    // edits (applied later via an explicit "Apply" action), which is
+    // itself the safe default, so the approval popup would be redundant
+    // for file-write calls made while in that mode.
+    const gatedCategory = GATED_TOOLS[name];
+    if (gatedCategory) {
+      const skipBecauseArchitectDraft = gatedCategory === "file-write" && this.executionMode === "architect";
+      if (!skipBecauseArchitectDraft) {
+        const decision = await this.requestApprovalIfNeeded(name, gatedCategory, args);
+        if (decision !== "allow") {
+          return `Denied: the user did not approve this ${gatedCategory.replace("-", " ")} action (${name}). Explain what you intended to do and why, then ask how they'd like to proceed.`;
+        }
+      }
+    }
+
     switch (name) {
       case "run_command":
         return this.runCommand(args.command);
@@ -2517,53 +2555,127 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
+  /**
+   * Phase 1 permission gate. Decides whether a shell/file/git tool call
+   * needs a visible confirmation, then shows it if so.
+   *
+   * The prompt-injection check (untrustedContent.matches) runs regardless
+   * of policy and regardless of the session allow-list — see
+   * promptInjectionGuard.ts for why.
+   */
+  private async requestApprovalIfNeeded(name: string, category: GatedCategory, args: any): Promise<"allow" | "deny"> {
+    const config = vscode.workspace.getConfiguration("codepartner");
+    const policy = (config.get<string>("approvalPolicy") as ApprovalPolicy) || "always-ask";
+
+    const argsText = JSON.stringify(args ?? {});
+    const flaggedByInjectionGuard = this.untrustedContent.matches(argsText);
+
+    let needsPrompt = flaggedByInjectionGuard || needsApprovalForPolicy(category, policy);
+
+    if (!flaggedByInjectionGuard && needsPrompt) {
+      // Session allow-list shortcuts only apply to non-flagged calls.
+      if (category === "shell" && matchesApprovedPrefix(args?.command || "", this.approvedCommandPrefixes)) {
+        needsPrompt = false;
+      } else if (category === "file-write" && this.sessionAutoApprove.fileWrite) {
+        needsPrompt = false;
+      } else if (category === "git-write" && this.sessionAutoApprove.gitWrite) {
+        needsPrompt = false;
+      }
+    }
+
+    if (!needsPrompt) {
+      return "allow";
+    }
+
+    const description = describeToolCall(name, args);
+    const warningPrefix = flaggedByInjectionGuard
+      ? "⚠️ This content closely matches text pulled from a web search, indexed docs, or an @-mentioned file. Confirming even though your autonomy setting would normally skip this — review carefully before allowing.\n\n"
+      : "";
+
+    this.output.appendLine(`[CodePartner] Requesting approval for ${name}${flaggedByInjectionGuard ? " (flagged: possible prompt injection)" : ""}: ${description}`);
+
+    const buttons = flaggedByInjectionGuard ? ["Allow", "Deny"] : ["Allow", "Always Allow This Session", "Deny"];
+    const choice = await vscode.window.showWarningMessage(
+      `${warningPrefix}CodePartner wants to: ${description}`,
+      { modal: true },
+      ...buttons
+    );
+
+    if (choice === "Always Allow This Session") {
+      if (category === "shell") {
+        this.approvedCommandPrefixes.add(commandPrefix(args?.command || ""));
+      } else if (category === "file-write") {
+        this.sessionAutoApprove.fileWrite = true;
+      } else if (category === "git-write") {
+        this.sessionAutoApprove.gitWrite = true;
+      }
+      return "allow";
+    }
+    if (choice === "Allow") {
+      return "allow";
+    }
+    this.output.appendLine(`[CodePartner] Denied: ${name}`);
+    return "deny";
+  }
+
+  /**
+   * Runs a shell command via child_process.spawn, streaming stdout/stderr
+   * and resolving on the "close" event — replaces the old temp-file
+   * polling hack, which resolved as soon as the output file had ANY bytes
+   * (so a slow-but-fine command could return truncated output) and had no
+   * way to actually stop a hung process, just stop waiting on it.
+   */
   private async runCommand(command: string): Promise<string> {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return "No workspace open.";
     }
 
-    if (!this.terminal || (this.terminal as any).exitStatus !== undefined) {
-      this.terminal = vscode.window.createTerminal({
-        name: "CodePartner Agent",
-        cwd: root
-      });
-    }
-    this.terminal.show(true);
+    const TIMEOUT_MS = 120000; // 2 minutes — real builds/tests can be slow; this isn't a snappy-command assumption.
 
-    const tempOutputFile = path.join(os.tmpdir(), `cp_output_${Date.now()}.txt`);
-    const isWin = process.platform === "win32";
-    
-    // Use a slightly different redirection for Windows PowerShell vs Bash
-    const fullCommand = isWin 
-      ? `${command} | Out-File -FilePath "${tempOutputFile}" -Encoding utf8; Get-Content "${tempOutputFile}"`
-      : `${command} > "${tempOutputFile}" 2>&1; cat "${tempOutputFile}"`;
+    this._view?.webview.postMessage({ type: "status", value: `Running: ${command}` });
+    this.output.appendLine(`[CodePartner] $ ${command}`);
 
-    this.terminal.sendText(fullCommand);
-
-    // Wait for the file to be created and populated
-    // This is a simple polling mechanism. In a real production app, we might use a more robust watcher.
     return new Promise((resolve) => {
-      let checks = 0;
-      const interval = setInterval(() => {
-        checks++;
-        if (fs.existsSync(tempOutputFile)) {
-          const stats = fs.statSync(tempOutputFile);
-          // If file hasn't changed in the last 500ms and has content, or we timed out
-          if (stats.size > 0 || checks > 100) {
-            clearInterval(interval);
-            const content = fs.readFileSync(tempOutputFile, "utf8");
-            try { fs.unlinkSync(tempOutputFile); } catch {}
-            resolve(content || "(Command executed, no output captured)");
-          }
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+
+      const child = cp.spawn(command, { cwd: root, shell: true, env: process.env });
+      this.runningChildProcess = child;
+
+      const finish = (message: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        if (this.runningChildProcess === child) {
+          this.runningChildProcess = undefined;
         }
-        if (checks > 200) { // 20 second timeout
-          clearInterval(interval);
-          resolve("Command timed out or produced no output in terminal.");
-        }
-      }, 100);
+        resolve(message);
+      };
+
+      const timeoutHandle = setTimeout(() => {
+        child.kill();
+        const combined = formatOutput(stdout, stderr);
+        this.warnIfSecrets(combined, `terminal output (${command})`);
+        finish(`Command timed out after ${TIMEOUT_MS / 1000}s and was killed. Partial output:\n${combined || "(none)"}`);
+      }, TIMEOUT_MS);
+
+      child.stdout?.on("data", (d) => { stdout += d.toString(); });
+      child.stderr?.on("data", (d) => { stderr += d.toString(); });
+
+      child.on("error", (err) => {
+        finish(`Error running command: ${err.message}`);
+      });
+
+      child.on("close", (code) => {
+        const combined = formatOutput(stdout, stderr);
+        this.warnIfSecrets(combined, `terminal output (${command})`);
+        finish(`Exit code: ${code}\n${combined || "(no output)"}`);
+      });
     });
   }
+
 
   private listDir(relPath: string): string {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -2596,7 +2708,9 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       if (!fs.existsSync(fullPath)) {
         return `File does not exist: ${relPath}`;
       }
-      return fs.readFileSync(fullPath, "utf8");
+      const content = fs.readFileSync(fullPath, "utf8");
+      this.warnIfSecrets(content, relPath);
+      return content;
     } catch (e: any) {
       return `Error reading file: ${e.message}`;
     }
@@ -2619,32 +2733,16 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         this.fileBackups.set(relPath, fs.readFileSync(fullPath, "utf8"));
       }
 
-      // Exact match first
-      let newContent: string;
-      if (originalContent.includes(search)) {
-        newContent = originalContent.replace(search, replace);
-      } else {
-        // Fuzzy fallback: trim whitespace on each line and try matching
-        const searchTrimmed = search.split("\n").map(l => l.trim()).join("\n");
-        const contentLines = originalContent.split("\n");
-        const contentTrimmed = contentLines.map(l => l.trim()).join("\n");
-        const idx = contentTrimmed.indexOf(searchTrimmed);
-        if (idx === -1) {
+      const editResult = applyEdit(originalContent, search, replace);
+      if (!editResult.ok) {
+        if (editResult.error === NOT_FOUND) {
           return `Error: Could not find the search text in ${relPath}. Please read_file first and use the exact text.`;
         }
-        // Find the original line range
-        const beforeTrimmed = contentTrimmed.substring(0, idx);
-        const startLine = beforeTrimmed.split("\n").length - 1;
-        const searchLineCount = searchTrimmed.split("\n").length;
-        const beforeLines = contentLines.slice(0, startLine);
-        const afterLines = contentLines.slice(startLine + searchLineCount);
-        newContent = [...beforeLines, replace, ...afterLines].join("\n");
+        // Ambiguous match (multiple occurrences) — refuse rather than
+        // silently editing the wrong one. See editUtils.ts.
+        return `Error: ${editResult.error}`;
       }
-
-      const oldLines = originalContent.split(/\r?\n/).filter(l => l.trim() !== "");
-      const newLines = newContent.split(/\r?\n/).filter(l => l.trim() !== "");
-      const removed = oldLines.filter(l => !newLines.includes(l)).length;
-      const added = newLines.filter(l => !oldLines.includes(l)).length;
+      const { content: newContent, added, removed } = editResult;
       this.fileChangeStats.set(relPath, { added, removed });
 
       if (this.executionMode === "architect") {
@@ -2711,7 +2809,13 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private runTests(customCommand?: string): string {
+  /**
+   * Auto-detects and runs the test suite via child_process.spawn (async,
+   * streamed), instead of the old cp.execSync call which blocked the
+   * entire extension host for up to 60s on every test run. Supports
+   * cancellation via the "cancel" webview message (see runningChildProcess).
+   */
+  private async runTests(customCommand?: string): Promise<string> {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "No workspace open."; }
     let command = customCommand;
@@ -2742,13 +2846,59 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         return "Could not auto-detect test runner. Please provide a command (e.g., 'npm test', 'pytest').";
       }
     }
-    this._view?.webview.postMessage({ type: "status", value: `ðŸ§ª Running tests: ${command}` });
-    try {
-      const output = cp.execSync(command, { cwd: root, encoding: "utf8", timeout: 60000, maxBuffer: 1024 * 1024 * 5 });
-      return `âœ… Tests passed.\n\n${output}`;
-    } catch (e: any) {
-      return `âŒ Tests failed.\n\nSTDOUT:\n${e.stdout || "(none)"}\n\nSTDERR:\n${e.stderr || "(none)"}`;
-    }
+
+    const TIMEOUT_MS = 300000; // 5 minutes — test suites commonly run longer than a typical shell command.
+    const testCommand = command;
+    this._view?.webview.postMessage({ type: "status", value: `Running tests: ${testCommand}` });
+    this.output.appendLine(`[CodePartner] $ ${testCommand} (tests)`);
+
+    return new Promise((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      let lastStreamedLength = 0;
+
+      const child = cp.spawn(testCommand, { cwd: root, shell: true, env: process.env });
+      this.runningChildProcess = child;
+
+      const streamPartial = () => {
+        const total = stdout.length + stderr.length;
+        if (total - lastStreamedLength >= 200) {
+          lastStreamedLength = total;
+          this._view?.webview.postMessage({ type: "status", value: `Running tests: ${testCommand} (${total}b output so far)` });
+        }
+      };
+
+      const finish = (message: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        if (this.runningChildProcess === child) {
+          this.runningChildProcess = undefined;
+        }
+        resolve(message);
+      };
+
+      const timeoutHandle = setTimeout(() => {
+        child.kill();
+        const combined = formatOutput(stdout, stderr);
+        this.warnIfSecrets(combined, `test output (${testCommand})`);
+        finish(`Tests timed out after ${TIMEOUT_MS / 1000}s and were killed. Partial output:\n${combined || "(none)"}`);
+      }, TIMEOUT_MS);
+
+      child.stdout?.on("data", (d) => { stdout += d.toString(); streamPartial(); });
+      child.stderr?.on("data", (d) => { stderr += d.toString(); streamPartial(); });
+
+      child.on("error", (err) => {
+        finish(`Error running tests: ${err.message}`);
+      });
+
+      child.on("close", (code) => {
+        const combined = formatOutput(stdout, stderr);
+        this.warnIfSecrets(combined, `test output (${testCommand})`);
+        finish(code === 0 ? `Tests passed.\n\n${combined}` : `Tests failed (exit code ${code}).\n\n${combined}`);
+      });
+    });
   }
 
   private async indexDocs(url: string, title: string): Promise<string> {
@@ -2757,7 +2907,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       fs.mkdirSync(knowledgeDir, { recursive: true });
     }
 
-    this._view?.webview.postMessage({ type: "status", value: `ðŸ“– Indexing docs: ${url}...` });
+    this._view?.webview.postMessage({ type: "status", value: `📖 Indexing docs: ${url}...` });
 
     try {
       if (!this.browserManager) {
@@ -2801,6 +2951,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       }
     }
 
+    if (results) {
+      this.warnIfSecrets(results, "indexed docs");
+      this.untrustedContent.track(results);
+    }
     return results || `No relevant information found for "${query}" in indexed documentation.`;
   }
 
@@ -2823,7 +2977,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       "vscode.diff",
       originalUri,
       currentUri,
-      `${relPath} (Original â†” Agentic Change)`
+      `${relPath} (Original ↔ Agentic Change)`
     );
   }
 
@@ -2887,7 +3041,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
     }));
     this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
-    this._view?.webview.postMessage({ type: "status", value: `ðŸ—ï¸ Architect Mode: Applied ${count} drafted files.` });
+    this._view?.webview.postMessage({ type: "status", value: `🏗️ Architect Mode: Applied ${count} drafted files.` });
     vscode.window.showInformationMessage(`Applied ${count} drafted files.`);
   }
 
@@ -2896,21 +3050,37 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     if (!root) return;
 
     const event = this.timelineEvents.find(e => e.chatId === chatId && e.timestamp === timestamp);
-    if (!event || event.revertContent === undefined || !event.path) {
+    if (!event || !event.path) {
+      vscode.window.showErrorMessage("Cannot revert this action: No backup found.");
+      return;
+    }
+
+    // Phase 2.4: fall back to the git checkpoint for this turn when the
+    // primary revertContent backup isn't available (e.g. an older chat
+    // saved before this field existed).
+    const gitRef = this.turnGitCheckpoints.get(event.turnId);
+    if (event.revertContent === undefined && gitRef === undefined) {
       vscode.window.showErrorMessage("Cannot revert this action: No backup found.");
       return;
     }
 
     const fullPath = path.join(root, event.path);
     try {
-      if (event.revertContent === "") {
-        // Was created by agent, so reverting means deleting it
-        if (fs.existsSync(fullPath)) {
-          fs.unlinkSync(fullPath);
+      if (event.revertContent !== undefined) {
+        if (event.revertContent === "") {
+          // Was created by agent, so reverting means deleting it
+          if (fs.existsSync(fullPath)) {
+            fs.unlinkSync(fullPath);
+          }
+        } else {
+          // Was edited, revert to previous content
+          fs.writeFileSync(fullPath, event.revertContent, "utf8");
         }
-      } else {
-        // Was edited, revert to previous content
-        fs.writeFileSync(fullPath, event.revertContent, "utf8");
+      } else if (gitRef !== undefined) {
+        const ok = restoreFileFromCheckpoint(root, gitRef, event.path);
+        if (!ok) {
+          throw new Error("no revertContent backup, and the git checkpoint fallback couldn't restore this file (it may not have existed at checkpoint time)");
+        }
       }
 
       // Update UI
@@ -2926,7 +3096,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) return;
 
-    const eventsToRevert = this.timelineEvents.filter(e => e.turnId === turnId && !e.reverted && e.revertContent !== undefined);
+    const gitRef = this.turnGitCheckpoints.get(turnId);
+    const eventsToRevert = this.timelineEvents.filter(e =>
+      e.turnId === turnId && !e.reverted && (e.revertContent !== undefined || gitRef !== undefined)
+    );
     eventsToRevert.sort((a, b) => b.timestamp - a.timestamp);
 
     let revertedCount = 0;
@@ -2934,12 +3107,19 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       if (!event.path) continue;
       const fullPath = path.join(root, event.path);
       try {
-        if (event.revertContent === "") {
-          if (fs.existsSync(fullPath)) {
-            fs.unlinkSync(fullPath);
+        if (event.revertContent !== undefined) {
+          if (event.revertContent === "") {
+            if (fs.existsSync(fullPath)) {
+              fs.unlinkSync(fullPath);
+            }
+          } else {
+            fs.writeFileSync(fullPath, event.revertContent, "utf8");
           }
-        } else {
-          fs.writeFileSync(fullPath, event.revertContent, "utf8");
+        } else if (gitRef !== undefined) {
+          const ok = restoreFileFromCheckpoint(root, gitRef, event.path);
+          if (!ok) {
+            throw new Error("git checkpoint fallback couldn't restore this file");
+          }
         }
         event.reverted = true;
         revertedCount++;
@@ -3008,7 +3188,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         <svg viewBox="0 0 16 16"><path d="M3.5 2a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5h-9zM5 5h6v1H5V5zm0 2.5h6v1H5v-1zm0 2.5h4v1H5v-1z"/></svg>
       </button>
       <button class="tab-btn" data-tab="skills" title="Skills">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 9.27a3.25 3.25 0 0 0-3.47-8.752L4.5 7.022a5.045 5.045 0 0 0-4.624 3.2 5.052 5.052 0 0 0 1.352 2.766l2.128-2.128a.75.75 0 0 1 1.06 1.06l-2.127 2.129A5.05 5.05 0 0 0 5.28 15.4c.94.417 1.954.542 2.92.368L14.7 9.27zM7.222 8.444L11.23 4.437a1.75 1.75 0 1 1 2.474 2.475l-4.007 4.007-2.475-2.475z"/></svg>
+        <svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>
       </button>
     </div>
 
