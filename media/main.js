@@ -498,6 +498,12 @@
   document.getElementById('apply-drafts-btn').onclick = () => {
     vscode.postMessage({ type: 'applyArchitectDrafts' });
   };
+  const applyHunksBtn = document.getElementById('apply-hunks-btn');
+  if (applyHunksBtn) {
+    applyHunksBtn.onclick = () => {
+      vscode.postMessage({ type: 'applyArchitectHunks', value: collectAcceptedHunkSelections() });
+    };
+  }
 
   // UI Event Listeners
   historyBtn.onclick = () => {
@@ -1102,18 +1108,69 @@
     }
   });
 
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   function renderArchitectDrafts(drafts) {
     if (!drafts || drafts.length === 0 || (Array.isArray(drafts) && drafts.length === 0)) {
       architectDraftsContainer.classList.add('hidden');
       return;
     }
     architectDraftsContainer.classList.remove('hidden');
-    draftsList.innerHTML = drafts.map(d => `
-      <div class="draft-item">
-        <span class="draft-path">${d.path}</span>
-        <span class="draft-lines">${d.lines} lines pending</span>
-      </div>
-    `).join('');
+    draftsList.innerHTML = drafts.map(d => {
+      const hunks = d.hunks || [];
+      const hunksHtml = hunks.map(h => {
+        const linesHtml = h.lines.map(l => {
+          const prefix = l.type === 'add' ? '+' : l.type === 'remove' ? '-' : ' ';
+          const cls = l.type === 'add' ? 'hunk-line-add' : l.type === 'remove' ? 'hunk-line-remove' : 'hunk-line-context';
+          return `<div class="${cls}">${prefix} ${escapeHtml(l.value)}</div>`;
+        }).join('');
+        return `
+          <div class="hunk-item" data-hunk-id="${escapeHtml(h.id)}">
+            <label class="hunk-toggle">
+              <input type="checkbox" class="hunk-accept-checkbox" data-hunk-id="${escapeHtml(h.id)}" checked />
+              <span>@@ -${h.oldStart} +${h.newStart} @@</span>
+            </label>
+            <div class="hunk-lines">${linesHtml}</div>
+          </div>
+        `;
+      }).join('');
+
+      return `
+        <div class="draft-item-wrapper" data-draft-path="${escapeHtml(d.path)}">
+          <div class="draft-item">
+            <span class="draft-path">${escapeHtml(d.path)}</span>
+            <span class="draft-lines">${d.lines} lines pending</span>
+            ${hunks.length > 0 ? `<button class="draft-review-toggle" type="button">Review ${hunks.length} hunk${hunks.length === 1 ? '' : 's'}</button>` : ''}
+          </div>
+          <div class="hunks-container hidden">${hunksHtml}</div>
+        </div>
+      `;
+    }).join('');
+
+    // Wire per-file expand/collapse toggles.
+    draftsList.querySelectorAll('.draft-review-toggle').forEach(btn => {
+      btn.onclick = () => {
+        const wrapper = btn.closest('.draft-item-wrapper');
+        const hunksContainer = wrapper.querySelector('.hunks-container');
+        hunksContainer.classList.toggle('hidden');
+      };
+    });
+  }
+
+  function collectAcceptedHunkSelections() {
+    const selections = {};
+    draftsList.querySelectorAll('.draft-item-wrapper').forEach(wrapper => {
+      const filePath = wrapper.getAttribute('data-draft-path');
+      const accepted = Array.from(wrapper.querySelectorAll('.hunk-accept-checkbox:checked')).map(cb => cb.getAttribute('data-hunk-id'));
+      selections[filePath] = accepted;
+    });
+    return selections;
   }
 
 

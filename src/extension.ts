@@ -18,6 +18,7 @@ import { repairJsonParse } from "./jsonRepair";
 import { isGitRepo, createGitCheckpoint, restoreFileFromCheckpoint } from "./gitCheckpoint";
 import { buildProviderRequest, extractNonStreamedText, extractToolCalls, extractAssistantMessage, ProviderMessage } from "./aiProviderAdapter";
 import { getScopedTools } from "./subAgentTools";
+import { diffLines, groupIntoHunks, applyAcceptedHunks } from "./lineDiff";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -1162,6 +1163,9 @@ Provide a concise, high-quality result.`;
           break;
         case "applyArchitectDrafts":
           this.applyArchitectDrafts();
+          break;
+        case "applyArchitectHunks":
+          this.applyArchitectHunks(data.value || {});
           break;
         case "revertTimelineAction":
           this.revertTimelineAction(data.chatId, data.timestamp);
@@ -3073,11 +3077,33 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     vscode.window.showWarningMessage(`Reverted changes in ${relPath}.`);
   }
 
+  /** Reads the on-disk content a draft is being compared against, or "" for a file that doesn't exist yet (Phase 3.2). */
+  private getArchitectOriginalContent(root: string, relPath: string): string {
+    const fullPath = path.join(root, relPath);
+    if (fs.existsSync(fullPath)) {
+      try {
+        return fs.readFileSync(fullPath, "utf8");
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  }
+
   private sendArchitectDrafts() {
-    const drafts = Array.from(this.architectDrafts.entries()).map(([path, content]) => ({
-      path,
-      lines: content.split(/\r?\n/).length
-    }));
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const drafts = Array.from(this.architectDrafts.entries()).map(([relPath, content]) => {
+      const original = root ? this.getArchitectOriginalContent(root, relPath) : "";
+      // Phase 3.2: per-hunk diff review data, alongside the existing
+      // whole-file summary so "Apply All Drafts" still works unchanged.
+      const dl = diffLines(original, content);
+      const hunks = groupIntoHunks(dl, 3);
+      return {
+        path: relPath,
+        lines: content.split(/\r?\n/).length,
+        hunks: hunks.map((h) => ({ id: h.id, oldStart: h.oldStart, newStart: h.newStart, lines: h.lines })),
+      };
+    });
     this._view?.webview.postMessage({ type: "architectDrafts", value: drafts });
   }
 
@@ -3105,6 +3131,47 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
     this._view?.webview.postMessage({ type: "status", value: `🏗️ Architect Mode: Applied ${count} drafted files.` });
     vscode.window.showInformationMessage(`Applied ${count} drafted files.`);
+  }
+
+  /**
+   * Applies only the accepted hunks per file (Phase 3.2), instead of the
+   * whole draft. `selections` maps relPath -> array of accepted hunk ids
+   * (from the webview's per-hunk checkboxes). A file with zero accepted
+   * hunks is left untouched on disk but still cleared from the draft
+   * queue, matching a full per-file reject.
+   */
+  private applyArchitectHunks(selections: Record<string, string[]>) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) { return; }
+
+    let filesChanged = 0;
+    for (const [relPath, content] of this.architectDrafts.entries()) {
+      const acceptedIds = new Set(selections[relPath] || []);
+      const original = this.getArchitectOriginalContent(root, relPath);
+      const dl = diffLines(original, content);
+      const hunks = groupIntoHunks(dl, 3);
+      const finalContent = applyAcceptedHunks(dl, hunks, acceptedIds);
+
+      if (finalContent !== original) {
+        const fullPath = path.join(root, relPath);
+        const dir = path.dirname(fullPath);
+        if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
+        fs.writeFileSync(fullPath, finalContent, "utf8");
+        this.modifiedFiles.add(relPath);
+        filesChanged++;
+      }
+    }
+
+    this.architectDrafts.clear();
+    this.sendArchitectDrafts();
+
+    const stats = Array.from(this.modifiedFiles).map(f => ({
+      path: f,
+      ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
+    }));
+    this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
+    this._view?.webview.postMessage({ type: "status", value: `🏗️ Architect Mode: Applied selected hunks in ${filesChanged} file(s).` });
+    vscode.window.showInformationMessage(`Applied selected hunks in ${filesChanged} file(s).`);
   }
 
   private revertTimelineAction(chatId: string, timestamp: number) {
@@ -3271,7 +3338,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
             <div id="architect-drafts" class="hidden">
               <div class="drafts-header">Architect Drafts Pending</div>
               <div id="drafts-list"></div>
-              <button id="apply-drafts-btn">Apply All Drafts</button>
+              <div class="drafts-actions">
+                <button id="apply-hunks-btn" class="secondary">Apply Selected Hunks</button>
+                <button id="apply-drafts-btn">Apply All Drafts</button>
+              </div>
             </div>
             <div id="suggestion-list" class="hidden"></div>
             <div id="attachment-chips" class="hidden"></div>
