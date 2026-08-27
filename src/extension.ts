@@ -20,6 +20,7 @@ import { buildProviderRequest, extractNonStreamedText, extractToolCalls, extract
 import { getScopedTools } from "./subAgentTools";
 import { diffLines, groupIntoHunks, applyAcceptedHunks } from "./lineDiff";
 import { buildPlanFromTasks, validatePlanIndex } from "./planUtils";
+import { estimateTokens, truncateToTokenBudget } from "./tokenEstimate";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -242,10 +243,9 @@ class BrowserManager {
           const title = await page.title();
           // @ts-ignore
           const fullContent: string = await page.evaluate(() => document.body.innerText);
-          const content = fullContent.length > 5000
-            ? fullContent.substring(0, 5000) + "\n... (truncated — page content continues, use grep_search or a narrower selector for more)"
-            : fullContent;
-          return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}`;
+          const { text: content, truncated } = truncateToTokenBudget(fullContent, 1250); // ~ previous 5000-char cap
+          const suffix = truncated ? "\n... (truncated — page content continues, use grep_search or a narrower selector for more)" : "";
+          return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}${suffix}`;
         }
         case "screenshot": {
           if (url) { await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 }); }
@@ -265,10 +265,9 @@ class BrowserManager {
           await page.waitForNetworkIdle({ timeout: 3000 }).catch(() => { });
           // @ts-ignore
           const fullClickContent: string = await page.evaluate(() => document.body.innerText);
-          const clickContent = fullClickContent.length > 3000
-            ? fullClickContent.substring(0, 3000) + "\n... (truncated — page content continues)"
-            : fullClickContent;
-          return `Clicked "${selector}". Page content after click:\n${clickContent}`;
+          const { text: clickContent, truncated: clickTruncated } = truncateToTokenBudget(fullClickContent, 750); // ~ previous 3000-char cap
+          const clickSuffix = clickTruncated ? "\n... (truncated — page content continues)" : "";
+          return `Clicked "${selector}". Page content after click:\n${clickContent}${clickSuffix}`;
         }
         case "type": {
           if (!selector || !text) { return "Error: selector and text required for type."; }
@@ -1849,7 +1848,16 @@ Provide a concise, high-quality result.`;
     vscode.window.showInformationMessage("Review the diff. Use the buttons in the diff editor to Accept or Revert changes.");
   }
 
-  private async getFileMentionsContext(prompt: string): Promise<string> {
+  /**
+   * Phase 3.4: injects @-mentioned file content within a shared token
+   * budget, instead of the previous unbounded injection (this was the
+   * one file-context source with NO cap at all before this change — the
+   * others had fixed character caps, this one had none). `budget` is
+   * shared with the active-editor/other-tabs context added later in the
+   * same turn, so heavy use of one source leaves less room for the rest
+   * rather than each source getting its own independent allowance.
+   */
+  private async getFileMentionsContext(prompt: string, budget: { remaining: number }): Promise<string> {
     const mentionRegex = /@([a-zA-Z0-9_\-./\\]+)/g;
     let match;
     let context = "";
@@ -1865,6 +1873,11 @@ Provide a concise, high-quality result.`;
       }
       seen.add(filename);
 
+      if (budget.remaining <= 0) {
+        this.output.appendLine(`[CodePartner] Skipped @${filename}: context token budget exhausted.`);
+        continue;
+      }
+
       try {
         let files = await vscode.workspace.findFiles(`**/${filename}`, "{**/node_modules/**,**/.git/**,**/dist/**}", 1);
         if (!files.length) {
@@ -1876,8 +1889,11 @@ Provide a concise, high-quality result.`;
           const text = doc.getText();
           this.warnIfSecrets(text, rel);
           this.untrustedContent.track(text);
-          context += `\n--- File: ${rel} ---\n\`\`\`\n${text}\n\`\`\`\n\n`;
-          this.output.appendLine(`[CodePartner] Injected file: ${rel}`);
+          const { text: capped, truncated } = truncateToTokenBudget(text, budget.remaining);
+          budget.remaining -= estimateTokens(capped);
+          const suffix = truncated ? "\n... (truncated to fit context token budget)" : "";
+          context += `\n--- File: ${rel} ---\n\`\`\`\n${capped}${suffix}\n\`\`\`\n\n`;
+          this.output.appendLine(`[CodePartner] Injected file: ${rel}${truncated ? " (truncated)" : ""}`);
         }
       } catch {
         this.output.appendLine(`[CodePartner] Could not read: ${filename}`);
@@ -2100,8 +2116,17 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       return;
     }
 
-    // Auto-compact if history is getting long
-    if (this.messageHistory.length > 40) {
+    // Auto-compact when history is getting long — either by message count
+    // (the original heuristic) or by an estimated token count (Phase 3.4).
+    // Message count alone can miss a handful of very large messages (e.g.
+    // large pasted files) that approach context limits well before 40
+    // messages accumulate.
+    const HISTORY_TOKEN_COMPACTION_THRESHOLD = 20000; // conservative; most current models have well more headroom than this
+    const estimatedHistoryTokens = this.messageHistory.reduce(
+      (sum, m) => sum + estimateTokens(typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")),
+      0
+    );
+    if (this.messageHistory.length > 40 || estimatedHistoryTokens > HISTORY_TOKEN_COMPACTION_THRESHOLD) {
       await this.compactContext();
     }
 
@@ -2134,7 +2159,14 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       let contextHeader = "";
     contextHeader += await this.getWebSearchContext(prompt);
     contextHeader += await this.getWorkspaceContext(prompt);
-    contextHeader += await this.getFileMentionsContext(prompt);
+
+    // Phase 3.4: token-aware context budget, shared across @file mentions,
+    // the active editor's content, and other open tabs — replacing what
+    // used to be independent fixed character caps per source (or, for
+    // @file mentions, no cap at all).
+    const contextBudget = { remaining: vscode.workspace.getConfiguration("codepartner").get<number>("contextTokenBudget") || 6000 };
+
+    contextHeader += await this.getFileMentionsContext(prompt, contextBudget);
 
     const editor = vscode.window.activeTextEditor;
     if (editor) {
@@ -2148,8 +2180,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       } else {
         const text = document.getText();
         this.warnIfSecrets(text, fileName || "active file");
-        const capped = text.length > 8000 ? text.substring(0, 8000) + "\n... (truncated)" : text;
-        contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nContent:\n\`\`\`\n${capped}\n\`\`\`\n`;
+        const { text: capped, truncated } = truncateToTokenBudget(text, contextBudget.remaining);
+        contextBudget.remaining -= estimateTokens(capped);
+        const suffix = truncated ? "\n... (truncated to fit context token budget)" : "";
+        contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nContent:\n\`\`\`\n${capped}${suffix}\n\`\`\`\n`;
       }
     }
 
@@ -2160,8 +2194,14 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const name = path.basename(doc.fileName);
       const text = doc.getText();
       this.warnIfSecrets(text, name);
-      const capped = text.length > 2000 ? text.substring(0, 2000) + "\n... (truncated)" : text;
-      contextHeader += `\n--- Context from Open Tab ---\nFile: \`${name}\`\nContent:\n\`\`\`\n${capped}\n\`\`\`\n`;
+      if (contextBudget.remaining <= 0) {
+        this.output.appendLine(`[CodePartner] Skipped open tab ${name}: context token budget exhausted.`);
+        continue;
+      }
+      const { text: capped, truncated } = truncateToTokenBudget(text, contextBudget.remaining);
+      contextBudget.remaining -= estimateTokens(capped);
+      const suffix = truncated ? "\n... (truncated to fit context token budget)" : "";
+      contextHeader += `\n--- Context from Open Tab ---\nFile: \`${name}\`\nContent:\n\`\`\`\n${capped}${suffix}\n\`\`\`\n`;
     }
 
     // Feature 7: Custom Instructions

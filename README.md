@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.0.2-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.0.8-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -24,19 +24,21 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 - **Timeline & Revert**: Full audit trail of every tool action with one-click undo
 
 ### 🛠️ Powerful Tools
-- **Safe File Operations**: `read_file` (always first), precise `search/replace` editing, `create_file`, `grep_search`
+- **Safe File Operations**: Always `read_file` first, precise hunk-based edits (`diffLines` + selective apply), `create_file`, `grep_search`
+- **Approval & Safety**: Configurable policies (`always-ask` / `full-auto`), secret scanner, prompt injection guard
 - **Terminal & Testing**: Runs shell commands, auto-detects and runs tests (`run_tests`)
 - **Browser Control**: Navigate, click, type, screenshot web pages for research (cross-platform via Puppeteer)
-- **Git Integration**: Status, stage, AI commit messages, branches, and GitHub PR creation
+- **Git Integration**: Status, stage, AI-generated commit messages (with Co-author), branches, and GitHub PR creation
 - **Web & Knowledge**: DuckDuckGo search, document indexing (`index_docs` + `query_knowledge`)
 - **MCP Support**: Connect to external Model Context Protocol servers for custom tools
-- **Artifacts**: Persistent storage of code, markdown, logs, and screenshots in `~/.codepartner`
+- **Artifacts & Skills**: Persistent global storage (`~/.codepartner`) of code, plans, markdown, logs, and screenshots
 
 ### 🔍 Smart Context
 - `@workspace` - Semantic TF-IDF search across your codebase
-- `@web` - Real-time web search
-- `@file` mentions and automatic context from active file + open tabs
-- Context compaction for long conversations
+- `@web` - Real-time web search + sub-agent researcher
+- `@file` mentions and automatic context from active file + **all open tabs**
+- Context compaction (LLM summarization when history >40 messages)
+- Token-aware budgeting and truncation
 - Image/file attachments support
 
 ### 🎨 Premium UX
@@ -90,13 +92,15 @@ Key settings (full list in VS Code Settings):
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `codepartner.provider` | `openai` | `openai`, `azure`, `anthropic`, `google`, `ollama` |
-| `codepartner.apiKey` | `` | Your API key |
+| `codepartner.apiKey` | `` | Your API key (set via command for secure storage) |
 | `codepartner.model` | `gpt-4` | Model name/deployment |
 | `codepartner.apiEndpoint` | `https://api.openai.com/v1` | Custom endpoint |
+| `codepartner.approvalPolicy` | `always-ask` | Safety level (`always-ask` / `ask-for-shell` / `full-auto` / `yolo`) |
 | `codepartner.inlineCompletions` | `false` | Enable ghost text completions |
 | `codepartner.inlineCompletionDebounce` | `500` | Debounce ms for completions |
 | `codepartner.mcpServers` | `{}` | MCP server configurations |
 | `codepartner.addAICoAuthor` | `true` | Add Co-authored-by to Git commits |
+| `codepartner.contextTokenBudget` | `6000` | Shared token budget for file/open-tab context |
 | `codepartner.maxTokens` | `4096` | Max output tokens |
 
 ---
@@ -150,7 +154,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Inline completions were added in v2.0.2. Semantic search and MCP bring it closer to industry leaders.
+**Note**: Now at v2.0.8 with approval system, secret scanning, prompt injection protection, precise hunk edits, context compaction, full multi-agent parallelism, and Marketplace-ready documentation. See [CHANGELOG.md](CHANGELOG.md) for the complete incremental history.
 
 ---
 

@@ -3,7 +3,7 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.0.7",
+  "version": "2.0.8",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
@@ -144,6 +144,11 @@
           "type": "number",
           "default": 4096,
           "description": "Max output tokens."
+        },
+        "codepartner.contextTokenBudget": {
+          "type": "number",
+          "default": 6000,
+          "description": "Approximate token budget shared across per-turn file context (active editor content, other open tabs, @file mentions). Replaces the old fixed character caps on each source individually — content is truncated (on a line boundary) to fit within this shared budget instead."
         },
         "codepartner.azureApiVersion": {
           "type": "string",
