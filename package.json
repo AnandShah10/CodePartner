@@ -3,7 +3,7 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",

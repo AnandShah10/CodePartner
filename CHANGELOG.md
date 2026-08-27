@@ -4,6 +4,27 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.0.9] - 2024-10-25
+### Added
+- Secure API key handling with VS Code SecretStorage (`API_KEY_SECRET_KEY`, automatic migration from settings)
+- Virtual document content providers (`SingleContentProvider`, `CodePartnerDiffProvider` for side-by-side proposed changes)
+- `formatOutput` utility for combining process stdout/stderr in terminal tools
+- Cross-platform `BrowserManager` with `findChromePath()` for reliable Puppeteer automation on Win/macOS/Linux
+- Enhanced `ArtifactRegistry` and `SkillManager` for global `~/.codepartner/{artifacts,skills}` persistence
+- `AgentManager` with `dispatch()` + status tracking for parallel `researcher`/`code_expert`/`tester`/`writer` sub-agents
+- `findAutoTriggeredSkills()` for proactive skill suggestions
+
+### Changed
+- `CodePartnerSidebarProvider` now fully integrates diff views, approval flows, and virtual docs
+- Configuration updated with deprecation notice for `codepartner.apiKey` (use "Set API Key" command)
+- Improved streaming, JSON repair, and token budgeting in core agent loop
+- Marketplace assets and documentation finalized (hero image, feature grid, config table)
+
+### Fixed
+- Chrome executable detection across platforms for browser tools
+- Output formatting and error recovery in MCP, Git, and shell command execution
+- Version alignment between `package.json` (now 2.0.9), README, and this changelog
+
 ## [2.0.8] - 2024-10-20
 ### Added
 - Final Marketplace readiness (icon, polished README, optimized `.vscodeignore`)

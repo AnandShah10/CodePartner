@@ -21,6 +21,7 @@ import { getScopedTools } from "./subAgentTools";
 import { diffLines, groupIntoHunks, applyAcceptedHunks } from "./lineDiff";
 import { buildPlanFromTasks, validatePlanIndex } from "./planUtils";
 import { estimateTokens, truncateToTokenBudget } from "./tokenEstimate";
+import { findAutoTriggeredSkills } from "./skillAutoTrigger";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -478,7 +479,7 @@ const TOOLS = [
   },
   {
     name: "use_skill",
-    description: "Retrieve instructions from a previously saved skill.",
+    description: "Retrieve instructions from a previously saved skill by name. Note: skills whose description keyword-matches the user's current message are already auto-loaded into context at the start of the turn — check context before assuming you need this. Use this for a skill that didn't auto-trigger, or one you want by exact name.",
     parameters: {
       type: "object",
       properties: {
@@ -489,7 +490,7 @@ const TOOLS = [
   },
   {
     name: "list_skills",
-    description: "List all currently available skills.",
+    description: "List all currently available skills (name + description) to see what exists, e.g. before deciding whether to create a new one or call use_skill on an existing one that didn't auto-trigger.",
     parameters: { type: "object", properties: {} },
   },
   {
@@ -2167,6 +2168,23 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     const contextBudget = { remaining: vscode.workspace.getConfiguration("codepartner").get<number>("contextTokenBudget") || 6000 };
 
     contextHeader += await this.getFileMentionsContext(prompt, contextBudget);
+
+    // Phase 3.5: auto-trigger skills whose description keyword-matches
+    // this prompt, instead of relying on the model remembering to call
+    // list_skills then use_skill. Still counts against the same shared
+    // context budget as everything else above.
+    if (this.skillManager) {
+      const availableSkills = this.skillManager.listSkills();
+      const autoSkills = findAutoTriggeredSkills(prompt, availableSkills);
+      for (const s of autoSkills) {
+        if (contextBudget.remaining <= 0) break;
+        const skillContent = this.skillManager.useSkill(s.name);
+        const { text: cappedSkill, truncated } = truncateToTokenBudget(skillContent, contextBudget.remaining);
+        contextBudget.remaining -= estimateTokens(cappedSkill);
+        contextHeader += cappedSkill + (truncated ? "\n... (skill truncated to fit context token budget)\n" : "");
+        this.output.appendLine(`[CodePartner] Auto-triggered skill: ${s.name}`);
+      }
+    }
 
     const editor = vscode.window.activeTextEditor;
     if (editor) {

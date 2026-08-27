@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.0.8-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.0.9-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -53,13 +53,12 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 ## 🚀 Quick Start
 
 1. **Install** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
-2. **Configure API**:
-   - Open Command Palette (`Ctrl+Shift+P`) → "Preferences: Open Settings (UI)"
-   - Search for "CodePartner"
-   - Set:
+2. **Configure API** (secure storage):
+   - Run **"CodePartner: Set API Key"** from Command Palette (`Ctrl+Shift+P`). This stores your key securely via VS Code SecretStorage (migrates any old `settings.json` value automatically).
+   - Then set:
      - `provider` (e.g. `openai`, `anthropic`, `ollama`)
-     - `apiKey`
      - `model` (e.g. `gpt-4o`, `claude-3-5-sonnet-20241022`, `llama3`)
+   - Optional: tweak `approvalPolicy`, `contextTokenBudget`, `inlineCompletions`, etc.
 3. **Open Sidebar**: Click the robot icon in Activity Bar or press `Ctrl+L` / `Cmd+L`
 4. **Try it**:
    - **Fast**: "Explain this function"
@@ -154,7 +153,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at v2.0.8 with approval system, secret scanning, prompt injection protection, precise hunk edits, context compaction, full multi-agent parallelism, and Marketplace-ready documentation. See [CHANGELOG.md](CHANGELOG.md) for the complete incremental history.
+**Note**: Now at **v2.0.9** with secure SecretStorage for API keys, virtual diff providers, cross-platform browser automation, full `AgentManager`/`SkillManager`/`ArtifactRegistry`, proactive skill detection, and complete Marketplace packaging. See [CHANGELOG.md](CHANGELOG.md) for the granular, implementation-derived history across all versions.
 
 ---
 
