@@ -19,6 +19,7 @@ import { isGitRepo, createGitCheckpoint, restoreFileFromCheckpoint } from "./git
 import { buildProviderRequest, extractNonStreamedText, extractToolCalls, extractAssistantMessage, ProviderMessage } from "./aiProviderAdapter";
 import { getScopedTools } from "./subAgentTools";
 import { diffLines, groupIntoHunks, applyAcceptedHunks } from "./lineDiff";
+import { buildPlanFromTasks, validatePlanIndex } from "./planUtils";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -347,9 +348,8 @@ DO NOT execute any code changes until the user explicitly approves.
 
 ### Phase 3: EXECUTION (Only After User Approval)
 Once the user says 'proceed', 'approved', 'go ahead', 'yes', or similar:
-- Create a "task" artifact to track progress
-- Execute changes one by one, marking tasks as complete
-- Use \`[x]\` for done, \`[ ]\` for pending, \`[/]\` for in-progress
+- Call \`create_plan\` once with the ordered list of implementation steps from your plan, so progress is tracked in the Plan panel
+- Execute changes one by one, calling \`update_plan_task\` to mark each step done as you finish it
 
 ### Phase 4: VERIFICATION & WALKTHROUGH
 - Run tests if applicable using \`run_tests\`
@@ -435,6 +435,33 @@ const TOOLS = [
         type: { type: "string", enum: ["code", "markdown", "log"], description: "Format of the artifact." },
       },
       required: ["title", "content", "type"],
+    },
+  },
+  {
+    name: "create_plan",
+    description: "Create or replace the structured task checklist shown in the Plan panel, as a JSON array of task descriptions. Call once, after research, with the full ordered list of implementation steps. Use update_plan_task to mark steps done as you complete them.",
+    parameters: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          items: { type: "string" },
+          description: "Ordered list of concise, one-line task descriptions.",
+        },
+      },
+      required: ["tasks"],
+    },
+  },
+  {
+    name: "update_plan_task",
+    description: "Mark a task in the current plan done or not done, by its 0-based index.",
+    parameters: {
+      type: "object",
+      properties: {
+        index: { type: "number", description: "0-based index of the task in the plan." },
+        done: { type: "boolean", description: "Whether the task is now complete." },
+      },
+      required: ["index", "done"],
     },
   },
   {
@@ -2500,34 +2527,11 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private extractPlan(response: string): { task: string; done: boolean }[] {
-    const lines = response.split("\n");
-    let inPlan = false;
-    const tasks: { task: string; done: boolean }[] = [];
-    for (const line of lines) {
-      if (/^#{1,3}\s*(implementation\s*plan|plan|tasks?|todo|roadmap|steps)/i.test(line)) {
-        inPlan = true;
-        continue;
-      }
-      if (inPlan && /^#{1,3}\s/.test(line) && !/plan|task|step/i.test(line)) {
-        break;
-      }
-      if (inPlan) {
-        const taskMatch = line.match(/^[\s]*(?:[-*]|\d+\.)\s*(?:\[[ x]\]\s*)?(.+)/);
-        if (taskMatch) {
-          const done = /\[x\]/i.test(line);
-          tasks.push({ task: taskMatch[1].trim(), done });
-        }
-      }
-    }
-    return tasks;
-  }
-
   private async executeTool(name: string, args: any): Promise<any> {
     if (this.executionMode === "planning") {
-      const hasPlan = this.currentArtifacts.some(a => a.title.toLowerCase().includes("plan"));
+      const hasPlan = this.currentPlan.length > 0 || this.currentArtifacts.some(a => a.title.toLowerCase().includes("plan"));
       if (!hasPlan && (name === "edit_file" || name === "create_file")) {
-        return `Error: You are in PLANNING MODE but have not created the "implementation_plan.md" artifact yet. You MUST create the implementation plan and get user approval BEFORE executing code modifications. Use the create_artifact tool.`;
+        return `Error: You are in PLANNING MODE but have not created a plan yet. Create the implementation plan artifact (create_artifact, title including "implementation_plan") and the structured task checklist (create_plan) before making code changes.`;
       }
     }
 
@@ -2569,6 +2573,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
           return `Artifact created: ${art.title} (ID: ${art.id})`;
         }
         return "Error: Workspace not open, cannot create artifact.";
+      case "create_plan":
+        return this.createPlan(args.tasks);
+      case "update_plan_task":
+        return this.updatePlanTask(args.index, args.done);
       case "browser_control":
         if (!this.browserManager) {
           return "Error: Workspace not open, browser control disabled.";
@@ -3088,6 +3096,37 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       }
     }
     return "";
+  }
+
+  /**
+   * Phase 3.3: structured plan creation, replacing the dead extractPlan()
+   * regex parser (it was defined but never actually called anywhere in
+   * the codebase — the Plan panel's UI was fully built and working, but
+   * nothing ever populated real data into it for a fresh conversation).
+   * The model now sets the checklist directly as JSON instead of the
+   * fragile approach of asking it to write `[x]`/`[ ]` markdown into an
+   * artifact and hoping a regex parses it correctly.
+   */
+  private createPlan(tasks: any): string {
+    const result = buildPlanFromTasks(tasks);
+    if ("error" in result) {
+      return `Error: ${result.error}`;
+    }
+    this.currentPlan = result.plan;
+    this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
+    this.saveCurrentChat();
+    return `Plan created with ${this.currentPlan.length} task(s).`;
+  }
+
+  private updatePlanTask(index: number, done: boolean): string {
+    const validation = validatePlanIndex(this.currentPlan, index);
+    if (!validation.ok) {
+      return `Error: ${validation.error}`;
+    }
+    this.currentPlan[index].done = !!done;
+    this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
+    this.saveCurrentChat();
+    return `Task ${index} ("${this.currentPlan[index].task}") marked as ${done ? "done" : "not done"}.`;
   }
 
   private sendArchitectDrafts() {
