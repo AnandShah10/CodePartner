@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as cp from 'child_process';
+import { parseGitHubUrl } from './gitUrlUtils';
 
 export class GitManager {
     private gitApi: any;
@@ -106,7 +107,13 @@ export class GitManager {
     }
 
     /**
-     * Push the current branch to its remote.
+     * Push the current branch to its remote, setting upstream explicitly.
+     * The PR workflow's typical path is create_git_branch (no upstream
+     * yet) -> stage -> commit -> create_pull_request, and a bare
+     * repo.push() with no arguments generally requires an existing
+     * upstream — it would fail on exactly that first-push-of-a-new-branch
+     * case this feature is built around. Passing setUpstream=true handles
+     * both the "never pushed before" and "already has upstream" cases.
      */
     public async push(): Promise<string> {
         const repo = this.getRepository();
@@ -114,8 +121,17 @@ export class GitManager {
             return "No Git repository found.";
         }
         try {
-            await repo.push();
-            return "Successfully pushed to remote.";
+            const branchName: string | undefined = repo.state.HEAD?.name;
+            if (!branchName) {
+                return "Error pushing to remote: could not determine current branch.";
+            }
+            const remotes = repo.state.remotes;
+            if (!remotes || remotes.length === 0) {
+                return "Error pushing to remote: no remote configured.";
+            }
+            const remoteName = (remotes.find((r: any) => r.name === "origin") || remotes[0]).name;
+            await repo.push(remoteName, branchName, true);
+            return `Successfully pushed ${branchName} to ${remoteName}.`;
         } catch (e: any) {
             return `Error pushing to remote: ${e.message}`;
         }
@@ -152,14 +168,10 @@ export class GitManager {
 
     /**
      * Parse a GitHub remote URL to extract owner and repo name.
+     * Delegates to the standalone, unit-tested parseGitHubUrl (gitUrlUtils.ts).
      */
     public parseGitHubUrl(url: string): { owner: string; repo: string } | null {
-        // Match SSH or HTTPS GitHub URLs
-        const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-        if (match) {
-            return { owner: match[1], repo: match[2] };
-        }
-        return null;
+        return parseGitHubUrl(url);
     }
 
     /**
@@ -187,6 +199,10 @@ export class GitManager {
             if (!currentBranch) {
                 return "Error: Could not determine current branch.";
             }
+            const base = baseBranch || "main";
+            if (currentBranch === base) {
+                return `Error: Current branch ("${currentBranch}") is the same as the base branch ("${base}"). Create and switch to a feature branch first (create_git_branch), then commit there before opening a PR.`;
+            }
 
             // Push current branch first
             const pushResult = await this.push();
@@ -202,7 +218,7 @@ export class GitManager {
                     title,
                     body,
                     head: currentBranch,
-                    base: baseBranch || "main",
+                    base,
                 },
                 {
                     headers: {

@@ -778,6 +778,21 @@
     promptOverlay.scrollTop = promptInput.scrollTop;
   }
 
+  // Phase 3.7: debounce @/-mention suggestion requests instead of firing
+  // one per keystroke — the backend now caches the file listing, but a
+  // request still crosses the extension-host boundary and re-filters, so
+  // there's no reason to fire one on every single character while typing
+  // fast. Local UI feedback (resize, overlay sync, hiding the list) stays
+  // synchronous; only the request to the backend is delayed.
+  let suggestionsDebounceTimer = null;
+  const SUGGESTIONS_DEBOUNCE_MS = 150;
+  function requestSuggestionsDebounced(type, query) {
+    clearTimeout(suggestionsDebounceTimer);
+    suggestionsDebounceTimer = setTimeout(() => {
+      vscode.postMessage({ type: 'getSuggestions', value: { type, query } });
+    }, SUGGESTIONS_DEBOUNCE_MS);
+  }
+
   // Handle Input Auto-resize and Suggestions
   promptInput.addEventListener('input', function () {
     this.style.height = 'auto';
@@ -798,11 +813,12 @@
 
     if (lastAt !== -1 && !val.slice(lastAt, pos).includes(' ') && lastAt >= lastSlash) {
       const query = val.slice(lastAt + 1, pos);
-      vscode.postMessage({ type: 'getSuggestions', value: { type: '@', query } });
+      requestSuggestionsDebounced('@', query);
     } else if (lastSlash !== -1 && !val.slice(lastSlash, pos).includes(' ') && lastSlash > lastAt) {
       const query = val.slice(lastSlash + 1, pos);
-      vscode.postMessage({ type: 'getSuggestions', value: { type: '/', query } });
+      requestSuggestionsDebounced('/', query);
     } else {
+      clearTimeout(suggestionsDebounceTimer);
       suggestionList.classList.add('hidden');
     }
   });

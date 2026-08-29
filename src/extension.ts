@@ -22,6 +22,7 @@ import { diffLines, groupIntoHunks, applyAcceptedHunks } from "./lineDiff";
 import { buildPlanFromTasks, validatePlanIndex } from "./planUtils";
 import { estimateTokens, truncateToTokenBudget } from "./tokenEstimate";
 import { findAutoTriggeredSkills } from "./skillAutoTrigger";
+import { filterCachedFiles, isCacheFresh, MentionCacheState } from "./mentionCache";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -34,6 +35,9 @@ function formatOutput(stdout: string, stderr: string): string {
   }
   return parts.filter(Boolean).join("\n\n").trim();
 }
+
+/** Phase 3.7: how long the @-mention file listing cache is trusted before a re-scan, if no invalidating file-system event fired first. */
+const MENTION_CACHE_TTL_MS = 30000;
 
 class SingleContentProvider implements vscode.TextDocumentContentProvider {
   private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
@@ -581,7 +585,7 @@ const TOOLS = [
   },
   {
     name: "commit_git_changes",
-    description: "Commits staged changes to the git repository.",
+    description: "Commits staged changes to the git repository. If the user's request implies opening a PR (or after committing to a feature branch), consider offering create_pull_request as the next step rather than stopping at the local commit.",
     parameters: {
       type: "object",
       properties: {
@@ -592,7 +596,7 @@ const TOOLS = [
   },
   {
     name: "create_pull_request",
-    description: "Create a GitHub pull request for the current branch.",
+    description: "Push the current branch (setting upstream if needed) and create a GitHub pull request for it against a base branch. Requires GitHub authentication (VS Code will prompt to sign in if needed) and a GitHub remote. Fails clearly if the current branch is the same as the base branch — create a feature branch first.",
     parameters: {
       type: "object",
       properties: {
@@ -734,6 +738,18 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Phase 3.7: invalidate the @-mention file cache on any workspace file
+  // create/delete/rename, so it can't serve a stale listing for longer
+  // than MENTION_CACHE_TTL_MS would already bound it to. A broad watcher
+  // pattern is fine here — invalidation is just clearing one in-memory
+  // field, not a rescan; the rescan itself only happens lazily on the
+  // next @-mention request.
+  const mentionWatcher = vscode.workspace.createFileSystemWatcher("**/*");
+  context.subscriptions.push(mentionWatcher);
+  context.subscriptions.push(mentionWatcher.onDidCreate(() => provider.invalidateMentionCache()));
+  context.subscriptions.push(mentionWatcher.onDidDelete(() => provider.invalidateMentionCache()));
+  context.subscriptions.push(vscode.workspace.onDidRenameFiles(() => provider.invalidateMentionCache()));
+
   // ── Inline Completion Provider ──
   const inlineProvider = new CodePartnerInlineCompletionProvider(output);
   context.subscriptions.push(
@@ -826,6 +842,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private approvedCommandPrefixes: Set<string> = new Set();
   private sessionAutoApprove: { fileWrite: boolean; gitWrite: boolean } = { fileWrite: false, gitWrite: false };
   private untrustedContent = new UntrustedContentTracker();
+  /**
+   * Phase 3.7: cached workspace file listing for @-mention suggestions,
+   * replacing a fresh vscode.workspace.findFiles glob scan on every
+   * keystroke. Invalidated by the file-watcher registered in activate()
+   * and by a TTL as a fallback (see MENTION_CACHE_TTL_MS / getCachedWorkspaceFiles).
+   */
+  private mentionFileCache: MentionCacheState | null = null;
   /**
    * Per-turn git checkpoint fallback (Phase 2.4): turnId -> stash-create
    * SHA ("" means the tree was clean at checkpoint time, i.e. == HEAD).
@@ -1409,16 +1432,15 @@ Provide a concise, high-quality result.`;
         suggestions.push({ label: "@web", detail: "Search the web", type: "special" });
         suggestions.push({ label: "@workspace", detail: "Entire workspace context", type: "special" });
 
-        // Find files
-        const files = await vscode.workspace.findFiles(
-          `**/*${q}*`,
-          "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}",
-          20
-        );
+        // Phase 3.7: filter the cached workspace listing in memory
+        // instead of re-running vscode.workspace.findFiles on every
+        // keystroke.
+        const cachedFiles = await this.getCachedWorkspaceFiles(root);
+        const matched = filterCachedFiles(cachedFiles, q, 20);
 
-        for (const f of files) {
+        for (const f of matched) {
           suggestions.push({
-            label: "@" + vscode.workspace.asRelativePath(f),
+            label: "@" + f.relPath,
             detail: f.fsPath,
             type: "file"
           });
@@ -1438,24 +1460,37 @@ Provide a concise, high-quality result.`;
           }
         }
       }
-      // Find folders (manual list shared root)
-      const dirs = fs.readdirSync(root, { withFileTypes: true })
-        .filter(d => d.isDirectory() && !d.name.startsWith(".") && d.name !== "node_modules");
-
-      for (const d of dirs) {
-        if (d.name.toLowerCase().includes(q)) {
-          suggestions.push({
-            label: "@" + d.name + "/",
-            detail: "Folder",
-            type: "folder"
-          });
-        }
-      }
 
       this._view?.webview.postMessage({ type: "suggestions", value: suggestions });
     } catch {
       // ignore
     }
+  }
+
+  /**
+   * Returns the workspace file listing used for @-mention suggestions,
+   * from cache when fresh (Phase 3.7). A fresh full scan only happens
+   * when the cache is empty, stale past MENTION_CACHE_TTL_MS, or was
+   * explicitly invalidated by the file-system watcher registered in
+   * activate().
+   */
+  private async getCachedWorkspaceFiles(root: string): Promise<{ relPath: string; fsPath: string }[]> {
+    if (isCacheFresh(this.mentionFileCache, MENTION_CACHE_TTL_MS)) {
+      return this.mentionFileCache!.files;
+    }
+    const uris = await vscode.workspace.findFiles(
+      "**/*",
+      "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}",
+      5000
+    );
+    const files = uris.map((f) => ({ relPath: vscode.workspace.asRelativePath(f), fsPath: f.fsPath }));
+    this.mentionFileCache = { files, fetchedAt: Date.now() };
+    return files;
+  }
+
+  /** Drops the cached @-mention file listing so the next request re-scans. Call on any file create/delete/rename. */
+  public invalidateMentionCache(): void {
+    this.mentionFileCache = null;
   }
 
   public refreshModels() {
