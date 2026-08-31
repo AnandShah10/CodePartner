@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.0.9-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.0.11-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -153,7 +153,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.0.9** with secure SecretStorage for API keys, virtual diff providers, cross-platform browser automation, full `AgentManager`/`SkillManager`/`ArtifactRegistry`, proactive skill detection, and complete Marketplace packaging. See [CHANGELOG.md](CHANGELOG.md) for the granular, implementation-derived history across all versions.
+**Note**: Now at **v2.0.11** with rich approval policy descriptions, shared `contextTokenBudget`, full Azure config, secure SecretStorage migration, detailed MCP schema, and complete alignment across package.json/README/CHANGELOG. See [CHANGELOG.md](CHANGELOG.md) for the granular, implementation-derived history (including `needsApprovalForPolicy`, `truncateToTokenBudget`, `formatOutput`, and `AgentManager`).
 
 ---
 

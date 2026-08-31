@@ -4,6 +4,45 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.0.11] - 2024-10-28
+### Added
+- Rich `enumDescriptions` and validation for `approvalPolicy` (`always-ask` / `ask-for-shell` / `full-auto` / `yolo` with explicit prompt-injection safeguards)
+- `contextTokenBudget` (shared 6000-token default across active editor + all open tabs, with line-boundary truncation via `truncateToTokenBudget`)
+- Comprehensive Azure configuration (`azureApiVersion`, `azureDeployments` array)
+- Prominent `codepartner.setApiKey` command with automatic migration from deprecated `apiKey` setting (using `API_KEY_SECRET_KEY` + SecretStorage)
+- Full schema for `mcpServers` (command/args/env/cwd per server)
+- Inline completion constraints (`inlineCompletionDebounce` with 200–3000ms bounds)
+- Updated runtime (`puppeteer-core ^25.8.0`) and dev tooling (TypeScript 5.9.3, esbuild, ESLint 9)
+
+### Changed
+- `CodePartnerSidebarProvider` and `AgentManager` now respect detailed approval policies before any gated tool (`GATED_TOOLS`, `needsApprovalForPolicy`)
+- Marketplace metadata, configuration table in README, and deprecation messaging fully aligned
+- Build pipeline (`package` script, `vscode:prepublish`) hardened with stricter linting and type checking
+
+### Fixed
+- Version drift (package.json now at **2.0.11**)
+- Edge cases in SecretStorage migration, browser Chrome path resolution, and MCP server spawning
+- Output formatting for combined stdout/stderr in terminal tools (`formatOutput`)
+
+## [2.0.10] - 2024-10-27
+### Added
+- Expanded `contributes.configuration` schema in `package.json` (provider enum + descriptions, full `approvalPolicy` options with `enumDescriptions`, `contextTokenBudget`, `mcpServers` object schema with command/args/env/cwd, Azure settings, inline completion options, deprecation notice for `apiKey`)
+- Comprehensive configuration table and feature matrix in README.md
+- `setApiKey` command registration and SecretStorage migration logic (`API_KEY_SECRET_KEY`)
+- Validation helpers for approval policies and token budgets
+- Updated Marketplace metadata (categories, activationEvents, icon, badges)
+
+### Changed
+- `CodePartnerSidebarProvider` and configuration resolver now surface rich descriptions and validation messages
+- README Quick Start updated to prioritize `codepartner.setApiKey` over direct setting edits
+- `.vscodeignore` refined to exclude `src/`, tests, and dev docs (smaller VSIX)
+- Build scripts and TypeScript config aligned for stricter checks
+
+### Fixed
+- Configuration drift between `package.json`, README table, and runtime defaults
+- Minor issues in MCP server schema parsing and browser path resolution
+- Version references and links across documentation
+
 ## [2.0.9] - 2024-10-25
 ### Added
 - Secure API key handling with VS Code SecretStorage (`API_KEY_SECRET_KEY`, automatic migration from settings)
