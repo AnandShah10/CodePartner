@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.0.11-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.0.12-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -153,7 +153,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.0.11** with rich approval policy descriptions, shared `contextTokenBudget`, full Azure config, secure SecretStorage migration, detailed MCP schema, and complete alignment across package.json/README/CHANGELOG. See [CHANGELOG.md](CHANGELOG.md) for the granular, implementation-derived history (including `needsApprovalForPolicy`, `truncateToTokenBudget`, `formatOutput`, and `AgentManager`).
+**Note**: Now at **v2.0.12** — final Marketplace configuration (complete JSON schema with `enumDescriptions`, `deprecationMessage`, `mcpServers` `additionalProperties`, bounds validation, Azure category). Stricter build pipeline, full command registration, and perfect doc alignment. See [CHANGELOG.md](CHANGELOG.md) for the complete granular history mapping to `extension.ts`, `CodePartnerSidebarProvider`, approval flows, and token budgeting.
 
 ---
 

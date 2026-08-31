@@ -25,6 +25,7 @@ import { findAutoTriggeredSkills } from "./skillAutoTrigger";
 import { filterCachedFiles, isCacheFresh, MentionCacheState } from "./mentionCache";
 import { isToolResultSuccess } from "./toolResultStatus";
 import { extractUsageFromStreamEvent, formatTokenCount } from "./usageExtraction";
+import { getModelMetadata, formatContextWindow } from "./modelMetadata";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -980,6 +981,21 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Phase 4.4: shows a one-time explanatory tip the first time a user
+   * switches into a given mode, using globalState (not per-workspace) so
+   * it doesn't re-appear in every new project once seen.
+   */
+  private showFirstRunTipIfNeeded(mode: "architect" | "planning", tip: string): void {
+    const key = `cp-seen-tip-${mode}`;
+    if (this.context.globalState.get<boolean>(key)) {
+      return;
+    }
+    this.context.globalState.update(key, true);
+    const label = mode === "architect" ? "Architect Mode" : "Planning Mode";
+    vscode.window.showInformationMessage(`CodePartner — ${label} ${tip}`);
+  }
+
+  /**
    * Phase 4.1: refreshes the status bar with this session's real
    * cumulative token usage (from actual API usage data — see the doc
    * comment on usageExtraction.ts for why this shows token counts rather
@@ -1203,8 +1219,10 @@ Provide a concise, high-quality result.`;
           let promptToUse = FAST_SYSTEM_PROMPT;
           if (this.executionMode === "planning") {
             promptToUse = PLANNING_SYSTEM_PROMPT;
+            this.showFirstRunTipIfNeeded("planning", "requires an approved plan (via create_plan) before it will edit or create files — it drafts the plan first and waits for your OK.");
           } else if (this.executionMode === "architect") {
             promptToUse = ARCHITECT_SYSTEM_PROMPT;
+            this.showFirstRunTipIfNeeded("architect", "drafts file edits instead of applying them immediately — review the hunks and choose \"Apply Selected Hunks\" or \"Apply All Drafts\" when ready.");
           }
           this.messageHistory[0] = { role: "system", content: promptToUse };
           this.output.appendLine(`[CodePartner] Mode changed to: ${this.executionMode}`);
@@ -1669,9 +1687,16 @@ Provide a concise, high-quality result.`;
   }
 
   private sendModelsToWebview(selectedId: string) {
+    // Phase 4.5: attach context-window metadata per model, where known,
+    // without mutating this.availableModels itself (keeps the stored
+    // list simple and provider-shaped).
+    const modelsWithMetadata = this.availableModels.map((m) => {
+      const meta = getModelMetadata(m.id);
+      return meta ? { ...m, contextWindow: meta.contextWindow, contextWindowLabel: formatContextWindow(meta.contextWindow) } : m;
+    });
     this._view?.webview.postMessage({
       type: "models",
-      value: this.availableModels,
+      value: modelsWithMetadata,
       selected: selectedId
     });
   }

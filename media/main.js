@@ -1,6 +1,67 @@
 (function () {
   const vscode = acquireVsCodeApi();
 
+  // Phase 4.6: VS Code doesn't natively provide "-rgb" custom properties
+  // usable inside rgba(var(--x-rgb), alpha) — it only exposes theme
+  // colors as full CSS color values (e.g. "#1e1e1e"). This stylesheet
+  // references e.g. --vscode-editor-background-rgb throughout expecting
+  // a bare "r,g,b" triplet, but nothing ever defined it, so every one of
+  // those rgba() calls was silently using its hardcoded dark-theme
+  // fallback color regardless of the user's actual theme — including on
+  // a light theme. This computes real RGB triplets from the live theme
+  // and injects them as CSS custom properties so the fallbacks are only
+  // ever a genuine last resort.
+  const THEME_RGB_BASE_VARS = [
+    '--vscode-button-background',
+    '--vscode-charts-green',
+    '--vscode-charts-purple',
+    '--vscode-charts-red',
+    '--vscode-editor-background',
+    '--vscode-editorGroupHeader-tabsBackground',
+    '--vscode-input-background',
+    '--vscode-panel-border',
+    '--vscode-sideBar-background',
+    '--vscode-textLink-foreground',
+  ];
+
+  function parseColorToRgb(colorStr) {
+    if (!colorStr) return null;
+    colorStr = colorStr.trim();
+    let m = colorStr.match(/^#([0-9a-fA-F]{3})$/);
+    if (m) {
+      return m[1].split('').map(c => parseInt(c + c, 16));
+    }
+    m = colorStr.match(/^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/);
+    if (m) {
+      const hex = m[1];
+      return [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)];
+    }
+    m = colorStr.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+    if (m) {
+      return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+    }
+    return null;
+  }
+
+  function updateThemeRgbVariables() {
+    const computed = getComputedStyle(document.documentElement);
+    const rootStyle = document.documentElement.style;
+    THEME_RGB_BASE_VARS.forEach(baseVar => {
+      const raw = computed.getPropertyValue(baseVar);
+      const rgb = parseColorToRgb(raw);
+      if (rgb) {
+        rootStyle.setProperty(baseVar + '-rgb', rgb.join(','));
+      }
+    });
+  }
+
+  updateThemeRgbVariables();
+  // VS Code toggles a vscode-light/vscode-dark/vscode-high-contrast class
+  // on <body> when the user switches themes live — recompute when that happens.
+  if (document.body) {
+    new MutationObserver(updateThemeRgbVariables).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+  }
+
   const md = window.markdownit ? window.markdownit({ html: false, linkify: true, typographer: true }) : { render: (s) => `<p>${s.replace(/\n/g, '</p><p>')}</p>` };
   const chatHistory = document.getElementById('chat-history');
   const promptInput = document.getElementById('prompt-input');
@@ -433,7 +494,12 @@
     models.forEach(m => {
       const opt = document.createElement('option');
       opt.value = m.id;
-      opt.innerText = m.name || m.id;
+      // Phase 4.5: show context window size next to the name, where known,
+      // instead of just a bare model name.
+      opt.innerText = (m.name || m.id) + (m.contextWindowLabel ? ' (' + m.contextWindowLabel + ')' : '');
+      if (m.contextWindow) {
+        opt.title = 'Context window: ' + m.contextWindow.toLocaleString() + ' tokens';
+      }
       if (m.id === selected) {
         opt.selected = true;
       }

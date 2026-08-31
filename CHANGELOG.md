@@ -4,6 +4,23 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.0.12] - 2024-10-29
+### Added
+- Final Marketplace configuration polish: complete `enumDescriptions` for all providers/approval policies, full JSON schema for `mcpServers` (including `additionalProperties`, nested `command`/`args`/`env`/`cwd` with `required` fields), explicit `deprecationMessage` on `apiKey`, `minimum`/`maximum` bounds on `inlineCompletionDebounce`, expanded `categories` (now includes "Azure")
+- Rich inline documentation for `contextTokenBudget` (shared token truncation across active file + open tabs) and Azure-specific settings
+- Additional commands (`setApiKey`, explain/fix/test) and keybindings fully registered in `contributes`
+- Stricter build pipeline (`vscode:prepublish`, `package` script now runs `check-types` + `lint` before esbuild)
+
+### Changed
+- `package.json` version, metadata, engines, activationEvents, views, and configuration properties now 100% aligned with implementation (`extension.ts`, `aiProviderAdapter.ts`, `CodePartnerSidebarProvider`, approval flows)
+- Updated devDependencies (TypeScript 5.9.3, ESLint 9 + typescript-eslint ^8, latest @types/* and test runners)
+- README configuration table, feature matrix, and Quick Start refreshed to match the new schema and deprecation guidance exactly
+
+### Fixed
+- Version drift (package.json now at **2.0.12**)
+- Minor schema validation issues in MCP server definitions and approval policy descriptions
+- Consistency between runtime defaults, settings UI, and documentation
+
 ## [2.0.11] - 2024-10-28
 ### Added
 - Rich `enumDescriptions` and validation for `approvalPolicy` (`always-ask` / `ask-for-shell` / `full-auto` / `yolo` with explicit prompt-injection safeguards)
