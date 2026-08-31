@@ -168,7 +168,14 @@ export function buildProviderRequest(opts: ProviderRequestOptions): ProviderRequ
   const openaiMessages = buildOpenAIMessages(messages, useSystemRole);
   const body: Record<string, unknown> = { messages: openaiMessages, max_tokens: maxTokens };
   if (temperature !== undefined) body.temperature = temperature;
-  if (stream) body.stream = true;
+  if (stream) {
+    body.stream = true;
+    // Ask for a final usage-summary chunk (Phase 4.1's status bar token
+    // counter needs this). Widely supported across OpenAI-compatible
+    // APIs; a server that doesn't recognize the field would typically
+    // just ignore it, per normal REST API tolerance for unknown fields.
+    body.stream_options = { include_usage: true };
+  }
   if (tools && tools.length > 0) {
     body.tools = toOpenAITools(tools);
     body.tool_choice = "auto";

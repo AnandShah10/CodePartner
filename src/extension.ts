@@ -23,6 +23,8 @@ import { buildPlanFromTasks, validatePlanIndex } from "./planUtils";
 import { estimateTokens, truncateToTokenBudget } from "./tokenEstimate";
 import { findAutoTriggeredSkills } from "./skillAutoTrigger";
 import { filterCachedFiles, isCacheFresh, MentionCacheState } from "./mentionCache";
+import { isToolResultSuccess } from "./toolResultStatus";
+import { extractUsageFromStreamEvent, formatTokenCount } from "./usageExtraction";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -715,6 +717,12 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(autonomyStatusBarItem);
   confirmYoloModeIfNeeded(context, output).then(() => updateAutonomyStatusBar(autonomyStatusBarItem));
 
+  // Phase 4.1: session token-usage counter. Hidden until the first real
+  // usage data arrives (see updateTokenStatusBar in the provider class).
+  const tokenStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1);
+  tokenStatusBarItem.name = "CodePartner Token Usage";
+  context.subscriptions.push(tokenStatusBarItem);
+
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(
       CodePartnerDiffProvider.scheme,
@@ -722,7 +730,7 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  const provider = new CodePartnerSidebarProvider(context, output);
+  const provider = new CodePartnerSidebarProvider(context, output, tokenStatusBarItem);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("codepartner-sidebar", provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -874,10 +882,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private semanticSearch: SemanticSearch;
   private mcpManager: MCPManager;
   private customInstructions: string = "";
+  /** Phase 4.1: cumulative real token usage for this session (from actual API usage data, not an estimate). */
+  private sessionTokenUsage = { input: 0, output: 0 };
 
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly output: vscode.OutputChannel
+    private readonly output: vscode.OutputChannel,
+    private readonly tokenStatusBarItem?: vscode.StatusBarItem
   ) {
     this.currentChatId = Date.now().toString();
     this.messageHistory = [{ role: "system", content: FAST_SYSTEM_PROMPT }];
@@ -903,6 +914,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
     // Build semantic search index in the background
     this.semanticSearch.buildIndex().catch(() => {});
+
+    // Phase 4.3: restore the last selected model per workspace, so it
+    // survives a VS Code restart instead of silently falling back to
+    // codepartner.model every time.
+    this.selectedModelId = this.context.workspaceState.get<string>("cp-selected-model-id") || undefined;
 
     // Try to restore last chat
     const lastChatId = this.context.workspaceState.get<string>("cp-last-chat-id");
@@ -961,6 +977,24 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
   public updateStatus(msg: string) {
     this._view?.webview.postMessage({ type: "status", value: msg });
+  }
+
+  /**
+   * Phase 4.1: refreshes the status bar with this session's real
+   * cumulative token usage (from actual API usage data — see the doc
+   * comment on usageExtraction.ts for why this shows token counts rather
+   * than a dollar-cost estimate).
+   */
+  private updateTokenStatusBar(): void {
+    if (!this.tokenStatusBarItem) return;
+    const total = this.sessionTokenUsage.input + this.sessionTokenUsage.output;
+    if (total === 0) {
+      this.tokenStatusBarItem.hide();
+      return;
+    }
+    this.tokenStatusBarItem.text = `$(symbol-numeric) ${formatTokenCount(total)}`;
+    this.tokenStatusBarItem.tooltip = `CodePartner session usage: ${this.sessionTokenUsage.input.toLocaleString()} input, ${this.sessionTokenUsage.output.toLocaleString()} output tokens (from provider-reported usage, this session only).`;
+    this.tokenStatusBarItem.show();
   }
 
   /**
@@ -1161,6 +1195,7 @@ Provide a concise, high-quality result.`;
           break;
         case "changeModel":
           this.selectedModelId = data.value;
+          this.context.workspaceState.update("cp-selected-model-id", this.selectedModelId);
           this.output.appendLine(`[CodePartner] Model changed to: ${this.selectedModelId}`);
           break;
         case "changeMode":
@@ -1332,6 +1367,10 @@ Provide a concise, high-quality result.`;
       this.currentArtifacts = chat.artifacts || [];
       this.timelineEvents = chat.timeline || [];
       this.turnGitCheckpoints = new Map(chat.gitCheckpoints || []);
+      // Phase 4.1: token usage counter tracks the active chat, not a
+      // running total across whichever chats were opened this session.
+      this.sessionTokenUsage = { input: 0, output: 0 };
+      this.updateTokenStatusBar();
 
       // Add hiddenFromUI flag to context-heavy messages for UI reloading
       const uiHistory = this.messageHistory.map((m, idx) => ({
@@ -1379,6 +1418,10 @@ Provide a concise, high-quality result.`;
     }
 
     this.currentChatId = Date.now().toString();
+    // Phase 4.1: token usage counter tracks the current chat, not the
+    // whole VS Code session — a fresh chat is a fresh task, so a fresh count.
+    this.sessionTokenUsage = { input: 0, output: 0 };
+    this.updateTokenStatusBar();
     let sysPrompt = FAST_SYSTEM_PROMPT;
     if (this.executionMode === "planning") {
       sysPrompt = PLANNING_SYSTEM_PROMPT;
@@ -1502,7 +1545,7 @@ Provide a concise, high-quality result.`;
     const provider = config.get<string>("provider") || "openai";
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
     const apiKey = await this.getApiKey();
-    let currentModel = this.selectedModelId || config.get<string>("model") || "";
+    let currentModel = (this.selectedModelId || config.get<string>("model") || "").trim();
 
     if (provider === "azure") {
       const deployments = config.get<string[]>("azureDeployments") || [];
@@ -2312,6 +2355,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       let fullResponse = "";
       let fullReasoning = "";
       let toolCalls: any[] = [];
+      let turnInputTokens: number | undefined;
+      let turnOutputTokens: number | undefined;
       this.modifiedFiles.clear();
 
       // Tool definitions in the flat shape buildProviderRequest expects.
@@ -2344,7 +2389,15 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
             }
             try {
               const parsed = JSON.parse(event.data);
-              
+
+              // Phase 4.1: real token usage for the status bar counter —
+              // additive, doesn't affect existing content/tool_call parsing.
+              const usage = extractUsageFromStreamEvent(providerType, parsed);
+              if (usage) {
+                if (usage.inputTokens !== undefined) turnInputTokens = usage.inputTokens;
+                if (usage.outputTokens !== undefined) turnOutputTokens = usage.outputTokens;
+              }
+
               // Anthropic format
               if (parsed.type === "content_block_delta" && parsed.delta?.text) {
                 fullResponse += parsed.delta.text;
@@ -2404,6 +2457,12 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
           response.data.on("error", reject);
         });
 
+        // Phase 4.1: accumulate real token usage into the session total
+        // and refresh the status bar.
+        if (turnInputTokens !== undefined) this.sessionTokenUsage.input += turnInputTokens;
+        if (turnOutputTokens !== undefined) this.sessionTokenUsage.output += turnOutputTokens;
+        this.updateTokenStatusBar();
+
         let shouldBreakLoop = false;
 
         if (toolCalls.length > 0) {
@@ -2449,7 +2508,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
                 tool: tc.function.name,
                 argsSummary,
                 resultPreview: (typeof result === "string" ? result : JSON.stringify(result)).substring(0, 120),
-                success: !(typeof result === "string" && result.startsWith("Error")),
+                success: isToolResultSuccess(result),
                 timestamp: toolStartTime,
                 duration: Date.now() - toolStartTime,
                 revertContent,

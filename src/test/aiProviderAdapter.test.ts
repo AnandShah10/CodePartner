@@ -60,6 +60,24 @@ suite("buildProviderRequest — handlePrompt-style (streaming, with tools)", () 
     assert.strictEqual(req.url, "http://localhost:11434/v1/chat/completions");
     assert.strictEqual("Authorization" in req.headers, false);
   });
+
+  test("OpenAI-family streaming requests include stream_options.include_usage (Phase 4.1 token counter)", () => {
+    const req = buildProviderRequest({
+      providerType: "openai", apiEndpoint: "", apiKey: "sk", modelId: "gpt-4o",
+      azureApiVersion: "", messages: toolCallMessages, useSystemRole: true,
+      maxTokens: 4096, stream: true,
+    });
+    assert.deepStrictEqual(req.body.stream_options, { include_usage: true });
+  });
+
+  test("non-streaming requests do not include stream_options", () => {
+    const req = buildProviderRequest({
+      providerType: "openai", apiEndpoint: "", apiKey: "sk", modelId: "gpt-4o",
+      azureApiVersion: "", messages: toolCallMessages, useSystemRole: true,
+      maxTokens: 4096, stream: false,
+    });
+    assert.strictEqual("stream_options" in req.body, false);
+  });
 });
 
 suite("buildProviderRequest — compactContext-style (non-streaming, single user message)", () => {
