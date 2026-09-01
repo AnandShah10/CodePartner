@@ -28,6 +28,7 @@ export const GATED_TOOLS: Record<string, GatedCategory> = {
   commit_git_changes: "git-write",
   create_git_branch: "git-write",
   create_pull_request: "git-write",
+  run_parallel_agents: "git-write",
 };
 
 /**
@@ -64,6 +65,10 @@ export function describeToolCall(name: string, args: any): string {
       return `Create git branch: ${args?.name ?? "(unnamed)"}`;
     case "create_pull_request":
       return `Create pull request: "${args?.title ?? ""}"`;
+    case "run_parallel_agents": {
+      const count = Array.isArray(args?.tasks) ? args.tasks.length : 0;
+      return `Run ${count} agent(s) in parallel, each in its own isolated git branch/worktree (won't touch your current working tree)`;
+    }
     default:
       return `Run tool: ${name}`;
   }

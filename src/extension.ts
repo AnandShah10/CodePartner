@@ -26,6 +26,7 @@ import { filterCachedFiles, isCacheFresh, MentionCacheState } from "./mentionCac
 import { isToolResultSuccess } from "./toolResultStatus";
 import { extractUsageFromStreamEvent, formatTokenCount } from "./usageExtraction";
 import { getModelMetadata, formatContextWindow } from "./modelMetadata";
+import { createWorktree, removeWorktree, getBranchDiffStat, commitAllIfDirty, toBranchSafeSegment } from "./gitWorktree";
 
 /** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
 const API_KEY_SECRET_KEY = "codepartner.apiKey";
@@ -420,7 +421,7 @@ const TOOLS = [
   },
   {
     name: "call_subagent",
-    description: "Dispatch a specialized SubAgent to independently work a sub-task using its own tools and message history, scoped to its type: researcher (web search, docs, read-only file/code search), code_expert (read, edit, create files, run commands), tester (run tests/commands, read files), writer (create files, read files, web search). Request multiple call_subagent calls in one turn to run them concurrently.",
+    description: "Dispatch a specialized SubAgent to independently work a sub-task using its own tools and message history, scoped to its type: researcher (web search, docs, read-only file/code search), code_expert (read, edit, create files, run commands), tester (run tests/commands, read files), writer (create files, read files, web search). Request multiple call_subagent calls in one turn to run them concurrently. These agents SHARE the real workspace — for concurrent agents editing the same files, use run_parallel_agents instead.",
     parameters: {
       type: "object",
       properties: {
@@ -429,6 +430,31 @@ const TOOLS = [
         personality: { type: "string", description: "Optional persona trait (e.g. 'Strict Reviewer', 'Creative Prototyper') to modify behavior." },
       },
       required: ["agent_type", "task"],
+    },
+  },
+  {
+    name: "run_parallel_agents",
+    description: "Runs 2-8 sub-agents concurrently, each FULLY ISOLATED in its own git branch and checked-out worktree — unlike call_subagent, these can safely edit the same files without conflicting with each other or the user's real working tree, since each operates on its own copy of the repo. Use this for trying several independent approaches to the same problem side by side (e.g. different implementations, different fixes) so the user can compare and pick one. Requires the workspace to be a git repository. Nothing is merged or applied automatically — each agent's branch is left in place with a diff summary for the user to review and merge manually.",
+    parameters: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          minItems: 2,
+          maxItems: 8,
+          items: {
+            type: "object",
+            properties: {
+              agent_type: { type: "string", enum: ["researcher", "code_expert", "tester", "writer"] },
+              task: { type: "string", description: "Specific instruction for this agent — should be independent of the other agents' tasks." },
+              personality: { type: "string" },
+            },
+            required: ["agent_type", "task"],
+          },
+          description: "2-8 independent tasks to run in parallel, each in its own isolated branch.",
+        },
+      },
+      required: ["tasks"],
     },
   },
   {
@@ -1051,8 +1077,12 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
    * one turn, executeTool's existing Promise.all over that turn's tool
    * calls already runs them concurrently — this method didn't need its
    * own concurrency mechanism, just to stop being a single blocking call.
+   *
+   * `workingRoot` (Phase 5.5): when set, this agent's file/shell tool
+   * calls are scoped to that directory (a git worktree) instead of the
+   * real workspace root — see runParallelAgents.
    */
-  public async runInternalAgent(agentType: string, task: string, personality?: string): Promise<string> {
+  public async runInternalAgent(agentType: string, task: string, personality?: string, workingRoot?: string): Promise<string> {
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
     const apiKey = await this.getApiKey();
@@ -1065,10 +1095,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const scopedToolNames = new Set(scopedTools.map((t) => t.name));
 
     const personalityText = personality ? `\nAdopt this personality trait: ${personality}` : "";
+    const isolationNote = workingRoot ? `\nYou are working in an isolated copy of the repo on your own git branch — nothing you do here affects the user's actual files until they choose to merge your branch.` : "";
     const toolsNote = scopedTools.length > 0
       ? `\nYou have access to these tools: ${scopedTools.map((t) => t.name).join(", ")}. Use them as needed, then give your final answer as plain text once done.`
       : `\nYou do not have tool access for this task — answer directly from reasoning.`;
-    const subPrompt = `You are a specialized SubAgent: ${agentType}.${personalityText}
+    const subPrompt = `You are a specialized SubAgent: ${agentType}.${personalityText}${isolationNote}
 Your task is: ${task}${toolsNote}
 Provide a concise, high-quality result.`;
 
@@ -1100,7 +1131,7 @@ Provide a concise, high-quality result.`;
         return (assistantMsg.content as string) || "(Sub-agent returned no content.)";
       }
 
-      this.updateStatus(`Agent ${agentType}: using ${toolCalls.map((tc) => tc.function.name).join(", ")}...`);
+      this.updateStatus(`Agent ${agentType}${workingRoot ? " (isolated)" : ""}: using ${toolCalls.map((tc) => tc.function.name).join(", ")}...`);
 
       for (const tc of toolCalls) {
         let toolResult: string;
@@ -1114,7 +1145,7 @@ Provide a concise, high-quality result.`;
           if (parsed === null) {
             toolResult = `Error: could not parse arguments for "${tc.function.name}". Retry with valid JSON.`;
           } else {
-            toolResult = await this.executeTool(tc.function.name, parsed.value);
+            toolResult = await this.executeTool(tc.function.name, parsed.value, workingRoot);
           }
         }
         subMessages.push({ role: "tool", content: typeof toolResult === "string" ? toolResult : JSON.stringify(toolResult), tool_call_id: tc.id, name: tc.function.name });
@@ -1122,6 +1153,121 @@ Provide a concise, high-quality result.`;
     }
 
     return `Sub-agent (${agentType}) reached its iteration limit (${MAX_SUBAGENT_ITERATIONS}) without a final answer. It may have made partial progress via tool calls above.`;
+  }
+
+  /**
+   * Phase 5.5: runs 2-8 sub-agents concurrently, each isolated in its own
+   * git worktree + branch, so they can safely edit the same files without
+   * conflicting with each other or the user's real working tree.
+   *
+   * Sequencing: worktrees are created SEQUENTIALLY (git worktree add
+   * briefly locks the repo's .git directory; doing this concurrently
+   * risked lock contention I couldn't fully rule out without a way to
+   * stress-test it against a real concurrent-access scenario). Once each
+   * worktree exists as an isolated directory, the actual agent runs (the
+   * expensive part — LLM calls and tool use) DO run concurrently via
+   * Promise.all, which is safe since each agent's filesystem is already
+   * fully separate by that point.
+   *
+   * Each agent's uncommitted work is auto-committed before its worktree
+   * is removed — verified against a real repo that this is genuinely
+   * lossless (the branch survives worktree removal with all changes
+   * intact) before relying on it. Worktrees are cleaned up after each
+   * run to avoid leaving scratch directories behind; the branches
+   * themselves are NOT deleted and nothing is merged automatically —
+   * reviewing and merging is left to the user.
+   *
+   * Known limitation: cancellation (the "cancel" button) only tracks one
+   * in-flight process at a time (this.runningChildProcess), so if
+   * multiple isolated agents are running shell commands concurrently,
+   * cancel may not stop all of them. Flagged rather than silently
+   * accepted — a full fix would need per-agent process tracking.
+   */
+  private async runParallelAgents(tasks: any): Promise<string> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return "Error: No workspace open.";
+    }
+    if (!isGitRepo(root)) {
+      return "Error: run_parallel_agents requires the workspace to be a git repository (each agent needs its own branch/worktree).";
+    }
+    if (!Array.isArray(tasks) || tasks.length < 2 || tasks.length > 8) {
+      return "Error: \"tasks\" must be an array of 2 to 8 {agent_type, task} entries.";
+    }
+
+    const runId = Date.now().toString().slice(-6);
+    const scratchDir = path.join(os.tmpdir(), "codepartner-worktrees");
+    if (!fs.existsSync(scratchDir)) {
+      fs.mkdirSync(scratchDir, { recursive: true });
+    }
+
+    interface AgentPlan { agentType: string; task: string; personality?: string; branchName: string; worktreePath: string; }
+    const plans: AgentPlan[] = tasks.map((t: any, i: number) => {
+      const agentType = String(t?.agent_type || "code_expert");
+      const task = String(t?.task || "");
+      const branchName = `codepartner/${agentType}-${toBranchSafeSegment(task)}-${runId}-${i}`;
+      const worktreePath = path.join(scratchDir, `${runId}-${i}`);
+      return { agentType, task, personality: t?.personality, branchName, worktreePath };
+    });
+
+    // Create worktrees sequentially — see method doc comment.
+    const created: AgentPlan[] = [];
+    const setupErrors: string[] = [];
+    for (const plan of plans) {
+      const result = createWorktree(root, plan.worktreePath, plan.branchName);
+      if (result.ok) {
+        created.push(plan);
+      } else {
+        setupErrors.push(`${plan.agentType} (${plan.branchName}): failed to create worktree — ${result.error}`);
+      }
+    }
+
+    if (created.length === 0) {
+      return `Error: could not create any worktrees.\n${setupErrors.join("\n")}`;
+    }
+
+    this._view?.webview.postMessage({ type: "status", value: `Running ${created.length} agents in parallel, isolated on separate branches...` });
+
+    let baseBranchResult = "";
+    try {
+      baseBranchResult = cp.execFileSync("git", ["branch", "--show-current"], { cwd: root, encoding: "utf8" }).trim();
+    } catch {
+      // Detached HEAD or another edge case — fall back to HEAD below rather than aborting the whole run.
+    }
+
+    const outcomes = await Promise.all(created.map(async (plan) => {
+      let finalAnswer: string;
+      try {
+        finalAnswer = await this.runInternalAgent(plan.agentType, plan.task, plan.personality, plan.worktreePath);
+      } catch (e: any) {
+        finalAnswer = `Error: ${e.message}`;
+      }
+
+      const commitResult = commitAllIfDirty(plan.worktreePath, `codepartner: ${plan.agentType} — ${plan.task.slice(0, 72)}`);
+      const diffResult = getBranchDiffStat(root, baseBranchResult || "HEAD", plan.branchName);
+      removeWorktree(root, plan.worktreePath, true);
+
+      return {
+        plan,
+        finalAnswer,
+        committed: commitResult.ok ? commitResult.committed : false,
+        diffSummary: diffResult.ok ? diffResult.summary : `(could not compute diff: ${diffResult.error})`,
+      };
+    }));
+
+    const sections = outcomes.map((o, i) =>
+      `### Agent ${i + 1}: ${o.plan.agentType} — branch \`${o.plan.branchName}\`\n` +
+      `Task: ${o.plan.task}\n\n` +
+      `${o.committed ? "Changes committed to this branch." : "No file changes were made."}\n\n` +
+      `Files changed:\n${o.diffSummary}\n\n` +
+      `Result: ${o.finalAnswer}`
+    );
+
+    const displayBaseBranch = baseBranchResult || "HEAD";
+    const header = `Ran ${created.length} agents in parallel, each isolated on its own branch (nothing was applied to your working tree or merged — review each branch and merge whichever you want, e.g. \`git diff ${displayBaseBranch}...codepartner/...\` or check one out).`;
+    const errorNote = setupErrors.length > 0 ? `\n\n${setupErrors.length} task(s) could not start:\n${setupErrors.join("\n")}` : "";
+
+    return `${header}${errorNote}\n\n${sections.join("\n\n---\n\n")}`;
   }
 
   public resolveWebviewView(
@@ -2704,7 +2850,15 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private async executeTool(name: string, args: any): Promise<any> {
+  /**
+   * `rootOverride` (Phase 5.5): when a tool call is being executed on
+   * behalf of an isolated parallel sub-agent (see runParallelAgents),
+   * this points at that agent's git worktree directory instead of the
+   * real workspace root, so its file/shell tools operate there. Omitted
+   * for the main agent and regular (non-isolated) sub-agents, which
+   * behave exactly as before.
+   */
+  private async executeTool(name: string, args: any, rootOverride?: string): Promise<any> {
     if (this.executionMode === "planning") {
       const hasPlan = this.currentPlan.length > 0 || this.currentArtifacts.some(a => a.title.toLowerCase().includes("plan"));
       if (!hasPlan && (name === "edit_file" || name === "create_file")) {
@@ -2720,7 +2874,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     if (gatedCategory) {
       const skipBecauseArchitectDraft = gatedCategory === "file-write" && this.executionMode === "architect";
       if (!skipBecauseArchitectDraft) {
-        const decision = await this.requestApprovalIfNeeded(name, gatedCategory, args);
+        const decision = await this.requestApprovalIfNeeded(name, gatedCategory, args, rootOverride);
         if (decision !== "allow") {
           return `Denied: the user did not approve this ${gatedCategory.replace("-", " ")} action (${name}). Explain what you intended to do and why, then ask how they'd like to proceed.`;
         }
@@ -2729,19 +2883,21 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
     switch (name) {
       case "run_command":
-        return this.runCommand(args.command);
+        return this.runCommand(args.command, rootOverride);
       case "list_dir":
-        return this.listDir(args.path);
+        return this.listDir(args.path, rootOverride);
       case "read_file":
-        return this.readFile(args.path);
+        return this.readFile(args.path, rootOverride);
       case "edit_file":
-        return this.editFile(args.path, args.search, args.replace);
+        return this.editFile(args.path, args.search, args.replace, rootOverride);
       case "create_file":
-        return this.createFile(args.path, args.content);
+        return this.createFile(args.path, args.content, rootOverride);
       case "web_search":
         return this.getWebSearchContext(`@web ${args.query}`);
       case "call_subagent":
         return this.agentManager.dispatch(args.agent_type, args.task, this, args.personality);
+      case "run_parallel_agents":
+        return this.runParallelAgents(args.tasks);
       case "create_artifact":
         if (this.artifactRegistry) {
           const art = this.artifactRegistry.create(args.title, args.content, args.type);
@@ -2777,9 +2933,9 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         this._view?.webview.postMessage({ type: "skills", value: skills });
         return `Found ${skills.length} skills. Sent to UI.`;
       case "grep_search":
-        return this.grepSearch(args.pattern, args.path, args.include);
+        return this.grepSearch(args.pattern, args.path, args.include, rootOverride);
       case "run_tests":
-        return this.runTests(args.command);
+        return this.runTests(args.command, rootOverride);
       case "index_docs":
         return this.indexDocs(args.url, args.title);
       case "query_knowledge":
@@ -2814,7 +2970,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
    * of policy and regardless of the session allow-list — see
    * promptInjectionGuard.ts for why.
    */
-  private async requestApprovalIfNeeded(name: string, category: GatedCategory, args: any): Promise<"allow" | "deny"> {
+  private async requestApprovalIfNeeded(name: string, category: GatedCategory, args: any, rootOverride?: string): Promise<"allow" | "deny"> {
     const config = vscode.workspace.getConfiguration("codepartner");
     const policy = (config.get<string>("approvalPolicy") as ApprovalPolicy) || "always-ask";
 
@@ -2842,12 +2998,17 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     const warningPrefix = flaggedByInjectionGuard
       ? "⚠️ This content closely matches text pulled from a web search, indexed docs, or an @-mentioned file. Confirming even though your autonomy setting would normally skip this — review carefully before allowing.\n\n"
       : "";
+    // Phase 5.5: make it unmistakable when this action is happening in an
+    // isolated worktree, not the user's real working tree.
+    const isolationNote = rootOverride
+      ? `📦 Isolated parallel agent run (${rootOverride}) — this does NOT touch your actual working tree.\n\n`
+      : "";
 
-    this.output.appendLine(`[CodePartner] Requesting approval for ${name}${flaggedByInjectionGuard ? " (flagged: possible prompt injection)" : ""}: ${description}`);
+    this.output.appendLine(`[CodePartner] Requesting approval for ${name}${flaggedByInjectionGuard ? " (flagged: possible prompt injection)" : ""}${rootOverride ? " (isolated worktree)" : ""}: ${description}`);
 
     const buttons = flaggedByInjectionGuard ? ["Allow", "Deny"] : ["Allow", "Always Allow This Session", "Deny"];
     const choice = await vscode.window.showWarningMessage(
-      `${warningPrefix}CodePartner wants to: ${description}`,
+      `${isolationNote}${warningPrefix}CodePartner wants to: ${description}`,
       { modal: true },
       ...buttons
     );
@@ -2876,8 +3037,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
    * (so a slow-but-fine command could return truncated output) and had no
    * way to actually stop a hung process, just stop waiting on it.
    */
-  private async runCommand(command: string): Promise<string> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private async runCommand(command: string, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return "No workspace open.";
     }
@@ -2928,8 +3089,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
   }
 
 
-  private listDir(relPath: string): string {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private listDir(relPath: string, rootOverride?: string): string {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return "No workspace open.";
     }
@@ -2949,8 +3110,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private readFile(relPath: string): string {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private readFile(relPath: string, rootOverride?: string): string {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return "No workspace open.";
     }
@@ -2967,8 +3128,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private async editFile(relPath: string, search: string, replace: string): Promise<string> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private async editFile(relPath: string, search: string, replace: string, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "Error: No workspace folder open."; }
     const fullPath = path.join(root, relPath);
     try {
@@ -2976,7 +3137,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         return `Error: File does not exist: ${relPath}. Use create_file for new files.`;
       }
 
-      const originalContent = this.executionMode === "architect" && this.architectDrafts.has(relPath)
+      const originalContent = this.executionMode === "architect" && !rootOverride && this.architectDrafts.has(relPath)
         ? this.architectDrafts.get(relPath)!
         : fs.readFileSync(fullPath, "utf8");
 
@@ -2996,7 +3157,9 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const { content: newContent, added, removed } = editResult;
       this.fileChangeStats.set(relPath, { added, removed });
 
-      if (this.executionMode === "architect") {
+      // See createFile()'s comment: Architect Mode drafting is a
+      // main-workspace concept, bypassed for isolated sub-agents.
+      if (this.executionMode === "architect" && !rootOverride) {
         this.architectDrafts.set(relPath, newContent);
         this.sendArchitectDrafts();
         return `[Architect Draft] File ${relPath} updated. +${added} -${removed} lines. Pending Apply.`;
@@ -3009,8 +3172,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private async createFile(relPath: string, content: string): Promise<string> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private async createFile(relPath: string, content: string, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "Error: No workspace folder open."; }
     const fullPath = path.join(root, relPath);
     try {
@@ -3023,7 +3186,11 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const lines = content.split(/\r?\n/).filter(l => l.trim() !== "").length;
       this.fileChangeStats.set(relPath, { added: lines, removed: 0 });
 
-      if (this.executionMode === "architect") {
+      // Architect Mode's "draft, don't apply" behavior is a main-workspace
+      // concept — an isolated parallel sub-agent (rootOverride set) writes
+      // directly into its own worktree instead; review happens at the
+      // branch/diff level (see runParallelAgents), not per-file drafts.
+      if (this.executionMode === "architect" && !rootOverride) {
         this.architectDrafts.set(relPath, content);
         this.sendArchitectDrafts();
         return `[Architect Draft] File ${relPath} created. ${lines} lines. Pending Apply.`;
@@ -3036,8 +3203,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private grepSearch(pattern: string, searchPath?: string, include?: string): string {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private grepSearch(pattern: string, searchPath?: string, include?: string, rootOverride?: string): string {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "No workspace open."; }
     const targetPath = searchPath ? path.join(root, searchPath) : root;
     try {
@@ -3066,8 +3233,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
    * entire extension host for up to 60s on every test run. Supports
    * cancellation via the "cancel" webview message (see runningChildProcess).
    */
-  private async runTests(customCommand?: string): Promise<string> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private async runTests(customCommand?: string, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "No workspace open."; }
     let command = customCommand;
     if (!command) {

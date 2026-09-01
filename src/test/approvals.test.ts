@@ -1,5 +1,17 @@
 import * as assert from "assert";
-import { needsApprovalForPolicy, commandPrefix, matchesApprovedPrefix } from "../approvals";
+import { needsApprovalForPolicy, commandPrefix, matchesApprovedPrefix, describeToolCall, GATED_TOOLS } from "../approvals";
+
+suite("Phase 5.5: run_parallel_agents gating", () => {
+  test("run_parallel_agents is gated as git-write", () => {
+    assert.strictEqual(GATED_TOOLS["run_parallel_agents"], "git-write");
+  });
+
+  test("describeToolCall mentions the agent count and isolation", () => {
+    const desc = describeToolCall("run_parallel_agents", { tasks: [{ agent_type: "code_expert", task: "a" }, { agent_type: "tester", task: "b" }] });
+    assert.ok(desc.includes("2"));
+    assert.ok(desc.toLowerCase().includes("isolated"));
+  });
+});
 
 suite("needsApprovalForPolicy", () => {
   test("always-ask gates every category", () => {

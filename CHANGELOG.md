@@ -4,6 +4,22 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.0.13] - 2024-11-05
+### Added
+- `GitWorktree` utilities (`createWorktree`, `removeWorktree`, `commitAllIfDirty`, `getBranchDiffStat`, `toBranchSafeSegment`) for creating isolated, concurrent working directories and branches per sub-agent
+- Full support for safe parallel multi-agent execution: each sub-agent (`researcher`, `code_expert`, `tester`, `writer`) now operates in its own Git worktree — preventing edit conflicts even when modifying the same files simultaneously
+- Comprehensive test coverage (`gitWorktree.test.ts`, updated approval tests)
+- Integration into core agent loop and approval system
+
+### Changed
+- `package.json` version bumped to 2.0.13
+- Updated `approvals.ts`, `extension.ts` and agent dispatch logic to leverage worktree isolation
+- README version references, feature descriptions, and version badge refreshed
+
+### Fixed
+- Race conditions and file conflicts during concurrent sub-agent operations
+- Minor test and approval flow edge cases
+
 ## [2.0.12] - 2024-10-29
 ### Added
 - Final Marketplace configuration polish: complete `enumDescriptions` for all providers/approval policies, full JSON schema for `mcpServers` (including `additionalProperties`, nested `command`/`args`/`env`/`cwd` with `required` fields), explicit `deprecationMessage` on `apiKey`, `minimum`/`maximum` bounds on `inlineCompletionDebounce`, expanded `categories` (now includes "Azure")
