@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import axios from "axios";
+import { API_KEY_SECRET_KEY } from "./secretKeys";
+import { buildProviderRequest, extractNonStreamedText } from "./aiProviderAdapter";
 
 /**
  * InlineCompletionProvider for CodePartner.
@@ -9,10 +11,12 @@ export class CodePartnerInlineCompletionProvider implements vscode.InlineComplet
   private debounceTimer: ReturnType<typeof setTimeout> | undefined;
   private lastRequestId = 0;
   private output: vscode.OutputChannel;
+  private context: vscode.ExtensionContext;
   private cache = new Map<string, { result: string; timestamp: number }>();
   private readonly CACHE_TTL = 30_000; // 30 seconds
 
-  constructor(output: vscode.OutputChannel) {
+  constructor(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
+    this.context = context;
     this.output = output;
   }
 
@@ -28,7 +32,7 @@ export class CodePartnerInlineCompletionProvider implements vscode.InlineComplet
       return undefined;
     }
 
-    const apiKey = config.get<string>("apiKey")?.trim() || "";
+    const apiKey = (await this.context.secrets.get(API_KEY_SECRET_KEY)) || "";
     const provider = config.get<string>("provider") || "openai";
     if (!apiKey && provider !== "ollama") {
       return undefined;
@@ -51,7 +55,7 @@ export class CodePartnerInlineCompletionProvider implements vscode.InlineComplet
     }
 
     try {
-      const completion = await this.getCompletion(document, position, token);
+      const completion = await this.getCompletion(document, position, token, apiKey);
       if (!completion || token.isCancellationRequested) {
         return undefined;
       }
@@ -71,12 +75,12 @@ export class CodePartnerInlineCompletionProvider implements vscode.InlineComplet
   private async getCompletion(
     document: vscode.TextDocument,
     position: vscode.Position,
-    token: vscode.CancellationToken
+    token: vscode.CancellationToken,
+    apiKey: string
   ): Promise<string | undefined> {
     const config = vscode.workspace.getConfiguration("codepartner");
     const providerType = config.get<string>("provider") || "openai";
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const apiKey = config.get<string>("apiKey")?.trim() || "";
     const modelId = config.get<string>("model")?.trim() || "";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
 
@@ -114,60 +118,25 @@ File: ${fileName} (${language})
 
 ${prefix}<CURSOR>${suffix}`;
 
-    const endpoint = apiEndpoint.replace(/\/$/, "");
-    let url = "";
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    let body: any = {};
-
-    if (providerType === "azure") {
-      url = `${endpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
-      headers["api-key"] = apiKey;
-      body = {
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 256,
-        temperature: 0.2,
-        stop: ["\n\n\n", "```"],
-      };
-    } else if (providerType === "anthropic") {
-      url = apiEndpoint || "https://api.anthropic.com/v1/messages";
-      headers["x-api-key"] = apiKey;
-      headers["anthropic-version"] = "2023-06-01";
-      body = {
-        model: modelId,
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 256,
-        temperature: 0.2,
-        stop_sequences: ["\n\n\n", "```"],
-      };
-    } else if (providerType === "google") {
-      url = `${apiEndpoint || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`;
-      headers["Authorization"] = `Bearer ${apiKey}`;
-      body = {
-        model: modelId,
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 256,
-        temperature: 0.2,
-      };
-    } else if (providerType === "ollama") {
-      url = `${apiEndpoint || "http://localhost:11434/v1"}/chat/completions`;
-      body = {
-        model: modelId,
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 256,
-        temperature: 0.2,
-        stop: ["\n\n\n", "```"],
-      };
-    } else {
-      // OpenAI or compatible
-      url = `${endpoint || "https://api.openai.com/v1"}/chat/completions`;
-      headers["Authorization"] = `Bearer ${apiKey}`;
-      body = {
-        model: modelId,
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 256,
-        temperature: 0.2,
-        stop: ["\n\n\n", "```"],
-      };
+    // Shared with the rest of the extension (aiProviderAdapter.ts) rather
+    // than a second hand-rolled copy of the provider branching — this file
+    // used to duplicate that logic, with its own drift risk (see the
+    // module doc comment on aiProviderAdapter.ts for the bugs found the
+    // last time two copies of this existed).
+    const { url, headers, body } = buildProviderRequest({
+      providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
+      messages: [{ role: "user", content: prompt }],
+      useSystemRole: true,
+      maxTokens: 256,
+      temperature: 0.2,
+      stream: false,
+    });
+    // Stop sequences aren't part of the shared adapter's options (only
+    // this call site needs them), so they're added on top of the built body.
+    if (providerType === "anthropic") {
+      body.stop_sequences = ["\n\n\n", "```"];
+    } else if (providerType !== "google") {
+      body.stop = ["\n\n\n", "```"];
     }
 
     const controller = new AbortController();
@@ -179,12 +148,7 @@ ${prefix}<CURSOR>${suffix}`;
       signal: controller.signal,
     });
 
-    let completion = "";
-    if (providerType === "anthropic") {
-      completion = res.data?.content?.[0]?.text || "";
-    } else {
-      completion = res.data?.choices?.[0]?.message?.content || "";
-    }
+    let completion = extractNonStreamedText(providerType, res.data);
 
     // Clean up: remove code fences if the model wrapped the response
     completion = completion

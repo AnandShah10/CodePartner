@@ -28,8 +28,7 @@ import { extractUsageFromStreamEvent, formatTokenCount } from "./usageExtraction
 import { getModelMetadata, formatContextWindow } from "./modelMetadata";
 import { createWorktree, removeWorktree, getBranchDiffStat, commitAllIfDirty, toBranchSafeSegment } from "./gitWorktree";
 
-/** SecretStorage key used to store the LLM provider API key (see migrateApiKeyToSecretStorage). */
-const API_KEY_SECRET_KEY = "codepartner.apiKey";
+import { API_KEY_SECRET_KEY } from "./secretKeys";
 
 /** Combines a spawned process's stdout/stderr into one trimmed string for display/prompt use. */
 function formatOutput(stdout: string, stderr: string): string {
@@ -786,7 +785,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(vscode.workspace.onDidRenameFiles(() => provider.invalidateMentionCache()));
 
   // ── Inline Completion Provider ──
-  const inlineProvider = new CodePartnerInlineCompletionProvider(output);
+  const inlineProvider = new CodePartnerInlineCompletionProvider(context, output);
   context.subscriptions.push(
     vscode.languages.registerInlineCompletionItemProvider(
       { pattern: "**" },
