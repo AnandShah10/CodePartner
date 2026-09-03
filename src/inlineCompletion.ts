@@ -32,6 +32,12 @@ export class CodePartnerInlineCompletionProvider implements vscode.InlineComplet
       return undefined;
     }
 
+    // Bug fix: this used to read config.get<string>("apiKey") directly,
+    // which is the plaintext settings.json path CodePartner migrated
+    // away from (see migrateApiKeyToSecretStorage in extension.ts) — so
+    // since that migration shipped, the key here was always "", and
+    // inline completions silently stopped working for every provider
+    // except Ollama. Reads from SecretStorage now, same as everywhere else.
     const apiKey = (await this.context.secrets.get(API_KEY_SECRET_KEY)) || "";
     const provider = config.get<string>("provider") || "openai";
     if (!apiKey && provider !== "ollama") {
@@ -113,6 +119,7 @@ export class CodePartnerInlineCompletionProvider implements vscode.InlineComplet
 
     const prompt = `You are a code completion engine. Complete the code at the cursor position marked with <CURSOR>.
 Return ONLY the completion text. Do NOT include the existing code before the cursor. Do NOT include markdown formatting, code fences, or explanations.
+When the context implies more than the current line — e.g. the rest of a function body, a loop, an if/else block, or a multi-line object/array literal — complete the FULL block, not just the current line. Stop naturally at the end of that logical unit.
 
 File: ${fileName} (${language})
 
@@ -127,7 +134,7 @@ ${prefix}<CURSOR>${suffix}`;
       providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
       messages: [{ role: "user", content: prompt }],
       useSystemRole: true,
-      maxTokens: 256,
+      maxTokens: 384, // bumped from 256 so a legitimate multi-line block (a full function body, a loop) isn't cut off mid-way; still small enough to stay latency-reasonable for ghost text
       temperature: 0.2,
       stream: false,
     });

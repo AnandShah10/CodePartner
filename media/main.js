@@ -948,7 +948,7 @@
       }
     }
   });
-
+  
   modelSelector.onchange = () => {
     vscode.postMessage({ type: 'changeModel', value: modelSelector.value });
   };
@@ -957,7 +957,74 @@
     vscode.postMessage({ type: 'attachFiles' });
   };
 
-  // Architect drafts button is already wired above with correct message type 'applyArchitectDrafts'
+  // Drag-and-drop file attachment: reuses the exact same attachedFiles
+  // pipeline as the file picker / attachBtn above. Two cases, since a
+  // browser drag event carries different data depending on the source:
+  //  - Dragging a file in from the OS file manager: dataTransfer.files
+  //    gives real File objects, readable client-side via FileReader.
+  //  - Dragging a file from VS Code's own Explorer: it's an in-app drag,
+  //    not a real filesystem drop, so dataTransfer only carries a
+  //    text/uri-list — the extension host reads that file from disk
+  //    (see the "attachFilesByPath" case in extension.ts).
+  const dropZone = document.getElementById('input-outer');
+  let dragDepth = 0;
+
+  function readFileAsAttachment(file) {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result || '';
+        const commaIdx = dataUrl.indexOf(',');
+        const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : '';
+        resolve({ name: file.name, mimeType: file.type || 'application/octet-stream', data: base64 });
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  if (dropZone) {
+    dropZone.addEventListener('dragenter', (e) => {
+      e.preventDefault();
+      dragDepth++;
+      dropZone.classList.add('drag-over');
+    });
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+    });
+    dropZone.addEventListener('dragleave', () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) {
+        dropZone.classList.remove('drag-over');
+      }
+    });
+    dropZone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      dragDepth = 0;
+      dropZone.classList.remove('drag-over');
+
+      const dt = e.dataTransfer;
+      if (!dt) { return; }
+
+      if (dt.files && dt.files.length > 0) {
+        const results = await Promise.all(Array.from(dt.files).map(readFileAsAttachment));
+        const valid = results.filter(Boolean);
+        if (valid.length > 0) {
+          attachedFiles.push(...valid);
+          renderAttachmentChips();
+        }
+        return;
+      }
+
+      const uriList = dt.getData('text/uri-list');
+      if (uriList) {
+        const uris = uriList.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+        if (uris.length > 0) {
+          vscode.postMessage({ type: 'attachFilesByPath', value: uris });
+        }
+      }
+    });
+  }
 
   // Handle Send/Stop click
   sendBtn.addEventListener('click', () => {

@@ -4,6 +4,43 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.2] - 2024-11-06
+### Added
+- New commands: `codepartner.newChat` (Ctrl+Alt+N / Cmd+Alt+N) and `codepartner.cancelActiveTask` (Ctrl+Alt+X / Cmd+Alt+X)
+- Enhanced keybindings for inline completions (accept next word/line) and all new commands
+- Updated system prompts and tool descriptions to precisely match Architect Mode rules, parallel agent isolation, and critical guidelines (read-before-edit, complete implementations, explain reasoning, etc.)
+- UI refinements in sidebar (media/main.css, main.js) for better glassmorphism, tabs, and task management
+
+### Changed
+- `run_parallel_agents` tool now explicitly documents full Git worktree + branch isolation for concurrent sub-agents
+- `call_subagent` and `runInternalAgent` descriptions updated for clarity on shared vs. isolated workspaces
+- `ARCHITECT_SYSTEM_PROMPT` and `BASE_SYSTEM` aligned with internal agent rules (no `run_command` in Architect mode, draft changes via `edit_file`)
+- Inline completion provider improvements (`src/inlineCompletion.ts`)
+- `package.json` version, commands, keybindings, and configuration fully synchronized
+
+### Fixed
+- Version drift between package.json (now **2.1.2**), README, and changelog
+- Minor inconsistencies in tool call parsing, token budgeting in browser_control, and approval policy enforcement during parallel runs
+
+## [2.1.1] - 2024-11-05
+### Added
+- Full production integration of `run_parallel_agents` with the `gitWorktree` module (isolated branches + worktrees for 2-8 concurrent sub-agents)
+- Support for `runInternalAgent` multi-turn loops in sub-agents with scoped tools via `getScopedTools`
+- Enhanced `AgentManager.dispatch` for parallel execution tracking and result aggregation
+- New test coverage for parallel agent workflows and worktree cleanup
+
+### Changed
+- `extension.ts` refactored to import and use `createWorktree`/`removeWorktree`/`commitAllIfDirty` etc. in the parallel agent path
+- Updated `run_parallel_agents` description to highlight isolation benefits vs. `call_subagent`
+- Improved error recovery, status updates, and Timeline entries for parallel runs
+- System prompts refined for better adherence to "Architect Mode" drafting behavior
+
+### Fixed
+- Race conditions in concurrent file edits (worktrees ensure independent checkouts)
+- Approval policy application across sub-agents
+- Worktree cleanup on task cancellation or errors
+- Version alignment from 2.0.13
+
 ## [2.0.13] - 2024-11-05
 ### Added
 - `GitWorktree` utilities (`createWorktree`, `removeWorktree`, `commitAllIfDirty`, `getBranchDiffStat`, `toBranchSafeSegment`) for creating isolated, concurrent working directories and branches per sub-agent

@@ -82,11 +82,6 @@ html, body {
   display: none;
 }
 .tab-btn {
-  flex: 0 0 auto;
-  min-width: 48px;
-  padding: 0 12px;
-}
-.tab-btn {
   flex: 1; background: transparent; border: none;
   color: var(--vscode-foreground); opacity: 0.5;
   cursor: pointer; transition: var(--transition);
@@ -234,6 +229,12 @@ pre {
   backdrop-filter: blur(var(--blur));
   border-top: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
   flex-shrink: 0; position: relative;
+  transition: background-color 0.15s ease;
+}
+#input-outer.drag-over {
+  background: rgba(var(--vscode-button-background-rgb, 0,120,212), 0.18);
+  outline: 2px dashed var(--vscode-focusBorder);
+  outline-offset: -2px;
 }
 #suggestion-list {
   position: absolute; bottom: 100%; left: 14px; right: 14px;
@@ -568,7 +569,7 @@ textarea::-webkit-scrollbar { display: none; }
 #apply-drafts-btn {
   background: var(--accent); color: var(--vscode-button-foreground);
   border: none; border-radius: var(--radius-sm); padding: 6px; font-size: 11px; font-weight: 700;
-  cursor: pointer; transition: var(--transition); margin-top: 4px;
+  cursor: pointer; transition: var(--transition);
 }
 #apply-drafts-btn:hover { filter: brightness(1.2); box-shadow: 0 2px 8px var(--accent-glow); }
 #apply-hunks-btn.secondary {

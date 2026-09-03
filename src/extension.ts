@@ -834,6 +834,18 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.newChat", () => {
+      provider.newChat();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.cancelActiveTask", () => {
+      provider.cancelActiveTask();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand("codepartner.setApiKey", async () => {
       const key = await vscode.window.showInputBox({
         title: "CodePartner: Set API Key",
@@ -1311,20 +1323,26 @@ Provide a concise, high-quality result.`;
         case "attachFiles":
           this.handleAttachFiles();
           break;
+        case "attachFilesByPath": {
+          // Phase: drag-and-drop of a file dragged from VS Code's own
+          // Explorer — the webview only got URI strings (text/uri-list),
+          // not file content. vscode.Uri.parse(...).fsPath handles the
+          // platform-specific parts (Windows drive letters, encoding)
+          // correctly, rather than hand-parsing the URI string in JS.
+          const uris: string[] = data.value || [];
+          const fsPaths = uris
+            .map(u => {
+              try { return vscode.Uri.parse(u).fsPath; } catch { return null; }
+            })
+            .filter((p): p is string => !!p);
+          this.attachFilesFromPaths(fsPaths);
+          break;
+        }
         case "prompt":
           this.handlePrompt(data.value, data.attachments);
           break;
         case "cancel":
-          if (this.abortController) {
-            this.abortController.abort();
-            this.abortController = undefined;
-            this.output.appendLine("[CodePartner] Cancelled by user.");
-          }
-          if (this.runningChildProcess) {
-            this.runningChildProcess.kill();
-            this.output.appendLine("[CodePartner] Killed in-flight command/test run.");
-            this.runningChildProcess = undefined;
-          }
+          this.cancelActiveTask();
           break;
         case "applyDiff":
           this.showDiffView(data.value);
@@ -1574,7 +1592,21 @@ Provide a concise, high-quality result.`;
     }
   }
 
-  private newChat() {
+  /** Stops the current turn's LLM stream and/or any in-flight shell command or test run. Also callable via the codepartner.cancelActiveTask keybinding, not just the webview's Stop button. */
+  public cancelActiveTask() {
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = undefined;
+      this.output.appendLine("[CodePartner] Cancelled by user.");
+    }
+    if (this.runningChildProcess) {
+      this.runningChildProcess.kill();
+      this.output.appendLine("[CodePartner] Killed in-flight command/test run.");
+      this.runningChildProcess = undefined;
+    }
+  }
+
+  public newChat() {
     // Save current if it has history
     if (this.messageHistory.length > 1) {
       this.saveCurrentChat();
@@ -1862,12 +1894,25 @@ Provide a concise, high-quality result.`;
       return;
     }
 
+    await this.attachFilesFromPaths(files.map(f => f.fsPath));
+  }
+
+  /**
+   * Reads files from disk and attaches them, in the shape the webview's
+   * existing attachment pipeline already expects. Shared by the file
+   * picker (handleAttachFiles) and drag-and-drop of a file dragged from
+   * VS Code's own Explorer (where the browser drag event carries a
+   * vscode-file:// URI, not real file content the webview can read
+   * directly — unlike dragging a file in from the OS file manager, which
+   * the webview reads client-side; see the "drop" handler in main.js).
+   */
+  private async attachFilesFromPaths(fsPaths: string[]): Promise<void> {
     const attached = [];
-    for (const file of files) {
+    for (const fsPath of fsPaths) {
       try {
-        const content = await fs.promises.readFile(file.fsPath);
+        const content = await fs.promises.readFile(fsPath);
         const base64 = content.toString("base64");
-        const ext = path.extname(file.fsPath).toLowerCase().substring(1);
+        const ext = path.extname(fsPath).toLowerCase().substring(1);
         let mimeType = "application/octet-stream";
 
         if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
@@ -1879,7 +1924,7 @@ Provide a concise, high-quality result.`;
         }
 
         attached.push({
-          name: path.basename(file.fsPath),
+          name: path.basename(fsPath),
           mimeType,
           data: base64
         });
@@ -1888,7 +1933,9 @@ Provide a concise, high-quality result.`;
       }
     }
 
-    this._view?.webview.postMessage({ type: "fileAttached", value: attached });
+    if (attached.length > 0) {
+      this._view?.webview.postMessage({ type: "fileAttached", value: attached });
+    }
   }
 
   private async openFileInEditor(relPath: string) {

@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.0.13-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.1.2-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -77,10 +77,15 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 | `codepartner.toggleInlineCompletions` | Toggle Inline Completions | `Ctrl+Shift+I` / `Cmd+Shift+I` | Enable/disable ghost text |
 | `codepartner.explainSelection` | Explain Selected Code | `Ctrl+Shift+;` / `Cmd+Shift+;` (when selection) | Context-aware explanation |
 | `codepartner.fixErrors` | Fix Errors in File | `Ctrl+Shift+'` / `Cmd+Shift+'` | Auto-fix diagnostics |
-| `codepartner.generateTests` | Generate Tests for File | - | Create unit tests |
+| `codepartner.generateTests` | Generate Tests for File | `Ctrl+Alt+T` / `Cmd+Alt+T` | Create unit tests |
+| `codepartner.newChat` | New Chat | `Ctrl+Alt+N` / `Cmd+Alt+N` | Start a fresh conversation |
+| `codepartner.cancelActiveTask` | Cancel Active Task | `Ctrl+Alt+X` / `Cmd+Alt+X` | Stop any running agent/task |
 | `codepartner.showDebugLog` | Show Debug Log | - | Open output channel |
+| `codepartner.setApiKey` | Set API Key | - | Securely store LLM API key |
 
-**Slash Commands in Chat**: `/fix`, `/explain`, `/test`, `/compact`, `/clear`
+**Inline Completions**: `Ctrl+Right` (next word), `Ctrl+Alt+Right` (next line)
+
+**Slash Commands in Chat**: `/fix`, `/explain`, `/test`, `/compact`, `/clear`, `/plan`, `/architect`
 
 ---
 
@@ -153,7 +158,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.0.13** — Git worktree isolation for concurrent sub-agents (prevents edit conflicts across parallel `researcher`/`code_expert` etc. runs). Updated approval flows, comprehensive tests, and full documentation alignment. See [CHANGELOG.md](CHANGELOG.md) for the complete history.
+**Note**: Now at **v2.1.2** — new UX commands (`New Chat`, `Cancel Active Task`), refined Architect Mode + `run_parallel_agents` with full worktree isolation, expanded keybindings, and UI polish. See [CHANGELOG.md](CHANGELOG.md) for details on 2.1.1 and 2.1.2.
 
 ---
 

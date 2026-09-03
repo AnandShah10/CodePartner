@@ -3,7 +3,7 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
@@ -52,6 +52,14 @@
       {
         "command": "codepartner.setApiKey",
         "title": "CodePartner: Set API Key"
+      },
+      {
+        "command": "codepartner.newChat",
+        "title": "CodePartner: New Chat"
+      },
+      {
+        "command": "codepartner.cancelActiveTask",
+        "title": "CodePartner: Cancel Active Task"
       }
     ],
     "keybindings": [
@@ -75,6 +83,33 @@
         "command": "codepartner.fixErrors",
         "key": "ctrl+shift+'",
         "mac": "cmd+shift+'"
+      },
+      {
+        "command": "codepartner.generateTests",
+        "key": "ctrl+alt+t",
+        "mac": "cmd+alt+t"
+      },
+      {
+        "command": "codepartner.newChat",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n"
+      },
+      {
+        "command": "codepartner.cancelActiveTask",
+        "key": "ctrl+alt+x",
+        "mac": "cmd+alt+x"
+      },
+      {
+        "command": "editor.action.inlineSuggest.acceptNextWord",
+        "key": "ctrl+right",
+        "mac": "cmd+right",
+        "when": "inlineSuggestionVisible && !editorReadonly"
+      },
+      {
+        "command": "editor.action.inlineSuggest.acceptNextLine",
+        "key": "ctrl+alt+right",
+        "mac": "cmd+alt+right",
+        "when": "inlineSuggestionVisible && !editorReadonly"
       }
     ],
     "viewsContainers": {
