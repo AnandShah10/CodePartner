@@ -767,6 +767,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("codepartner")) {
         provider.refreshModels();
+        provider.applyEmbeddingConfig().catch(() => {});
         confirmYoloModeIfNeeded(context, output).then(() => updateAutonomyStatusBar(autonomyStatusBarItem));
       }
     })
@@ -952,6 +953,9 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
     // Build semantic search index in the background
     this.semanticSearch.buildIndex().catch(() => {});
+    this.applyEmbeddingConfig().catch((e) => {
+      this.output.appendLine(`[CodePartner] Embedding config error: ${e.message}`);
+    });
 
     // Phase 4.3: restore the last selected model per workspace, so it
     // survives a VS Code restart instead of silently falling back to
@@ -1058,6 +1062,52 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private async getApiKey(): Promise<string> {
     const key = await this.context.secrets.get(API_KEY_SECRET_KEY);
     return (key || "").trim();
+  }
+
+  /**
+   * Reads embedding-search settings and pushes them into SemanticSearch.
+   * Strictly opt-in — codepartner.embeddingProvider defaults to
+   * "disabled", meaning TF-IDF-only, zero behavior/cost change from
+   * before this feature existed. "same-as-chat" resolves to whatever
+   * codepartner.provider is configured, EXCEPT Anthropic, which has no
+   * embeddings endpoint — that case logs once and falls back to TF-IDF
+   * (configureEmbeddings(null)) rather than trying and failing repeatedly.
+   */
+  public async applyEmbeddingConfig(): Promise<void> {
+    const config = vscode.workspace.getConfiguration("codepartner");
+    const setting = config.get<string>("embeddingProvider") || "disabled";
+
+    if (setting === "disabled") {
+      this.semanticSearch.configureEmbeddings(null);
+      return;
+    }
+
+    let providerType: "openai" | "azure" | "google" | "ollama";
+    if (setting === "same-as-chat") {
+      const chatProvider = config.get<string>("provider") || "openai";
+      if (chatProvider === "anthropic") {
+        this.output.appendLine("[CodePartner] embeddingProvider is \"same-as-chat\" but the chat provider (Anthropic) has no embeddings endpoint — using TF-IDF search instead. Set codepartner.embeddingProvider explicitly (e.g. \"openai\") to use embeddings anyway.");
+        this.semanticSearch.configureEmbeddings(null);
+        return;
+      }
+      if (chatProvider !== "openai" && chatProvider !== "azure" && chatProvider !== "google" && chatProvider !== "ollama") {
+        // A custom/OpenAI-compatible chat endpoint — treat as openai-shaped.
+        providerType = "openai";
+      } else {
+        providerType = chatProvider as "openai" | "azure" | "google" | "ollama";
+      }
+    } else if (setting === "openai" || setting === "azure" || setting === "google" || setting === "ollama") {
+      providerType = setting;
+    } else {
+      this.semanticSearch.configureEmbeddings(null);
+      return;
+    }
+
+    const apiKey = providerType === "ollama" ? "" : await this.getApiKey();
+    const apiEndpoint = config.get<string>("embeddingEndpoint")?.trim() || (setting === "same-as-chat" ? config.get<string>("apiEndpoint")?.trim() || "" : "");
+    const model = config.get<string>("embeddingModel")?.trim() || "";
+
+    this.semanticSearch.configureEmbeddings({ providerType, apiEndpoint, apiKey, model });
   }
 
   /**

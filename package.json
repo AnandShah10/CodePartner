@@ -3,7 +3,7 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
@@ -184,6 +184,30 @@
           "type": "number",
           "default": 6000,
           "description": "Approximate token budget shared across per-turn file context (active editor content, other open tabs, @file mentions). Replaces the old fixed character caps on each source individually — content is truncated (on a line boundary) to fit within this shared budget instead."
+        },
+        "codepartner.embeddingProvider": {
+          "type": "string",
+          "enum": ["disabled", "same-as-chat", "openai", "azure", "google", "ollama"],
+          "enumDescriptions": [
+            "@workspace uses TF-IDF (term-frequency ranked keyword search) only — the default, no extra API calls or cost.",
+            "Use real embeddings from whatever codepartner.provider is already configured. Falls back to TF-IDF if that's Anthropic (no embeddings endpoint).",
+            "Use OpenAI's embeddings API regardless of the chat provider.",
+            "Use Azure OpenAI's embeddings API regardless of the chat provider.",
+            "Use Google's embeddings API regardless of the chat provider.",
+            "Use a local Ollama embedding model — no API key needed."
+          ],
+          "default": "disabled",
+          "description": "Upgrades @workspace search from TF-IDF to real embedding-based semantic search. Reuses the API key already set via \"CodePartner: Set API Key\" (Ollama needs none). On any failure (bad key, network error, unreachable endpoint) this automatically falls back to TF-IDF rather than breaking @workspace."
+        },
+        "codepartner.embeddingModel": {
+          "type": "string",
+          "default": "",
+          "description": "Embedding model name. Leave blank to use a sensible default for the selected codepartner.embeddingProvider (e.g. text-embedding-3-small for OpenAI, nomic-embed-text for Ollama)."
+        },
+        "codepartner.embeddingEndpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Custom embeddings API endpoint. Leave blank to use the provider's public default (or, for \"same-as-chat\", the same endpoint as codepartner.apiEndpoint)."
         },
         "codepartner.azureApiVersion": {
           "type": "string",

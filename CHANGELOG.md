@@ -4,6 +4,26 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.3] - 2024-11-07
+### Added
+- Real **embedding-based semantic search** (`src/embeddings.ts` + upgraded `SemanticSearch`)
+  - New config: `codepartner.embeddingProvider` (`disabled` / `same-as-chat` / `openai` / `azure` / `google` / `ollama`)
+  - `codepartner.embeddingModel` and `codepartner.embeddingEndpoint` for full control
+  - Automatic graceful fallback to TF-IDF on any error (bad key, network issue, Anthropic chat provider, etc.)
+  - Chunking with overlap, content-hash caching, cosine similarity, batching where supported
+  - Unit-tested request building, response parsing, similarity math, and chunking (network calls not testable in sandbox)
+- Updated `semanticSearch.ts` to optionally use embeddings for `@workspace` (much better relevance than pure TF-IDF)
+- Expanded configuration schema, README, and changelog to document the new semantic search upgrade path
+
+### Changed
+- `package.json` version bumped to **2.1.3**
+- `SemanticSearch.search()` now tries embeddings first (when configured) and falls back transparently
+- README "Smart Context" and configuration table refreshed with embedding options
+- Version badge and final note in README updated
+
+### Fixed
+- Version alignment across package.json (2.1.3), README badge, and changelog top section
+
 ## [2.1.2] - 2024-11-06
 ### Added
 - New commands: `codepartner.newChat` (Ctrl+Alt+N / Cmd+Alt+N) and `codepartner.cancelActiveTask` (Ctrl+Alt+X / Cmd+Alt+X)

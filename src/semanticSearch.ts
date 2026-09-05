@@ -1,11 +1,38 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
+import * as crypto from "crypto";
+import axios from "axios";
+import { buildEmbeddingRequest, extractEmbeddings, cosineSimilarity, chunkText, EmbeddingProviderType } from "./embeddings";
 
 /**
- * TF-IDF based semantic workspace search.
- * Much better than naive keyword matching for @workspace queries.
+ * TF-IDF based semantic workspace search, with an OPTIONAL real
+ * embedding-based upgrade path.
+ *
+ * TF-IDF remains the default and the fallback for every failure mode —
+ * no embedding provider configured, no API key, a network error, an
+ * unexpected response shape. Embedding search is strictly opt-in via
+ * configureEmbeddings(): unless a caller explicitly turns it on, nothing
+ * about this class's behavior or cost changes from before.
  */
+
+export interface EmbeddingConfig {
+  providerType: EmbeddingProviderType;
+  apiEndpoint: string;
+  apiKey: string;
+  model: string;
+}
+
+interface EmbeddingChunk {
+  chunkIndex: number;
+  text: string;
+  vector: number[];
+}
+
+interface EmbeddingCacheEntry {
+  contentHash: string;
+  chunks: EmbeddingChunk[];
+}
 
 interface DocEntry {
   relPath: string;
@@ -22,8 +49,25 @@ export class SemanticSearch {
   private output: vscode.OutputChannel;
   private watcher?: vscode.FileSystemWatcher;
 
+  // Embedding search state — all inert unless configureEmbeddings() is called.
+  private embeddingConfig: EmbeddingConfig | null = null;
+  private embeddingCache: Map<string, EmbeddingCacheEntry> = new Map(); // relPath -> cached chunks/vectors
+  private embeddingIndexBuilt = false;
+  private embeddingDisabledForSession = false; // set true after a hard failure (e.g. bad key) so we don't retry every file
+
   constructor(output: vscode.OutputChannel) {
     this.output = output;
+  }
+
+  /**
+   * Opts into real embedding-based search. Pass null to go back to
+   * TF-IDF only. Changing this invalidates the embedding index so it
+   * rebuilds (with a fresh provider/model) on the next search.
+   */
+  public configureEmbeddings(config: EmbeddingConfig | null): void {
+    this.embeddingConfig = config;
+    this.embeddingIndexBuilt = false;
+    this.embeddingDisabledForSession = false;
   }
 
   /**
@@ -107,11 +151,19 @@ export class SemanticSearch {
 
   private invalidate(): void {
     this.indexed = false;
+    // Don't clear embeddingCache itself — it's keyed by content hash, so
+    // an unchanged file's vectors are still valid and reused for free.
+    // Just allow buildEmbeddingIndex() to run again so changed/new files
+    // get re-embedded.
+    this.embeddingIndexBuilt = false;
   }
 
   /**
-   * Search the workspace using TF-IDF scoring.
-   * Returns the top N most relevant files with matching excerpts.
+   * Searches the workspace. Uses real embedding-based search when
+   * configureEmbeddings() has been called and the embedding index built
+   * successfully; falls back to TF-IDF on any failure — no configured
+   * provider, an API error, a bad response, or the index simply not
+   * being ready yet on the very first call.
    */
   public async search(
     query: string,
@@ -121,6 +173,144 @@ export class SemanticSearch {
       await this.buildIndex();
     }
 
+    if (this.embeddingConfig && !this.embeddingDisabledForSession) {
+      try {
+        if (!this.embeddingIndexBuilt) {
+          await this.buildEmbeddingIndex();
+        }
+        if (this.embeddingIndexBuilt) {
+          const results = await this.searchByEmbedding(query, topN);
+          if (results.length > 0) {
+            return results;
+          }
+        }
+      } catch (e: any) {
+        this.output.appendLine(`[SemanticSearch] Embedding search failed, falling back to TF-IDF: ${e.message}`);
+      }
+    }
+
+    return this.searchTfIdf(query, topN);
+  }
+
+  /**
+   * Builds the embedding index: chunks each already-TF-IDF-indexed
+   * file's content and embeds each chunk, skipping files whose content
+   * hash hasn't changed since the last successful embed (content-hash
+   * cache — avoids re-paying for an API call on every rebuild for files
+   * that haven't changed). If the very first embedding call fails
+   * outright (bad key, network down, wrong model name), embedding search
+   * is disabled for the rest of this session rather than retried on
+   * every subsequent file — TF-IDF keeps working regardless.
+   */
+  private async buildEmbeddingIndex(): Promise<void> {
+    if (!this.embeddingConfig) return;
+    const config = this.embeddingConfig;
+    let firstCallAttempted = false;
+
+    for (const doc of this.index) {
+      const contentHash = crypto.createHash("sha256").update(doc.content).digest("hex");
+      const cached = this.embeddingCache.get(doc.relPath);
+      if (cached && cached.contentHash === contentHash) {
+        continue; // unchanged since last embed — reuse cached vectors, no API call
+      }
+
+      const pieces = chunkText(doc.content, 2000, 200);
+      if (pieces.length === 0) continue;
+
+      try {
+        const vectors = await this.embedTexts(config, pieces);
+        firstCallAttempted = true;
+        if (vectors.length !== pieces.length) {
+          this.output.appendLine(`[SemanticSearch] Embedding count mismatch for ${doc.relPath} (got ${vectors.length}, expected ${pieces.length}) — skipping this file.`);
+          continue;
+        }
+        const chunks: EmbeddingChunk[] = pieces.map((text, i) => ({ chunkIndex: i, text, vector: vectors[i] }));
+        this.embeddingCache.set(doc.relPath, { contentHash, chunks });
+      } catch (e: any) {
+        if (!firstCallAttempted) {
+          // The very first call failed outright — likely a config problem
+          // (bad key, wrong URL, unreachable). Don't hammer it once per file.
+          this.embeddingDisabledForSession = true;
+          this.output.appendLine(`[SemanticSearch] Embedding provider unreachable, disabling embedding search for this session (TF-IDF still works): ${e.message}`);
+          return;
+        }
+        this.output.appendLine(`[SemanticSearch] Failed to embed ${doc.relPath}, skipping it: ${e.message}`);
+      }
+    }
+
+    this.embeddingIndexBuilt = this.embeddingCache.size > 0;
+
+    // Prune cache entries for files that no longer exist / were removed
+    // from the workspace — otherwise a deleted file's vectors would keep
+    // surfacing in search results indefinitely.
+    const currentPaths = new Set(this.index.map((d) => d.relPath));
+    for (const cachedPath of this.embeddingCache.keys()) {
+      if (!currentPaths.has(cachedPath)) {
+        this.embeddingCache.delete(cachedPath);
+      }
+    }
+  }
+
+  /** Calls the configured embedding provider for one or more text chunks, batching when the provider supports it (only Ollama's endpoint doesn't). */
+  private async embedTexts(config: EmbeddingConfig, texts: string[]): Promise<number[][]> {
+    if (config.providerType !== "ollama") {
+      const { url, headers, body } = buildEmbeddingRequest({
+        providerType: config.providerType, apiEndpoint: config.apiEndpoint,
+        apiKey: config.apiKey, model: config.model, input: texts,
+      });
+      const res = await axios.post(url, body, { headers, timeout: 20000 });
+      return extractEmbeddings(config.providerType, res.data);
+    }
+
+    // Ollama's endpoint takes one prompt per call, not a batch array.
+    const vectors: number[][] = [];
+    for (const text of texts) {
+      const { url, headers, body } = buildEmbeddingRequest({
+        providerType: config.providerType, apiEndpoint: config.apiEndpoint,
+        apiKey: config.apiKey, model: config.model, input: text,
+      });
+      const res = await axios.post(url, body, { headers, timeout: 20000 });
+      const extracted = extractEmbeddings(config.providerType, res.data);
+      if (extracted.length > 0) vectors.push(extracted[0]);
+    }
+    return vectors;
+  }
+
+  /** Embedding-based search: cosine similarity between the query vector and every cached chunk, best chunk per file wins. */
+  private async searchByEmbedding(
+    query: string,
+    topN: number
+  ): Promise<{ path: string; score: number; excerpt: string }[]> {
+    if (!this.embeddingConfig) return [];
+    const queryVectors = await this.embedTexts(this.embeddingConfig, [query]);
+    if (queryVectors.length === 0) return [];
+    const queryVector = queryVectors[0];
+
+    const bestPerFile = new Map<string, { score: number; excerpt: string }>();
+    for (const [relPath, entry] of this.embeddingCache) {
+      for (const chunk of entry.chunks) {
+        const score = cosineSimilarity(queryVector, chunk.vector);
+        const existing = bestPerFile.get(relPath);
+        if (!existing || score > existing.score) {
+          bestPerFile.set(relPath, { score, excerpt: chunk.text });
+        }
+      }
+    }
+
+    return Array.from(bestPerFile.entries())
+      .map(([path, v]) => ({ path, score: v.score, excerpt: v.excerpt }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topN);
+  }
+
+  /**
+   * Search the workspace using TF-IDF scoring.
+   * Returns the top N most relevant files with matching excerpts.
+   */
+  private async searchTfIdf(
+    query: string,
+    topN: number = 8
+  ): Promise<{ path: string; score: number; excerpt: string }[]> {
     const queryTerms = this.tokenize(query);
     const results: { path: string; score: number; excerpt: string }[] = [];
 

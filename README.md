@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.1.2-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.1.3-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -34,12 +34,13 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 - **Artifacts & Skills**: Persistent global storage (`~/.codepartner`) of code, plans, markdown, logs, and screenshots
 
 ### 🔍 Smart Context
-- `@workspace` - Semantic TF-IDF search across your codebase
+- `@workspace` - **Semantic search** (TF-IDF by default; upgrade to real embeddings via `embeddingProvider` setting for dramatically better relevance)
 - `@web` - Real-time web search + sub-agent researcher
 - `@file` mentions and automatic context from active file + **all open tabs**
 - Context compaction (LLM summarization when history >40 messages)
-- Token-aware budgeting and truncation
+- Token-aware budgeting and truncation (shared across all sources)
 - Image/file attachments support
+- **New in v2.1.3**: `embeddings.ts` with provider-agnostic request builder, cosine similarity, smart chunking+overlap, content-hash caching, and automatic TF-IDF fallback
 
 ### 🎨 Premium UX
 - Beautiful glassmorphism sidebar with tabs (Chat, Plan, Timeline, Artifacts, Skills)
@@ -91,21 +92,26 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 
 ## ⚙️ Configuration
 
-Key settings (full list in VS Code Settings):
+Key settings (full list in VS Code Settings → search "codepartner"):
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `codepartner.provider` | `openai` | `openai`, `azure`, `anthropic`, `google`, `ollama` |
-| `codepartner.apiKey` | `` | Your API key (set via command for secure storage) |
-| `codepartner.model` | `gpt-4` | Model name/deployment |
-| `codepartner.apiEndpoint` | `https://api.openai.com/v1` | Custom endpoint |
-| `codepartner.approvalPolicy` | `always-ask` | Safety level (`always-ask` / `ask-for-shell` / `full-auto` / `yolo`) |
-| `codepartner.inlineCompletions` | `false` | Enable ghost text completions |
-| `codepartner.inlineCompletionDebounce` | `500` | Debounce ms for completions |
-| `codepartner.mcpServers` | `{}` | MCP server configurations |
-| `codepartner.addAICoAuthor` | `true` | Add Co-authored-by to Git commits |
-| `codepartner.contextTokenBudget` | `6000` | Shared token budget for file/open-tab context |
-| `codepartner.maxTokens` | `4096` | Max output tokens |
+| `codepartner.provider` | `openai` | LLM provider (`openai`, `azure`, `anthropic`, `google`, `ollama`) |
+| `codepartner.embeddingProvider` | `disabled` | **New v2.1.3**: Upgrade `@workspace` to real embeddings (`same-as-chat` / `openai` / `azure` / `google` / `ollama`). Falls back to TF-IDF automatically. |
+| `codepartner.embeddingModel` | `` | Embedding model (blank = sensible default per provider) |
+| `codepartner.embeddingEndpoint` | `` | Custom embeddings endpoint (blank = provider default) |
+| `codepartner.apiKey` | `` | Set via **"CodePartner: Set API Key"** command (secure SecretStorage) |
+| `codepartner.model` | `gpt-4` | Chat model / deployment name |
+| `codepartner.apiEndpoint` | `https://api.openai.com/v1` | Custom chat endpoint |
+| `codepartner.approvalPolicy` | `always-ask` | Safety (`always-ask` / `ask-for-shell` / `full-auto` / `yolo`) |
+| `codepartner.contextTokenBudget` | `6000` | Shared token budget for file context, open tabs, and `@file` mentions |
+| `codepartner.maxTokens` | `4096` | Max output tokens per response |
+| `codepartner.inlineCompletions` | `false` | Enable ghost-text inline completions |
+| `codepartner.inlineCompletionDebounce` | `500` | Debounce (ms) for inline suggestions |
+| `codepartner.mcpServers` | `{}` | Custom Model Context Protocol tool servers |
+| `codepartner.addAICoAuthor` | `true` | Add Co-authored-by to Git commits made by CodePartner |
+
+**Tip for embeddings**: Start with `"same-as-chat"` (reuses your existing key/provider). Set to `disabled` to avoid any extra API cost/latency. See `embeddings.ts` for supported models and graceful fallback behavior.
 
 ---
 
@@ -113,7 +119,7 @@ Key settings (full list in VS Code Settings):
 
 - **Skills**: Reusable instruction sets (`.md` files)
 - **Artifacts**: Generated plans, code snippets, screenshots, logs
-- **Knowledge**: Indexed documentation via `index_docs`
+- **Knowledge**: Indexed documentation via `index_docs` + `query_knowledge`
 - **Global Instructions**: `global_instructions.md` applied to every chat
 
 Skills and knowledge travel with you across all projects.
@@ -158,7 +164,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.1.2** — new UX commands (`New Chat`, `Cancel Active Task`), refined Architect Mode + `run_parallel_agents` with full worktree isolation, expanded keybindings, and UI polish. See [CHANGELOG.md](CHANGELOG.md) for details on 2.1.1 and 2.1.2.
+**Note**: Now at **v2.1.3** — **real embedding-based semantic search** for `@workspace` (opt-in via `embeddingProvider`, with automatic TF-IDF fallback), new config options, plus all prior improvements from v2.1.2 (worktree-isolated parallel agents, new commands, Architect Mode refinements). See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ---
 
