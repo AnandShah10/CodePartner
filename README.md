@@ -1,7 +1,7 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.1.4-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
-[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
+[![Version](https://img.shields.io/badge/version-2.1.5-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.93.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ![CodePartner Hero](media/hero.png)
@@ -164,7 +164,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.1.4** — includes real **embedding-based semantic search** for `@workspace` (opt-in via `codepartner.embeddingProvider`, with automatic graceful TF-IDF fallback on any error), full unit tests in `embeddings.test.ts`, lint compliance, and all prior v2.1.x improvements. See [CHANGELOG.md](CHANGELOG.md) for details.
+**Note**: Now at **v2.1.5** — includes lint compliance (ESLint `curly` now an error), improved test runner stability (pinned VS Code version, higher timeouts, reduced flakiness), real **embedding-based semantic search** for `@workspace` (opt-in via `codepartner.embeddingProvider`, with automatic graceful TF-IDF fallback), full unit tests, durable Timeline undo, Architect hunk review, MCP, context compaction, approval policies, and all prior v2.1.x improvements. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ---
 

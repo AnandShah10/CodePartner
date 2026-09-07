@@ -3,7 +3,7 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.1.4",
+  "version": "2.1.5",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
@@ -220,6 +220,17 @@
           "type": "string",
           "default": "",
           "description": "Custom embeddings API endpoint. Leave blank to use the provider's public default (or, for \"same-as-chat\", the same endpoint as codepartner.apiEndpoint)."
+        },
+        "codepartner.terminalInlineAssist": {
+          "type": "string",
+          "enum": ["disabled", "codepartner-only", "all-terminals"],
+          "enumDescriptions": [
+            "No terminal monitoring — the default.",
+            "Offer help only when a command fails in CodePartner's own visible terminal (started via run_in_terminal).",
+            "Offer help when a command fails in ANY terminal in the workspace, including ones you opened and typed into yourself. Requires a one-time confirmation the first time it's enabled."
+          ],
+          "default": "disabled",
+          "description": "When a terminal command fails, shows a dismissable notification offering to ask CodePartner for help with the failure (the failed command + its output). \"all-terminals\" means CodePartner is watching everything typed into every terminal, not just its own — that's a real permission, not just a UI preference, hence the separate confirmation when you enable it."
         },
         "codepartner.azureApiVersion": {
           "type": "string",

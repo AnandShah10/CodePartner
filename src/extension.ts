@@ -28,6 +28,7 @@ import { extractUsageFromStreamEvent, formatTokenCount } from "./usageExtraction
 import { getModelMetadata, formatContextWindow } from "./modelMetadata";
 import { createWorktree, removeWorktree, getBranchDiffStat, commitAllIfDirty, toBranchSafeSegment } from "./gitWorktree";
 import { stripAnsiCodes } from "./ansiStrip";
+import { isFailureWorthAssisting, shouldOfferAssist, buildAssistPrompt, AssistOfferSignature } from "./terminalAssist";
 
 import { API_KEY_SECRET_KEY } from "./secretKeys";
 
@@ -743,6 +744,41 @@ function updateAutonomyStatusBar(item: vscode.StatusBarItem): void {
   }
 }
 
+/**
+ * Terminal inline assist's "all-terminals" scope means CodePartner is
+ * watching everything typed into every terminal in the workspace, not
+ * just its own — a real permission, same reasoning as yolo mode above:
+ * confirm it explicitly the first time it's active each session, and
+ * revert rather than silently proceed if declined.
+ */
+const TERMINAL_ASSIST_ALL_CONFIRMED_KEY = "codepartner.terminalAssistAllConfirmedThisSession";
+
+async function confirmAllTerminalsAssistIfNeeded(context: vscode.ExtensionContext, output: vscode.OutputChannel): Promise<void> {
+  const config = vscode.workspace.getConfiguration("codepartner");
+  const setting = config.get<string>("terminalInlineAssist");
+  if (setting !== "all-terminals") {
+    await context.workspaceState.update(TERMINAL_ASSIST_ALL_CONFIRMED_KEY, false);
+    return;
+  }
+  const alreadyConfirmed = context.workspaceState.get<boolean>(TERMINAL_ASSIST_ALL_CONFIRMED_KEY, false);
+  if (alreadyConfirmed) {
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    "CodePartner's terminal assist is set to watch ALL terminals in this workspace — not just its own. When any command fails (including ones you type yourself), it'll offer to help, using the failed command and its output. Nothing is sent anywhere unless you click \"Ask CodePartner\" on that offer.",
+    { modal: true },
+    "I understand, enable it",
+    "Revert to CodePartner-only"
+  );
+  if (choice === "I understand, enable it") {
+    await context.workspaceState.update(TERMINAL_ASSIST_ALL_CONFIRMED_KEY, true);
+    output.appendLine("[CodePartner] All-terminals inline assist confirmed by user.");
+  } else {
+    await config.update("terminalInlineAssist", "codepartner-only", vscode.ConfigurationTarget.Global);
+    output.appendLine("[CodePartner] All-terminals inline assist declined — reverted to codepartner-only.");
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("CodePartner");
   context.subscriptions.push(output);
@@ -755,6 +791,7 @@ export function activate(context: vscode.ExtensionContext) {
   const autonomyStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
   context.subscriptions.push(autonomyStatusBarItem);
   confirmYoloModeIfNeeded(context, output).then(() => updateAutonomyStatusBar(autonomyStatusBarItem));
+  confirmAllTerminalsAssistIfNeeded(context, output);
 
   // Phase 4.1: session token-usage counter. Hidden until the first real
   // usage data arrives (see updateTokenStatusBar in the provider class).
@@ -782,6 +819,7 @@ export function activate(context: vscode.ExtensionContext) {
         provider.refreshModels();
         provider.applyEmbeddingConfig().catch(() => {});
         confirmYoloModeIfNeeded(context, output).then(() => updateAutonomyStatusBar(autonomyStatusBarItem));
+        confirmAllTerminalsAssistIfNeeded(context, output);
       }
     })
   );
@@ -797,6 +835,96 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(mentionWatcher.onDidCreate(() => provider.invalidateMentionCache()));
   context.subscriptions.push(mentionWatcher.onDidDelete(() => provider.invalidateMentionCache()));
   context.subscriptions.push(vscode.workspace.onDidRenameFiles(() => provider.invalidateMentionCache()));
+
+  /**
+   * Terminal inline assist: offers to help when a terminal command
+   * fails. Scope (own terminal only, or all terminals in the workspace)
+   * is gated by codepartner.terminalInlineAssist, defaulting to
+   * "disabled" — see confirmAllTerminalsAssistIfNeeded above for why the
+   * broader "all-terminals" scope gets its own one-time confirmation.
+   *
+   * VERIFICATION NOTE: same caveat as run_in_terminal — this depends on
+   * VS Code's Terminal Shell Integration API (onDidStartTerminalShellExecution,
+   * onDidEndTerminalShellExecution), which I could not compile or run
+   * against real typings/a live host in this sandbox. Wrapped in
+   * try/catch so a wrong assumption here disables the feature silently
+   * (logged, not thrown) rather than breaking activation.
+   */
+  try {
+    const terminalOutputBuffers = new WeakMap<vscode.TerminalShellExecution, string>();
+    const terminalIds = new WeakMap<vscode.Terminal, number>();
+    let nextTerminalId = 1;
+    let lastAssistOffer: AssistOfferSignature | null = null;
+
+    const getTerminalId = (terminal: vscode.Terminal): string => {
+      let id = terminalIds.get(terminal);
+      if (id === undefined) {
+        id = nextTerminalId++;
+        terminalIds.set(terminal, id);
+      }
+      return String(id);
+    };
+
+    context.subscriptions.push(
+      vscode.window.onDidStartTerminalShellExecution((e) => {
+        terminalOutputBuffers.set(e.execution, "");
+        (async () => {
+          try {
+            for await (const chunk of e.execution.read()) {
+              terminalOutputBuffers.set(e.execution, (terminalOutputBuffers.get(e.execution) || "") + chunk);
+            }
+          } catch {
+            // Reading can fail if the terminal closes mid-command, etc. —
+            // safe to ignore; the assist offer just won't have output.
+          }
+        })();
+      })
+    );
+
+    context.subscriptions.push(
+      vscode.window.onDidEndTerminalShellExecution((e) => {
+        const setting = vscode.workspace.getConfiguration("codepartner").get<string>("terminalInlineAssist") || "disabled";
+        if (setting === "disabled") {
+          terminalOutputBuffers.delete(e.execution);
+          return;
+        }
+        if (setting === "codepartner-only" && !provider.isOwnTerminal(e.terminal)) {
+          terminalOutputBuffers.delete(e.execution);
+          return;
+        }
+        if (!isFailureWorthAssisting(e.exitCode)) {
+          terminalOutputBuffers.delete(e.execution);
+          return;
+        }
+
+        const commandLine = e.execution.commandLine?.value || "(unknown command)";
+        const capturedOutput = terminalOutputBuffers.get(e.execution) || "";
+        terminalOutputBuffers.delete(e.execution);
+
+        const signature: AssistOfferSignature = {
+          terminalId: getTerminalId(e.terminal),
+          commandLine,
+          exitCode: e.exitCode as number,
+          timestamp: Date.now(),
+        };
+        if (!shouldOfferAssist(lastAssistOffer, signature)) {
+          return;
+        }
+        lastAssistOffer = signature;
+
+        const shortCommand = commandLine.length > 60 ? `${commandLine.slice(0, 60)}...` : commandLine;
+        vscode.window.showInformationMessage(`Command failed (exit ${e.exitCode}): ${shortCommand}`, "Ask CodePartner")
+          .then((choice) => {
+            if (choice === "Ask CodePartner") {
+              const cleaned = stripAnsiCodes(capturedOutput);
+              provider.submitExternalPrompt(buildAssistPrompt(commandLine, e.exitCode as number, cleaned));
+            }
+          });
+      })
+    );
+  } catch (e: any) {
+    output.appendLine(`[CodePartner] Terminal inline assist unavailable (shell integration API not present in this VS Code version): ${e.message}`);
+  }
 
   // ── Inline Completion Provider ──
   const inlineProvider = new CodePartnerInlineCompletionProvider(context, output);
@@ -929,6 +1057,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private architectDrafts: Map<string, string> = new Map();
   /** The persistent, user-visible terminal used by run_in_terminal (Phase: interactive terminal). Distinct from the hidden spawned processes runCommand/runTests use. */
   private visibleTerminal?: vscode.Terminal;
+
+  /** True if `terminal` is the one CodePartner itself created via run_in_terminal — used by the terminal inline assistant's "codepartner-only" scope. */
+  public isOwnTerminal(terminal: vscode.Terminal): boolean {
+    return terminal === this.visibleTerminal;
+  }
   /** The currently in-flight shell command / test run, if any — killed on cancel (Phase 2.1/2.2). */
   private runningChildProcess?: cp.ChildProcess;
   private gitManager: GitManager;
@@ -1029,6 +1162,19 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     // Small delay to let webview initialize
     await new Promise(r => setTimeout(r, 300));
     this.handleSlashCommand(command);
+  }
+
+  /**
+   * Reveals the sidebar and submits a full prompt as if the user had
+   * typed and sent it — used by the terminal inline assistant's "Ask
+   * CodePartner" action. Mirrors executeSlashCommand's reveal-then-wait
+   * pattern, but calls handlePrompt directly since this is a full prompt
+   * (a failed command + its output), not a "/command" shorthand.
+   */
+  public async submitExternalPrompt(promptText: string): Promise<void> {
+    await vscode.commands.executeCommand("workbench.view.extension.codepartner-view-container");
+    await new Promise(r => setTimeout(r, 300));
+    this.handlePrompt(promptText);
   }
 
   public updateStatus(msg: string) {

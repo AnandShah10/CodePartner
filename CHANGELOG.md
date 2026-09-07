@@ -4,6 +4,21 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.5] - 2024-11-09
+### Changed
+- Final lint compliance pass on terminal inline assistant (`src/terminalAssist.ts`): added braces to all `if` statements in `isFailureWorthAssisting()`, `shouldOfferAssist()` (and updated `buildAssistPrompt` comment style for consistency)
+- ESLint `curly` rule upgraded from `"warn"` to `"error"` in `eslint.config.mjs` now that **all** bracing issues (94 total) across the codebase have been resolved
+- Version bumped to **2.1.5**; README badge, bottom note, feature table, and comparison analysis synchronized
+- Pretest sequence and `.vscode-test.mjs` refined for faster, more reliable test runs (pinned VS Code version, increased timeouts, GPU/extension disables)
+
+### Added
+- Robust test runner configuration for CI-like environments (handles OneDrive paths, network flakiness)
+
+### Fixed
+- Remaining `curly` lint violations specific to terminal assistant decision logic (failure detection, offer deduplication, prompt building)
+- Test runner flakiness (`spawnSync cmd.exe ETIMEDOUT`, path issues with spaces/dashes)
+- Documentation parity for lint compliance, test stability, embeddings guidance, Architect Mode, Timeline undo, MCP, context compaction, approval system, and hybrid semantic search
+
 ## [2.1.4] - 2024-11-08
 ### Changed
 - Version alignment across `package.json` (now **2.1.4**), README badge, CHANGELOG, and comparison analysis
