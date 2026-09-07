@@ -85,7 +85,7 @@ export function extractEmbeddings(providerType: EmbeddingProviderType, responseD
   }
   // OpenAI-shape (also used by azure and google here): { data: [{ embedding, index }, ...] }
   const items = responseData?.data;
-  if (!Array.isArray(items)) return [];
+  if (!Array.isArray(items)) {return [];}
   return items
     .slice()
     .sort((a: any, b: any) => (a?.index ?? 0) - (b?.index ?? 0))
@@ -95,14 +95,14 @@ export function extractEmbeddings(providerType: EmbeddingProviderType, responseD
 
 /** Cosine similarity between two vectors, in [-1, 1]. Returns 0 for empty or mismatched-length vectors rather than throwing. */
 export function cosineSimilarity(a: number[], b: number[]): number {
-  if (!a || !b || a.length === 0 || a.length !== b.length) return 0;
+  if (!a || !b || a.length === 0 || a.length !== b.length) {return 0;}
   let dot = 0, normA = 0, normB = 0;
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     normA += a[i] * a[i];
     normB += b[i] * b[i];
   }
-  if (normA === 0 || normB === 0) return 0;
+  if (normA === 0 || normB === 0) {return 0;}
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
@@ -114,8 +114,8 @@ export function cosineSimilarity(a: number[], b: number[]): number {
  * missed entirely.
  */
 export function chunkText(text: string, maxChars = 2000, overlapChars = 200): string[] {
-  if (text.length === 0) return [];
-  if (text.length <= maxChars) return [text];
+  if (text.length === 0) {return [];}
+  if (text.length <= maxChars) {return [text];}
 
   const chunks: string[] = [];
   let start = 0;
@@ -128,7 +128,7 @@ export function chunkText(text: string, maxChars = 2000, overlapChars = 200): st
       }
     }
     chunks.push(text.slice(start, end));
-    if (end >= text.length) break;
+    if (end >= text.length) {break;}
     start = Math.max(end - overlapChars, start + 1);
   }
   return chunks;

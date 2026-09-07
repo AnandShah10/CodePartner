@@ -3,14 +3,14 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.1.3",
+  "version": "2.1.4",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/AnandShah10/CodePartner.git"
   },
   "engines": {
-    "vscode": "^1.86.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "AI",
@@ -165,7 +165,12 @@
         },
         "codepartner.approvalPolicy": {
           "type": "string",
-          "enum": ["always-ask", "ask-for-shell", "full-auto", "yolo"],
+          "enum": [
+            "always-ask",
+            "ask-for-shell",
+            "full-auto",
+            "yolo"
+          ],
           "enumDescriptions": [
             "Confirm every shell command, file edit/creation, and git commit/branch/PR before running it.",
             "Only confirm shell commands. File edits and git operations run without a prompt.",
@@ -187,7 +192,14 @@
         },
         "codepartner.embeddingProvider": {
           "type": "string",
-          "enum": ["disabled", "same-as-chat", "openai", "azure", "google", "ollama"],
+          "enum": [
+            "disabled",
+            "same-as-chat",
+            "openai",
+            "azure",
+            "google",
+            "ollama"
+          ],
           "enumDescriptions": [
             "@workspace uses TF-IDF (term-frequency ranked keyword search) only — the default, no extra API calls or cost.",
             "Use real embeddings from whatever codepartner.provider is already configured. Falls back to TF-IDF if that's Anthropic (no embeddings endpoint).",
@@ -295,7 +307,7 @@
     "@types/markdown-it": "^14.1.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "^22.19.11",
-    "@types/vscode": "^1.86.0",
+    "@types/vscode": "^1.93.0",
     "@vscode/test-cli": "^0.0.11",
     "@vscode/test-electron": "^2.5.2",
     "esbuild": "^0.27.2",

@@ -42,7 +42,7 @@ const PATTERNS: Pattern[] = [
  * array when nothing is found.
  */
 export function scanForSecrets(text: string): SecretFinding[] {
-  if (!text) return [];
+  if (!text) {return [];}
   const findings: SecretFinding[] = [];
   const seen = new Set<string>();
 
@@ -52,11 +52,11 @@ export function scanForSecrets(text: string): SecretFinding[] {
     while ((match = regex.exec(text)) !== null) {
       const raw = match[0];
       const key = `${label}:${raw}`;
-      if (seen.has(key)) continue;
+      if (seen.has(key)) {continue;}
       seen.add(key);
       findings.push({ label, preview: redact(raw) });
       // Guard against pathological input / catastrophic match counts.
-      if (findings.length > 25) return findings;
+      if (findings.length > 25) {return findings;}
     }
   }
 
@@ -66,7 +66,7 @@ export function scanForSecrets(text: string): SecretFinding[] {
 /** Redacts a matched string down to a short, non-reversible preview. */
 function redact(value: string): string {
   const trimmed = value.trim();
-  if (trimmed.length <= 8) return "****";
+  if (trimmed.length <= 8) {return "****";}
   return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
 }
 
@@ -75,7 +75,7 @@ function redact(value: string): string {
  * a status/warning message. Returns "" when there's nothing to report.
  */
 export function summarizeFindings(findings: SecretFinding[], sourceLabel: string): string {
-  if (findings.length === 0) return "";
+  if (findings.length === 0) {return "";}
   const labels = Array.from(new Set(findings.map((f) => f.label)));
   const labelText = labels.length <= 3 ? labels.join(", ") : `${labels.slice(0, 3).join(", ")}, +${labels.length - 3} more`;
   return `⚠️ Possible secret detected in ${sourceLabel} (${labelText}) — it was still included. Consider removing it before continuing.`;

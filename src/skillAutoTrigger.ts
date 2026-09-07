@@ -28,11 +28,11 @@ function stem(word: string): string {
   // to stop "component" / "components" or "write" / "writing" from being
   // treated as unrelated tokens, which was a real false-negative source
   // in testing before this was added.
-  if (word.endsWith("ies") && word.length > 4) return word.slice(0, -3) + "y";
-  if (word.endsWith("ing") && word.length > 5) return word.slice(0, -3);
-  if (word.endsWith("ed") && word.length > 4) return word.slice(0, -2);
-  if (word.endsWith("es") && word.length > 4) return word.slice(0, -2);
-  if (word.endsWith("s") && !word.endsWith("ss") && word.length > 3) return word.slice(0, -1);
+  if (word.endsWith("ies") && word.length > 4) {return word.slice(0, -3) + "y";}
+  if (word.endsWith("ing") && word.length > 5) {return word.slice(0, -3);}
+  if (word.endsWith("ed") && word.length > 4) {return word.slice(0, -2);}
+  if (word.endsWith("es") && word.length > 4) {return word.slice(0, -2);}
+  if (word.endsWith("s") && !word.endsWith("ss") && word.length > 3) {return word.slice(0, -1);}
   return word;
 }
 
@@ -59,10 +59,10 @@ function tokenize(text: string): Set<string> {
 export function scoreSkillRelevance(prompt: string, skill: SkillSummary): number {
   const promptTerms = tokenize(prompt);
   const skillTerms = tokenize(`${skill.name} ${skill.description}`);
-  if (skillTerms.size === 0 || promptTerms.size === 0) return 0;
+  if (skillTerms.size === 0 || promptTerms.size === 0) {return 0;}
   let matches = 0;
   for (const term of skillTerms) {
-    if (promptTerms.has(term)) matches++;
+    if (promptTerms.has(term)) {matches++;}
   }
   const denom = Math.min(promptTerms.size, skillTerms.size);
   return matches / denom;
@@ -73,7 +73,7 @@ function countMatches(prompt: string, skill: SkillSummary): number {
   const skillTerms = tokenize(`${skill.name} ${skill.description}`);
   let matches = 0;
   for (const term of skillTerms) {
-    if (promptTerms.has(term)) matches++;
+    if (promptTerms.has(term)) {matches++;}
   }
   return matches;
 }

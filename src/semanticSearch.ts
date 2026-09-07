@@ -203,7 +203,7 @@ export class SemanticSearch {
    * every subsequent file — TF-IDF keeps working regardless.
    */
   private async buildEmbeddingIndex(): Promise<void> {
-    if (!this.embeddingConfig) return;
+    if (!this.embeddingConfig) {return;}
     const config = this.embeddingConfig;
     let firstCallAttempted = false;
 
@@ -215,7 +215,7 @@ export class SemanticSearch {
       }
 
       const pieces = chunkText(doc.content, 2000, 200);
-      if (pieces.length === 0) continue;
+      if (pieces.length === 0) {continue;}
 
       try {
         const vectors = await this.embedTexts(config, pieces);
@@ -271,7 +271,7 @@ export class SemanticSearch {
       });
       const res = await axios.post(url, body, { headers, timeout: 20000 });
       const extracted = extractEmbeddings(config.providerType, res.data);
-      if (extracted.length > 0) vectors.push(extracted[0]);
+      if (extracted.length > 0) {vectors.push(extracted[0]);}
     }
     return vectors;
   }
@@ -281,9 +281,9 @@ export class SemanticSearch {
     query: string,
     topN: number
   ): Promise<{ path: string; score: number; excerpt: string }[]> {
-    if (!this.embeddingConfig) return [];
+    if (!this.embeddingConfig) {return [];}
     const queryVectors = await this.embedTexts(this.embeddingConfig, [query]);
-    if (queryVectors.length === 0) return [];
+    if (queryVectors.length === 0) {return [];}
     const queryVector = queryVectors[0];
 
     const bestPerFile = new Map<string, { score: number; excerpt: string }>();

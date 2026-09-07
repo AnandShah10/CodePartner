@@ -4,6 +4,17 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.4] - 2024-11-08
+### Changed
+- Version alignment across `package.json` (now **2.1.4**), README badge, CHANGELOG, and comparison analysis
+- Documentation and feature notes refreshed to reflect stable v2.1.3 embeddings implementation now shipping in 2.1.4
+- Updated "Smart Context" and configuration sections in README with clearer embeddings guidance
+
+### Fixed
+- 93 ESLint `curly` warnings (added consistent braces to all `if`/`for` statements in `embeddings.ts`, `semanticSearch.ts`, `extension.ts`, and supporting modules)
+- Test runner flakiness (network timeout on `@vscode/test-electron` download during CI-like runs; pretest now succeeds cleanly)
+- Minor version drift and doc inconsistencies from the embeddings rollout
+
 ## [2.1.3] - 2024-11-07
 ### Added
 - Real **embedding-based semantic search** (`src/embeddings.ts` + upgraded `SemanticSearch`)

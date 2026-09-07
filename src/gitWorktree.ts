@@ -33,7 +33,7 @@ export function createWorktree(repoRoot: string, worktreePath: string, branchNam
 /** Removes a worktree (does not delete its branch). `force` discards uncommitted changes in it. */
 export function removeWorktree(repoRoot: string, worktreePath: string, force = true): { ok: true } | { ok: false; error: string } {
   const args = ["worktree", "remove", worktreePath];
-  if (force) args.push("--force");
+  if (force) {args.push("--force");}
   const result = runGit(args, repoRoot);
   return result.ok ? { ok: true } : { ok: false, error: result.error };
 }
@@ -41,21 +41,21 @@ export function removeWorktree(repoRoot: string, worktreePath: string, force = t
 /** Lists files changed on `branchName` relative to `baseBranch`, for a post-run summary. */
 export function getBranchDiffStat(repoRoot: string, baseBranch: string, branchName: string): { ok: true; summary: string } | { ok: false; error: string } {
   const result = runGit(["diff", "--stat", `${baseBranch}...${branchName}`], repoRoot);
-  if (!result.ok) return { ok: false, error: result.error };
+  if (!result.ok) {return { ok: false, error: result.error };}
   return { ok: true, summary: result.output.trim() || "(no changes)" };
 }
 
 /** Commits any uncommitted changes in a worktree, if there are any. Called before worktree removal so an agent's work is never silently discarded. */
 export function commitAllIfDirty(worktreePath: string, message: string): { ok: true; committed: boolean } | { ok: false; error: string } {
   const status = runGit(["status", "--porcelain"], worktreePath);
-  if (!status.ok) return { ok: false, error: status.error };
+  if (!status.ok) {return { ok: false, error: status.error };}
   if (status.output.trim() === "") {
     return { ok: true, committed: false };
   }
   const add = runGit(["add", "-A"], worktreePath);
-  if (!add.ok) return { ok: false, error: add.error };
+  if (!add.ok) {return { ok: false, error: add.error };}
   const commit = runGit(["commit", "-q", "-m", message], worktreePath);
-  if (!commit.ok) return { ok: false, error: commit.error };
+  if (!commit.ok) {return { ok: false, error: commit.error };}
   return { ok: true, committed: true };
 }
 

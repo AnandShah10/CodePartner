@@ -20,7 +20,7 @@ export interface RepairResult {
 
 /** Returns the parsed value on success (repaired or not), or null if unrecoverable. */
 export function repairJsonParse(raw: string): RepairResult | null {
-  if (!raw || !raw.trim()) return null;
+  if (!raw || !raw.trim()) {return null;}
 
   try {
     return { value: JSON.parse(raw), repaired: false };
@@ -76,15 +76,15 @@ function balanceBrackets(s: string): string {
   let escaped = false;
   for (const ch of s) {
     if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === '"') inString = false;
+      if (escaped) {escaped = false;}
+      else if (ch === "\\") {escaped = true;}
+      else if (ch === '"') {inString = false;}
       continue;
     }
     if (ch === '"') { inString = true; continue; }
-    if (ch === "{" || ch === "[") stack.push(ch);
-    else if (ch === "}") { if (stack[stack.length - 1] === "{") stack.pop(); }
-    else if (ch === "]") { if (stack[stack.length - 1] === "[") stack.pop(); }
+    if (ch === "{" || ch === "[") {stack.push(ch);}
+    else if (ch === "}") { if (stack[stack.length - 1] === "{") {stack.pop();} }
+    else if (ch === "]") { if (stack[stack.length - 1] === "[") {stack.pop();} }
   }
   let result = s;
   while (stack.length) {

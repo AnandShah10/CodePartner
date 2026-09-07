@@ -39,9 +39,9 @@ const MODEL_PATTERNS: Array<{ pattern: RegExp; metadata: ModelMetadata }> = [
 
 /** Returns known metadata for a model id via pattern match, or null if unrecognized. */
 export function getModelMetadata(modelId: string): ModelMetadata | null {
-  if (!modelId) return null;
+  if (!modelId) {return null;}
   for (const { pattern, metadata } of MODEL_PATTERNS) {
-    if (pattern.test(modelId)) return metadata;
+    if (pattern.test(modelId)) {return metadata;}
   }
   return null;
 }

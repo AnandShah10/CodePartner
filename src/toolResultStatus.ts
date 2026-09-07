@@ -13,13 +13,13 @@
  * preview" ask was actually about.
  */
 export function isToolResultSuccess(result: unknown): boolean {
-  if (typeof result !== "string") return true;
-  if (result.startsWith("Error")) return false;
-  if (result.startsWith("Denied:")) return false;
-  if (/^Command timed out/.test(result)) return false;
-  if (/^Tests timed out/.test(result)) return false;
-  if (/^Tests failed/.test(result)) return false;
+  if (typeof result !== "string") {return true;}
+  if (result.startsWith("Error")) {return false;}
+  if (result.startsWith("Denied:")) {return false;}
+  if (/^Command timed out/.test(result)) {return false;}
+  if (/^Tests timed out/.test(result)) {return false;}
+  if (/^Tests failed/.test(result)) {return false;}
   const exitCodeMatch = result.match(/^Exit code: (-?\d+)/);
-  if (exitCodeMatch && parseInt(exitCodeMatch[1], 10) !== 0) return false;
+  if (exitCodeMatch && parseInt(exitCodeMatch[1], 10) !== 0) {return false;}
   return true;
 }

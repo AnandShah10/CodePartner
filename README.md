@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.1.3-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.1.4-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.86.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -40,7 +40,7 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 - Context compaction (LLM summarization when history >40 messages)
 - Token-aware budgeting and truncation (shared across all sources)
 - Image/file attachments support
-- **New in v2.1.3**: `embeddings.ts` with provider-agnostic request builder, cosine similarity, smart chunking+overlap, content-hash caching, and automatic TF-IDF fallback
+- **New in v2.1.3**: Real embedding-based `@workspace` search via `embeddings.ts` (provider-agnostic for OpenAI/Azure/Google/Ollama, cosine similarity, chunking with overlap, content-hash caching, graceful TF-IDF fallback)
 
 ### 🎨 Premium UX
 - Beautiful glassmorphism sidebar with tabs (Chat, Plan, Timeline, Artifacts, Skills)
@@ -97,7 +97,7 @@ Key settings (full list in VS Code Settings → search "codepartner"):
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `codepartner.provider` | `openai` | LLM provider (`openai`, `azure`, `anthropic`, `google`, `ollama`) |
-| `codepartner.embeddingProvider` | `disabled` | **New v2.1.3**: Upgrade `@workspace` to real embeddings (`same-as-chat` / `openai` / `azure` / `google` / `ollama`). Falls back to TF-IDF automatically. |
+| `codepartner.embeddingProvider` | `disabled` | **New in v2.1.3**: Upgrade `@workspace` to real neural embeddings (`same-as-chat` / `openai` / `azure` / `google` / `ollama`). Defaults to zero-cost TF-IDF with automatic fallback on errors. |
 | `codepartner.embeddingModel` | `` | Embedding model (blank = sensible default per provider) |
 | `codepartner.embeddingEndpoint` | `` | Custom embeddings endpoint (blank = provider default) |
 | `codepartner.apiKey` | `` | Set via **"CodePartner: Set API Key"** command (secure SecretStorage) |
@@ -164,7 +164,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.1.3** — **real embedding-based semantic search** for `@workspace` (opt-in via `embeddingProvider`, with automatic TF-IDF fallback), new config options, plus all prior improvements from v2.1.2 (worktree-isolated parallel agents, new commands, Architect Mode refinements). See [CHANGELOG.md](CHANGELOG.md) for the full history.
+**Note**: Now at **v2.1.4** — includes real **embedding-based semantic search** for `@workspace` (opt-in via `codepartner.embeddingProvider`, with automatic graceful TF-IDF fallback on any error), full unit tests in `embeddings.test.ts`, lint compliance, and all prior v2.1.x improvements. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ---
 

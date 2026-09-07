@@ -71,12 +71,12 @@ export interface ProviderRequest {
 function buildOpenAIMessages(messages: ProviderMessage[], useSystemRole: boolean): any[] {
   return messages.map((m) => {
     const msg: any = { role: m.role === "system" && !useSystemRole ? "user" : m.role, content: m.content };
-    if (m.tool_calls) msg.tool_calls = m.tool_calls;
+    if (m.tool_calls) {msg.tool_calls = m.tool_calls;}
     if (m.tool_call_id) {
       msg.tool_call_id = m.tool_call_id;
-      if (m.name) msg.name = m.name;
+      if (m.name) {msg.name = m.name;}
     }
-    if (m.name && m.role !== "tool") msg.name = m.name;
+    if (m.name && m.role !== "tool") {msg.name = m.name;}
     return msg;
   });
 }
@@ -84,7 +84,7 @@ function buildOpenAIMessages(messages: ProviderMessage[], useSystemRole: boolean
 function buildAnthropicMessages(messages: ProviderMessage[]): any[] {
   const anthropicMessages: any[] = [];
   for (const m of messages) {
-    if (m.role === "system") continue;
+    if (m.role === "system") {continue;}
 
     if (m.role === "tool") {
       anthropicMessages.push({
@@ -97,7 +97,7 @@ function buildAnthropicMessages(messages: ProviderMessage[]): any[] {
       });
     } else if (m.role === "assistant" && m.tool_calls) {
       const contentBlocks: any[] = [];
-      if (m.content) contentBlocks.push({ type: "text", text: m.content });
+      if (m.content) {contentBlocks.push({ type: "text", text: m.content });}
       for (const tc of m.tool_calls) {
         let parsedInput = {};
         try { parsedInput = JSON.parse(tc.function.arguments); } catch { parsedInput = {}; }
@@ -153,12 +153,12 @@ export function buildProviderRequest(opts: ProviderRequestOptions): ProviderRequ
       max_tokens: maxTokens,
       messages: buildAnthropicMessages(messages),
     };
-    if (temperature !== undefined) body.temperature = temperature;
-    if (stream) body.stream = true;
+    if (temperature !== undefined) {body.temperature = temperature;}
+    if (stream) {body.stream = true;}
 
     const sysMsg = messages.find((m) => m.role === "system");
-    if (sysMsg) body.system = sysMsg.content;
-    if (tools && tools.length > 0) body.tools = toAnthropicTools(tools);
+    if (sysMsg) {body.system = sysMsg.content;}
+    if (tools && tools.length > 0) {body.tools = toAnthropicTools(tools);}
 
     return { url, headers, body };
   }
@@ -167,7 +167,7 @@ export function buildProviderRequest(opts: ProviderRequestOptions): ProviderRequ
   // OpenAI-compatible endpoint.
   const openaiMessages = buildOpenAIMessages(messages, useSystemRole);
   const body: Record<string, unknown> = { messages: openaiMessages, max_tokens: maxTokens };
-  if (temperature !== undefined) body.temperature = temperature;
+  if (temperature !== undefined) {body.temperature = temperature;}
   if (stream) {
     body.stream = true;
     // Ask for a final usage-summary chunk (Phase 4.1's status bar token
@@ -262,11 +262,11 @@ export function extractAssistantMessage(providerType: string, responseData: any)
     const textBlocks = (responseData?.content || []).filter((b: any) => b?.type === "text").map((b: any) => b.text);
     const content = textBlocks.length > 0 ? textBlocks.join("\n") : null;
     const msg: ProviderMessage = { role: "assistant", content };
-    if (toolCalls.length > 0) msg.tool_calls = toolCalls;
+    if (toolCalls.length > 0) {msg.tool_calls = toolCalls;}
     return msg;
   }
   const message = responseData?.choices?.[0]?.message || {};
   const msg: ProviderMessage = { role: "assistant", content: message.content ?? null };
-  if (toolCalls.length > 0) msg.tool_calls = toolCalls;
+  if (toolCalls.length > 0) {msg.tool_calls = toolCalls;}
   return msg;
 }

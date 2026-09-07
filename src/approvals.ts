@@ -23,6 +23,7 @@ export type GatedCategory = "shell" | "file-write" | "git-write";
 /** Tool names that require an approval gate, and which category they fall into. */
 export const GATED_TOOLS: Record<string, GatedCategory> = {
   run_command: "shell",
+  run_in_terminal: "shell",
   edit_file: "file-write",
   create_file: "file-write",
   commit_git_changes: "git-write",
@@ -55,6 +56,8 @@ export function describeToolCall(name: string, args: any): string {
   switch (name) {
     case "run_command":
       return `Run shell command:\n${args?.command ?? "(no command given)"}`;
+    case "run_in_terminal":
+      return `Run in a visible terminal${args?.background ? " (background)" : ""}:\n${args?.command ?? "(no command given)"}`;
     case "edit_file":
       return `Edit file: ${args?.path ?? "(unknown path)"}`;
     case "create_file":

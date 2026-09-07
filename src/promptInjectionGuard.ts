@@ -36,9 +36,9 @@ export class UntrustedContentTracker {
 
   /** True if argsText closely echoes any tracked untrusted content. */
   matches(argsText: string): boolean {
-    if (!argsText) return false;
+    if (!argsText) {return false;}
     const normalizedArgs = normalize(argsText);
-    if (normalizedArgs.length < MIN_OVERLAP) return false;
+    if (normalizedArgs.length < MIN_OVERLAP) {return false;}
     for (const chunk of this.chunks) {
       if (hasSharedSubstring(normalizedArgs, normalize(chunk), MIN_OVERLAP)) {
         return true;

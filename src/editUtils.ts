@@ -79,6 +79,6 @@ export function applyEdit(originalContent: string, search: string, replace: stri
 }
 
 function countOccurrences(haystack: string, needle: string): number {
-  if (needle.length === 0) return 0;
+  if (needle.length === 0) {return 0;}
   return haystack.split(needle).length - 1;
 }

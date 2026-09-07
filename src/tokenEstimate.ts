@@ -16,7 +16,7 @@
 
 /** Rough token-count estimate for `text`. Not exact — see module doc comment. */
 export function estimateTokens(text: string): number {
-  if (!text) return 0;
+  if (!text) {return 0;}
   const charEstimate = text.length / 4;
   const wordCount = text.split(/\s+/).filter(Boolean).length;
   const wordEstimate = wordCount * 1.3;

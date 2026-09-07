@@ -25,6 +25,6 @@ export const SUBAGENT_TOOL_SCOPES: Record<string, string[]> = {
 /** Filters a full tool list down to what `agentType` is allowed to use. An unrecognized type gets no tools (text-only). */
 export function getScopedTools<T extends { name: string }>(agentType: string, allTools: T[]): T[] {
   const scope = SUBAGENT_TOOL_SCOPES[agentType];
-  if (!scope) return [];
+  if (!scope) {return [];}
   return allTools.filter((t) => scope.includes(t.name));
 }

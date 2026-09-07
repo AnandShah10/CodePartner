@@ -45,8 +45,8 @@ export function diffLines(oldText: string, newText: string): DiffLine[] {
   if (n * m > MAX_LCS_CELLS) {
     // Fall back to a flat replace rather than hang on a huge file.
     const result: DiffLine[] = [];
-    for (const l of oldLines) result.push({ type: "remove", value: l });
-    for (const l of newLines) result.push({ type: "add", value: l });
+    for (const l of oldLines) {result.push({ type: "remove", value: l });}
+    for (const l of newLines) {result.push({ type: "add", value: l });}
     return result;
   }
 
@@ -88,14 +88,14 @@ export function groupIntoHunks(lines: DiffLine[], context = 3): Hunk[] {
   let curStart = -1;
   for (let idx = 0; idx < lines.length; idx++) {
     if (lines[idx].type !== "context") {
-      if (curStart === -1) curStart = idx;
+      if (curStart === -1) {curStart = idx;}
     } else if (curStart !== -1) {
       changeRanges.push([curStart, idx]);
       curStart = -1;
     }
   }
-  if (curStart !== -1) changeRanges.push([curStart, lines.length]);
-  if (changeRanges.length === 0) return [];
+  if (curStart !== -1) {changeRanges.push([curStart, lines.length]);}
+  if (changeRanges.length === 0) {return [];}
 
   const merged: Array<[number, number]> = [];
   for (const [s, e] of changeRanges) {
@@ -139,7 +139,7 @@ export function groupIntoHunks(lines: DiffLine[], context = 3): Hunk[] {
 export function applyAcceptedHunks(allLines: DiffLine[], hunks: Hunk[], acceptedHunkIds: Set<string>): string {
   const owner = new Array(allLines.length).fill(-1);
   hunks.forEach((h, hi) => {
-    for (let i = h.coreRange[0]; i < h.coreRange[1]; i++) owner[i] = hi;
+    for (let i = h.coreRange[0]; i < h.coreRange[1]; i++) {owner[i] = hi;}
   });
 
   const output: string[] = [];
@@ -152,9 +152,9 @@ export function applyAcceptedHunks(allLines: DiffLine[], hunks: Hunk[], accepted
     const hi = owner[i];
     const accepted = hi !== -1 && acceptedHunkIds.has(hunks[hi].id);
     if (line.type === "add") {
-      if (accepted) output.push(line.value);
+      if (accepted) {output.push(line.value);}
     } else if (line.type === "remove") {
-      if (!accepted) output.push(line.value);
+      if (!accepted) {output.push(line.value);}
     }
   }
   return output.join("\n");

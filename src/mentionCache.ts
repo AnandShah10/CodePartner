@@ -28,7 +28,7 @@ export function filterCachedFiles(files: CachedFile[], query: string, maxResults
   for (const f of files) {
     if (f.relPath.toLowerCase().includes(q)) {
       results.push(f);
-      if (results.length >= maxResults) break;
+      if (results.length >= maxResults) {break;}
     }
   }
   return results;
@@ -36,6 +36,6 @@ export function filterCachedFiles(files: CachedFile[], query: string, maxResults
 
 /** True if a cache entry is still fresh enough to use without a re-scan. */
 export function isCacheFresh(state: MentionCacheState | null, maxAgeMs: number, now: number = Date.now()): boolean {
-  if (!state) return false;
+  if (!state) {return false;}
   return now - state.fetchedAt < maxAgeMs;
 }

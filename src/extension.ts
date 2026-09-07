@@ -27,6 +27,7 @@ import { isToolResultSuccess } from "./toolResultStatus";
 import { extractUsageFromStreamEvent, formatTokenCount } from "./usageExtraction";
 import { getModelMetadata, formatContextWindow } from "./modelMetadata";
 import { createWorktree, removeWorktree, getBranchDiffStat, commitAllIfDirty, toBranchSafeSegment } from "./gitWorktree";
+import { stripAnsiCodes } from "./ansiStrip";
 
 import { API_KEY_SECRET_KEY } from "./secretKeys";
 
@@ -375,8 +376,20 @@ Do NOT use "run_command" unless explicitly asked. Focus on generating code chang
 const TOOLS = [
   {
     name: "run_command",
-    description: "Run a shell command in the workspace root.",
+    description: "Run a shell command in the workspace root, hidden from the user (runs in a spawned background process, not a visible terminal). Use this for routine commands. For anything the user should watch or might want to type into — dev servers, watch/build processes, interactive CLIs — use run_in_terminal instead.",
     parameters: { type: "object", properties: { command: { type: "string", description: "The command to run." } }, required: ["command"] },
+  },
+  {
+    name: "run_in_terminal",
+    description: "Runs a command in a VISIBLE terminal panel the user can see and interact with, unlike run_command which runs hidden. Use this for dev servers, watch/build processes, interactive CLIs, or anything long-running or worth the user's attention. Set background=true for a command that doesn't exit on its own (e.g. a dev server) to start it and return immediately without waiting for it to finish. Output/exit-code capture depends on VS Code's shell integration being available for the user's shell — when it isn't, the command still runs visibly but output can't be captured automatically.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The command to run." },
+        background: { type: "boolean", description: "If true, start the command and return immediately without waiting for it to finish (for servers/watchers that run indefinitely). Default false." },
+      },
+      required: ["command"],
+    },
   },
   {
     name: "list_dir",
@@ -914,7 +927,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private executionMode: "planning" | "fast" | "architect" = "fast";
   private skillManager?: SkillManager;
   private architectDrafts: Map<string, string> = new Map();
-  private terminal?: vscode.Terminal;
+  /** The persistent, user-visible terminal used by run_in_terminal (Phase: interactive terminal). Distinct from the hidden spawned processes runCommand/runTests use. */
+  private visibleTerminal?: vscode.Terminal;
   /** The currently in-flight shell command / test run, if any — killed on cancel (Phase 2.1/2.2). */
   private runningChildProcess?: cp.ChildProcess;
   private gitManager: GitManager;
@@ -1043,7 +1057,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
    * than a dollar-cost estimate).
    */
   private updateTokenStatusBar(): void {
-    if (!this.tokenStatusBarItem) return;
+    if (!this.tokenStatusBarItem) {return;}
     const total = this.sessionTokenUsage.input + this.sessionTokenUsage.output;
     if (total === 0) {
       this.tokenStatusBarItem.hide();
@@ -1118,7 +1132,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
    */
   private warnIfSecrets(text: string, sourceLabel: string): void {
     const findings = scanForSecrets(text);
-    if (findings.length === 0) return;
+    if (findings.length === 0) {return;}
     const summary = summarizeFindings(findings, sourceLabel);
     this.output.appendLine(`[CodePartner] ${summary}`);
     this._view?.webview.postMessage({ type: "status", value: summary });
@@ -2344,7 +2358,7 @@ Provide a concise, high-quality result.`;
    * Compact the conversation context by summarizing old messages.
    */
   private async compactContext() {
-    if (this.messageHistory.length < 15) return;
+    if (this.messageHistory.length < 15) {return;}
 
     this.output.appendLine("[CodePartner] Compacting context...");
     this.updateStatus("🗜️ Compacting context...");
@@ -2522,7 +2536,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const availableSkills = this.skillManager.listSkills();
       const autoSkills = findAutoTriggeredSkills(prompt, availableSkills);
       for (const s of autoSkills) {
-        if (contextBudget.remaining <= 0) break;
+        if (contextBudget.remaining <= 0) {break;}
         const skillContent = this.skillManager.useSkill(s.name);
         const { text: cappedSkill, truncated } = truncateToTokenBudget(skillContent, contextBudget.remaining);
         contextBudget.remaining -= estimateTokens(cappedSkill);
@@ -2661,8 +2675,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
               // additive, doesn't affect existing content/tool_call parsing.
               const usage = extractUsageFromStreamEvent(providerType, parsed);
               if (usage) {
-                if (usage.inputTokens !== undefined) turnInputTokens = usage.inputTokens;
-                if (usage.outputTokens !== undefined) turnOutputTokens = usage.outputTokens;
+                if (usage.inputTokens !== undefined) {turnInputTokens = usage.inputTokens;}
+                if (usage.outputTokens !== undefined) {turnOutputTokens = usage.outputTokens;}
               }
 
               // Anthropic format
@@ -2726,8 +2740,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
         // Phase 4.1: accumulate real token usage into the session total
         // and refresh the status bar.
-        if (turnInputTokens !== undefined) this.sessionTokenUsage.input += turnInputTokens;
-        if (turnOutputTokens !== undefined) this.sessionTokenUsage.output += turnOutputTokens;
+        if (turnInputTokens !== undefined) {this.sessionTokenUsage.input += turnInputTokens;}
+        if (turnOutputTokens !== undefined) {this.sessionTokenUsage.output += turnOutputTokens;}
         this.updateTokenStatusBar();
 
         let shouldBreakLoop = false;
@@ -2858,7 +2872,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
               const errorData = JSON.parse(rawBody);
               msg = errorData?.error?.message || errorData?.message || errorData?.error?.type || msg;
             } catch {
-              if (rawBody.length > 0) msg = rawBody.substring(0, 500);
+              if (rawBody.length > 0) {msg = rawBody.substring(0, 500);}
             }
           } catch (e) {
             this.output.appendLine(`[CodePartner] Failed to read error stream: ${e}`);
@@ -2980,6 +2994,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     switch (name) {
       case "run_command":
         return this.runCommand(args.command, rootOverride);
+      case "run_in_terminal":
+        return this.runInTerminal(args.command, !!args.background, rootOverride);
       case "list_dir":
         return this.listDir(args.path, rootOverride);
       case "read_file":
@@ -3153,7 +3169,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       this.runningChildProcess = child;
 
       const finish = (message: string) => {
-        if (settled) return;
+        if (settled) {return;}
         settled = true;
         clearTimeout(timeoutHandle);
         if (this.runningChildProcess === child) {
@@ -3182,6 +3198,117 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         finish(`Exit code: ${code}\n${combined || "(no output)"}`);
       });
     });
+  }
+
+  /**
+   * Runs a command in a VISIBLE VS Code terminal (unlike runCommand,
+   * which is deliberately hidden — spawned, not shown), for anything the
+   * user should watch or might want to type into: dev servers, watchers,
+   * interactive CLIs.
+   *
+   * VERIFICATION NOTE: this uses VS Code's Terminal Shell Integration API
+   * (Terminal.shellIntegration, TerminalShellExecution.read(),
+   * onDidChangeTerminalShellIntegration, onDidEndTerminalShellExecution),
+   * which stabilized in VS Code 1.93 — this extension's minimum version
+   * was bumped accordingly (see package.json). I could not compile this
+   * against real @vscode/types or run it against a live VS Code instance
+   * in this sandbox (no network access to install the updated typings),
+   * so the exact shape of these APIs is written from documented,
+   * remembered behavior, not verified. Every call into it is
+   * feature-detected and wrapped so a wrong assumption here degrades to
+   * the plain sendText fallback (command still runs visibly, just
+   * without captured output/exit code) rather than throwing — please
+   * test this specifically against a real VS Code 1.93+ before relying
+   * on captured output/exit codes from it.
+   */
+  private async runInTerminal(command: string, background: boolean, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return "No workspace open.";
+    }
+
+    if (!this.visibleTerminal || this.visibleTerminal.exitStatus !== undefined) {
+      this.visibleTerminal = vscode.window.createTerminal({ name: "CodePartner", cwd: root });
+    }
+    const terminal = this.visibleTerminal;
+    terminal.show(true); // reveal the terminal without stealing focus from wherever the user currently is
+
+    if (background) {
+      // Long-running/never-exiting process (dev server, watcher) — start
+      // it and return immediately. Don't bother with shell integration
+      // here; there's no "finish" to wait for.
+      terminal.sendText(command, true);
+      return `Started "${command}" in the visible CodePartner terminal (background — not waiting for it to finish). Check the terminal panel to see its output.`;
+    }
+
+    let shellIntegration: vscode.TerminalShellIntegration | undefined;
+    try {
+      shellIntegration = terminal.shellIntegration;
+      if (!shellIntegration) {
+        // Shell integration activates asynchronously after terminal
+        // creation, even for a shell that supports it — give it a short
+        // window before falling back, so we don't give up on a shell
+        // that would have worked half a second later.
+        shellIntegration = await new Promise<vscode.TerminalShellIntegration | undefined>((resolve) => {
+          const timer = setTimeout(() => { disposable.dispose(); resolve(undefined); }, 3000);
+          const disposable = vscode.window.onDidChangeTerminalShellIntegration((e) => {
+            if (e.terminal === terminal) {
+              clearTimeout(timer);
+              disposable.dispose();
+              resolve(e.shellIntegration);
+            }
+          });
+        });
+      }
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] Shell integration check failed, falling back to sendText: ${e.message}`);
+      shellIntegration = undefined;
+    }
+
+    if (!shellIntegration) {
+      terminal.sendText(command, true);
+      return `Command sent to the visible CodePartner terminal: ${command}\nThis shell doesn't support VS Code's shell integration (or it hasn't activated yet), so output and exit code can't be captured automatically — check the terminal panel to see the result.`;
+    }
+
+    const TIMEOUT_MS = 120000;
+    try {
+      const execution = shellIntegration.executeCommand(command);
+      let output = "";
+      const readPromise = (async () => {
+        for await (const chunk of execution.read()) {
+          output += chunk;
+        }
+      })();
+
+      const timedOut = await Promise.race([
+        readPromise.then(() => false),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(true), TIMEOUT_MS)),
+      ]);
+
+      const cleaned = stripAnsiCodes(output).trim();
+      this.warnIfSecrets(cleaned, `terminal output (${command})`);
+
+      if (timedOut) {
+        return `Command is still running after ${TIMEOUT_MS / 1000}s in the visible CodePartner terminal (not killed — check the terminal panel). Output so far:\n${cleaned || "(none yet)"}`;
+      }
+
+      const exitCode = await new Promise<number | undefined>((resolve) => {
+        const timer = setTimeout(() => { disposable.dispose(); resolve(undefined); }, 5000);
+        const disposable = vscode.window.onDidEndTerminalShellExecution((e) => {
+          if (e.execution === execution) {
+            clearTimeout(timer);
+            disposable.dispose();
+            resolve(e.exitCode);
+          }
+        });
+      });
+
+      return `Exit code: ${exitCode ?? "(unknown)"}\n${cleaned || "(no output)"}`;
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] run_in_terminal shell-integration path failed, falling back to sendText: ${e.message}`);
+      terminal.sendText(command, true);
+      return `Command sent to the visible CodePartner terminal: ${command}\nCould not capture output automatically (${e.message}) — check the terminal panel to see the result.`;
+    }
   }
 
 
@@ -3384,7 +3511,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       };
 
       const finish = (message: string) => {
-        if (settled) return;
+        if (settled) {return;}
         settled = true;
         clearTimeout(timeoutHandle);
         if (this.runningChildProcess === child) {
@@ -3655,7 +3782,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
   private revertTimelineAction(chatId: string, timestamp: number) {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!root) return;
+    if (!root) {return;}
 
     const event = this.timelineEvents.find(e => e.chatId === chatId && e.timestamp === timestamp);
     if (!event || !event.path) {
@@ -3702,7 +3829,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
   private revertTurn(turnId: string) {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!root) return;
+    if (!root) {return;}
 
     const gitRef = this.turnGitCheckpoints.get(turnId);
     const eventsToRevert = this.timelineEvents.filter(e =>
@@ -3712,7 +3839,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
     let revertedCount = 0;
     for (const event of eventsToRevert) {
-      if (!event.path) continue;
+      if (!event.path) {continue;}
       const fullPath = path.join(root, event.path);
       try {
         if (event.revertContent !== undefined) {

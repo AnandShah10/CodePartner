@@ -81,7 +81,7 @@ suite("gitWorktree", () => {
     createWorktree(repoDir, wtPath, "codepartner/agent-clean-test");
     const result = commitAllIfDirty(wtPath, "auto commit");
     assert.strictEqual(result.ok, true);
-    if (result.ok) assert.strictEqual(result.committed, false);
+    if (result.ok) {assert.strictEqual(result.committed, false);}
     removeWorktree(repoDir, wtPath, true);
   });
 
@@ -93,7 +93,7 @@ suite("gitWorktree", () => {
 
     const commitResult = commitAllIfDirty(wtPath, "auto commit work");
     assert.strictEqual(commitResult.ok, true);
-    if (commitResult.ok) assert.strictEqual(commitResult.committed, true);
+    if (commitResult.ok) {assert.strictEqual(commitResult.committed, true);}
 
     removeWorktree(repoDir, wtPath, true);
 
