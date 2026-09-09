@@ -29,6 +29,7 @@ import { getModelMetadata, formatContextWindow } from "./modelMetadata";
 import { createWorktree, removeWorktree, getBranchDiffStat, commitAllIfDirty, toBranchSafeSegment } from "./gitWorktree";
 import { stripAnsiCodes } from "./ansiStrip";
 import { isFailureWorthAssisting, shouldOfferAssist, buildAssistPrompt, AssistOfferSignature } from "./terminalAssist";
+import { CustomAgentDefinition, parseCustomAgentFile, resolveAgentTools, findUnknownAgentTools } from "./customAgents";
 
 import { API_KEY_SECRET_KEY } from "./secretKeys";
 
@@ -434,7 +435,7 @@ const TOOLS = [
   },
   {
     name: "call_subagent",
-    description: "Dispatch a specialized SubAgent to independently work a sub-task using its own tools and message history, scoped to its type: researcher (web search, docs, read-only file/code search), code_expert (read, edit, create files, run commands), tester (run tests/commands, read files), writer (create files, read files, web search). Request multiple call_subagent calls in one turn to run them concurrently. These agents SHARE the real workspace — for concurrent agents editing the same files, use run_parallel_agents instead.",
+    description: "Dispatch a specialized SubAgent to independently work a sub-task using its own tools and message history, scoped to its type: researcher (web search, docs, read-only file/code search), code_expert (read, edit, create files, run commands), tester (run tests/commands, read files), writer (create files, read files, web search). Request multiple call_subagent calls in one turn to run them concurrently. These agents SHARE the real workspace — for concurrent agents editing the same files, use run_parallel_agents instead. If the repo defines its own custom agent personas (.codepartner/agents/*.md), use list_custom_agents / call_custom_agent instead of one of these fixed built-in types.",
     parameters: {
       type: "object",
       properties: {
@@ -443,6 +444,23 @@ const TOOLS = [
         personality: { type: "string", description: "Optional persona trait (e.g. 'Strict Reviewer', 'Creative Prototyper') to modify behavior." },
       },
       required: ["agent_type", "task"],
+    },
+  },
+  {
+    name: "list_custom_agents",
+    description: "Lists custom agent personas the repo has defined in .codepartner/agents/*.md (name, description, and which tools each one has). Check this before assuming only the four built-in agent types (researcher/code_expert/tester/writer) are available — a repo may define its own, more specific personas.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "call_custom_agent",
+    description: "Runs a repo-defined custom agent persona (from .codepartner/agents/*.md) as a multi-turn, tool-using sub-agent — same underlying mechanism as call_subagent, but the persona/system prompt and tool access come from the repo's own file instead of a fixed built-in type. Use list_custom_agents first to see what's defined.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The custom agent's name, from list_custom_agents." },
+        task: { type: "string", description: "Specific instruction for the agent." },
+      },
+      required: ["name", "task"],
     },
   },
   {
@@ -1304,16 +1322,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
    * real workspace root — see runParallelAgents.
    */
   public async runInternalAgent(agentType: string, task: string, personality?: string, workingRoot?: string): Promise<string> {
-    const config = vscode.workspace.getConfiguration("codepartner");
-    const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const apiKey = await this.getApiKey();
-    const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
-    const providerType = config.get<string>("provider") || "openai";
-    const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
-
     const allTools = [...TOOLS, ...this.mcpManager.getTools()];
     const scopedTools = getScopedTools(agentType, allTools);
-    const scopedToolNames = new Set(scopedTools.map((t) => t.name));
 
     const personalityText = personality ? `\nAdopt this personality trait: ${personality}` : "";
     const isolationNote = workingRoot ? `\nYou are working in an isolated copy of the repo on your own git branch — nothing you do here affects the user's actual files until they choose to merge your branch.` : "";
@@ -1324,7 +1334,58 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 Your task is: ${task}${toolsNote}
 Provide a concise, high-quality result.`;
 
-    const subMessages: ProviderMessage[] = [{ role: "system", content: subPrompt }];
+    return this.runAgentLoop(`Sub-agent (${agentType})`, subPrompt, scopedTools, workingRoot);
+  }
+
+  /**
+   * Runs a repo-defined custom agent (.codepartner/agents/*.md — see
+   * customAgents.ts) through the same multi-turn tool-using loop as the
+   * built-in sub-agent types. Unlike the four built-ins, tool access
+   * comes from the file's own `tools:` frontmatter, not a fixed map, and
+   * the file's body IS the system prompt (no persona template wrapping
+   * it) — a custom agent should read as exactly what the repo author
+   * wrote, not "SubAgent: <name>. <their text>."
+   */
+  public async runCustomAgent(name: string, task: string, workingRoot?: string): Promise<string> {
+    const agents = await this.loadCustomAgents();
+    const agent = agents.find((a) => a.name === name);
+    if (!agent) {
+      const available = agents.length > 0 ? agents.map((a) => a.name).join(", ") : "(none found)";
+      return `Error: no custom agent named "${name}" in .codepartner/agents/. Available: ${available}`;
+    }
+
+    const allTools = [...TOOLS, ...this.mcpManager.getTools()];
+    const scopedTools = resolveAgentTools(agent, allTools);
+    const unknown = findUnknownAgentTools(agent, allTools);
+    if (unknown.length > 0) {
+      this.output.appendLine(`[CodePartner] Custom agent "${agent.name}" declares unknown tool(s) in its frontmatter, ignored: ${unknown.join(", ")}`);
+    }
+
+    const isolationNote = workingRoot ? `\n\nYou are working in an isolated copy of the repo on your own git branch — nothing you do here affects the user's actual files until they choose to merge your branch.` : "";
+    const toolsNote = scopedTools.length > 0
+      ? `\n\nYou have access to these tools: ${scopedTools.map((t) => t.name).join(", ")}.`
+      : `\n\nYou do not have tool access for this task — answer directly from reasoning.`;
+    const systemPrompt = `${agent.instructions}${isolationNote}${toolsNote}\n\nYour current task: ${task}`;
+
+    return this.runAgentLoop(`Custom agent (${agent.name})`, systemPrompt, scopedTools, workingRoot);
+  }
+
+  /**
+   * The multi-turn, tool-using loop shared by runInternalAgent (built-in
+   * sub-agent types) and runCustomAgent (repo-defined .agent.md
+   * personas) — extracted so custom agents didn't need a second copy of
+   * this logic. `agentLabel` is only used for status/error messages.
+   */
+  private async runAgentLoop(agentLabel: string, systemPrompt: string, scopedTools: any[], workingRoot?: string): Promise<string> {
+    const config = vscode.workspace.getConfiguration("codepartner");
+    const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
+    const apiKey = await this.getApiKey();
+    const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
+    const providerType = config.get<string>("provider") || "openai";
+    const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
+
+    const scopedToolNames = new Set(scopedTools.map((t) => t.name));
+    const subMessages: ProviderMessage[] = [{ role: "system", content: systemPrompt }];
     const MAX_SUBAGENT_ITERATIONS = 6; // Smaller than the main loop's 15 — sub-agent tasks should be narrowly scoped.
 
     for (let i = 0; i < MAX_SUBAGENT_ITERATIONS; i++) {
@@ -1341,7 +1402,7 @@ Provide a concise, high-quality result.`;
       try {
         res = await axios.post(url, body, { headers });
       } catch (e: any) {
-        return `Error in sub-agent (${agentType}): ${e.response?.data?.error?.message || e.message}`;
+        return `Error in ${agentLabel}: ${e.response?.data?.error?.message || e.message}`;
       }
 
       const assistantMsg = extractAssistantMessage(providerType, res.data);
@@ -1349,10 +1410,10 @@ Provide a concise, high-quality result.`;
 
       const toolCalls = extractToolCalls(providerType, res.data);
       if (toolCalls.length === 0) {
-        return (assistantMsg.content as string) || "(Sub-agent returned no content.)";
+        return (assistantMsg.content as string) || `(${agentLabel} returned no content.)`;
       }
 
-      this.updateStatus(`Agent ${agentType}${workingRoot ? " (isolated)" : ""}: using ${toolCalls.map((tc) => tc.function.name).join(", ")}...`);
+      this.updateStatus(`${agentLabel}${workingRoot ? " (isolated)" : ""}: using ${toolCalls.map((tc) => tc.function.name).join(", ")}...`);
 
       for (const tc of toolCalls) {
         let toolResult: string;
@@ -1360,7 +1421,7 @@ Provide a concise, high-quality result.`;
           // Defense in depth: refuse here too, not just by omitting the
           // tool from the request — a model can still hallucinate a call
           // to a tool it wasn't offered.
-          toolResult = `Error: the "${tc.function.name}" tool is not available to the ${agentType} sub-agent.`;
+          toolResult = `Error: the "${tc.function.name}" tool is not available to ${agentLabel}.`;
         } else {
           const parsed = repairJsonParse(tc.function.arguments);
           if (parsed === null) {
@@ -1373,7 +1434,43 @@ Provide a concise, high-quality result.`;
       }
     }
 
-    return `Sub-agent (${agentType}) reached its iteration limit (${MAX_SUBAGENT_ITERATIONS}) without a final answer. It may have made partial progress via tool calls above.`;
+    return `${agentLabel} reached its iteration limit (${MAX_SUBAGENT_ITERATIONS}) without a final answer. It may have made partial progress via tool calls above.`;
+  }
+
+  /** Scans .codepartner/agents/*.md in the workspace root for custom agent definitions (see customAgents.ts). Returns an empty array if the folder doesn't exist or no workspace is open. */
+  private async loadCustomAgents(): Promise<CustomAgentDefinition[]> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {return [];}
+    const agentsDir = path.join(root, ".codepartner", "agents");
+    if (!fs.existsSync(agentsDir)) {return [];}
+
+    const agents: CustomAgentDefinition[] = [];
+    try {
+      const files = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
+      for (const file of files) {
+        try {
+          const content = fs.readFileSync(path.join(agentsDir, file), "utf8");
+          const parsed = parseCustomAgentFile(path.basename(file, ".md"), content);
+          if (parsed) {agents.push(parsed);}
+        } catch (e: any) {
+          this.output.appendLine(`[CodePartner] Failed to read custom agent file ${file}: ${e.message}`);
+        }
+      }
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] Failed to list .codepartner/agents: ${e.message}`);
+    }
+    return agents;
+  }
+
+  /** Tool implementation for list_custom_agents — a plain text summary, matching how list_skills reports back to the model. */
+  private async listCustomAgentsTool(): Promise<string> {
+    const agents = await this.loadCustomAgents();
+    if (agents.length === 0) {
+      return "No custom agents defined. Add .md files to .codepartner/agents/ in the workspace root to define repo-specific agent personas.";
+    }
+    return agents
+      .map((a) => `- ${a.name}: ${a.description}${a.tools.length > 0 ? ` (tools: ${a.tools.join(", ")})` : " (no tool access)"}`)
+      .join("\n");
   }
 
   /**
@@ -3154,6 +3251,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         return this.getWebSearchContext(`@web ${args.query}`);
       case "call_subagent":
         return this.agentManager.dispatch(args.agent_type, args.task, this, args.personality);
+      case "list_custom_agents":
+        return this.listCustomAgentsTool();
+      case "call_custom_agent":
+        return this.runCustomAgent(args.name, args.task, rootOverride);
       case "run_parallel_agents":
         return this.runParallelAgents(args.tasks);
       case "create_artifact":

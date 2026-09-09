@@ -4,19 +4,37 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.1.5] - 2024-11-09
-### Changed
-- Final lint compliance pass on terminal inline assistant (`src/terminalAssist.ts`): added braces to all `if` statements in `isFailureWorthAssisting()`, `shouldOfferAssist()` (and updated `buildAssistPrompt` comment style for consistency)
-- ESLint `curly` rule upgraded from `"warn"` to `"error"` in `eslint.config.mjs` now that **all** bracing issues (94 total) across the codebase have been resolved
-- Version bumped to **2.1.5**; README badge, bottom note, feature table, and comparison analysis synchronized
-- Pretest sequence and `.vscode-test.mjs` refined for faster, more reliable test runs (pinned VS Code version, increased timeouts, GPU/extension disables)
-
+## [2.1.6] - 2024-11-10
 ### Added
-- Robust test runner configuration for CI-like environments (handles OneDrive paths, network flakiness)
+- **Custom repo-scoped agents** (`.codepartner/agents/*.md` with YAML frontmatter): Define your own named agents using `name:`, `description:`, `tools:` (comma-separated), and the file body as the full system prompt. Strictly scoped to the repo (not global like Skills).
+  - New `parseCustomAgentFile`, `resolveAgentTools`, `findUnknownAgentTools` in `src/customAgents.ts` (filename fallback, rejects empty/missing-frontmatter files, trims whitespace, set-intersection for tools, logs unknown tools for typo detection without failing)
+  - Integration in `extension.ts`: `loadCustomAgents()`, `runCustomAgent()`, `listCustomAgentsTool` (graceful empty-dir fallback with helpful bootstrap message, added to `runAgentLoop` and parallel path, no extra persona wrapper)
+  - New tools `list_custom_agents` / `call_custom_agent`
+  - Comprehensive test suite in `customAgents.test.ts` for all parsing edge cases, tool resolution, unknown tools
+- Documentation for custom agents in README (frontmatter example, usage, "no agents" behavior, Extension Development Host testing workflow)
+
+### Changed
+- Version, README badge/note, feature table, comparison analysis, and changelog synchronized to **2.1.6** (now accurately reflects implemented custom agent + terminal lint changes)
 
 ### Fixed
-- Remaining `curly` lint violations specific to terminal assistant decision logic (failure detection, offer deduplication, prompt building)
-- Test runner flakiness (`spawnSync cmd.exe ETIMEDOUT`, path issues with spaces/dashes)
+- Graceful degradation for missing `.codepartner/agents/` directory or invalid agent files (returns `[]` or explicit message)
+- Docs parity for custom agents, embeddings, Architect Mode, Timeline, MCP, context compaction, approval system, hybrid search
+
+(See full details in `customAgents.ts`, `extension.ts`, `terminalAssist.ts`, and tests.)
+
+## [2.1.5] - 2024-11-09
+### Changed
+- Final lint compliance pass on terminal inline assistant (`src/terminalAssist.ts`): added braces to all `if` statements in `isFailureWorthAssisting()`, `shouldOfferAssist()`, updated `buildAssistPrompt` comment style
+- ESLint `curly` rule upgraded `"warn"` → `"error"` in `eslint.config.mjs` (all 94 `if`/`for` bracing issues now resolved across entire codebase; no functional changes to core agent loop, embeddings, worktree isolation, approvals or Architect Mode)
+- Pretest sequence and `.vscode-test.mjs` refined: pinned VS Code to ^1.93.0, increased Mocha timeout, added stability flags (GPU/extension disables) for CI-like reliability
+- Version bumped to **2.1.5** with README badge/note/feature table and comparison analysis synchronized
+
+### Added
+- Robust test runner hardening for flaky `spawnSync cmd.exe ETIMEDOUT/ENOBUFS` (handles OneDrive paths, network, spaces/dashes in paths)
+
+### Fixed
+- Remaining `curly` lint violations specific to terminal assistant logic (failure detection, assist offer deduplication, prompt building)
+- Test runner flakiness in pretest and CI environments
 - Documentation parity for lint compliance, test stability, embeddings guidance, Architect Mode, Timeline undo, MCP, context compaction, approval system, and hybrid semantic search
 
 ## [2.1.4] - 2024-11-08

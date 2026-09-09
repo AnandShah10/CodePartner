@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.1.5-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.1.6-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.93.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -19,7 +19,7 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
   - **Fast Mode**: Direct, concise responses and immediate actions
   - **Planning Mode**: Generates detailed implementation plans + artifacts; waits for approval before editing
   - **Architect Mode**: Drafts changes in-memory for review before bulk application
-- **Multi-Agent System**: Automatically dispatches to specialized sub-agents (`researcher`, `code_expert`, `tester`, `writer`) running in **isolated Git worktrees** to enable safe, conflict-free concurrent editing
+- **Multi-Agent System**: Automatically dispatches to specialized sub-agents (`researcher`, `code_expert`, `tester`, `writer`) running in **isolated Git worktrees** to enable safe, conflict-free concurrent editing. Also supports **Custom repo-scoped agents** (see below)
 - **Proactive Skill Discovery**: Suggests saving repeated workflows as reusable global **Skills**
 - **Timeline & Revert**: Full audit trail of every tool action with one-click undo
 
@@ -31,6 +31,7 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 - **Git Integration**: Status, stage, AI-generated commit messages (with Co-author), branches, and GitHub PR creation
 - **Web & Knowledge**: DuckDuckGo search, document indexing (`index_docs` + `query_knowledge`)
 - **MCP Support**: Connect to external Model Context Protocol servers for custom tools
+- **Custom Agents**: Repo-local agents (`.codepartner/agents/*.md`) with YAML frontmatter + custom system prompts (see dedicated section)
 - **Artifacts & Skills**: Persistent global storage (`~/.codepartner`) of code, plans, markdown, logs, and screenshots
 
 ### 🔍 Smart Context
@@ -126,6 +127,40 @@ Skills and knowledge travel with you across all projects.
 
 ---
 
+## 🛠️ Custom Repo Agents (New in v2.1.6)
+
+Define your own specialized agents **local to the current repository** by placing Markdown files in a `.codepartner/agents/` directory (create it if it doesn't exist — the extension will detect it automatically).
+
+Each file uses **YAML frontmatter** for metadata + the rest of the file as the full system prompt:
+
+```markdown
+---
+name: senior_frontend
+description: Expert in React, Tailwind, and modern frontend best practices
+tools: read_file, edit_file, grep_search, run_tests, list_dir
+---
+
+You are a senior frontend engineer. 
+- Always call read_file before any edit_file.
+- Provide complete, production-ready implementations with tests.
+- Follow the project's existing style and architecture.
+```
+
+**Key behaviors**:
+- `name:` is optional (falls back to filename without .md)
+- `tools:` is a comma-separated list; only valid/known tools are used (unknown tools are logged as potential typos but do not cause failure)
+- Files without proper frontmatter, empty body, or only instructions are skipped
+- `list_custom_agents` tool returns available agents or a helpful bootstrap message if none found (encouraging you to create the folder + first agent)
+- Use via `call_custom_agent` tool or by referencing in `run_parallel_agents` task list
+- Fully unit-tested with edge cases (whitespace, missing fields, invalid tools, graceful degradation)
+- **Testing tip**: In **Extension Development Host** (F5 from source), create `.codepartner/agents/` inside the opened test workspace and add .md files — they will be loaded on next agent run
+
+Custom agents integrate seamlessly into the agent loop and parallel execution without changing core behavior or safety rules.
+
+See [CHANGELOG.md](CHANGELOG.md) and `src/customAgents.ts` for parser/implementation details.
+
+---
+
 ## 📸 Screenshots
 
 *(Screenshots will be added to the marketplace listing. Current assets in `/media`)*
@@ -164,7 +199,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.1.5** — includes lint compliance (ESLint `curly` now an error), improved test runner stability (pinned VS Code version, higher timeouts, reduced flakiness), real **embedding-based semantic search** for `@workspace` (opt-in via `codepartner.embeddingProvider`, with automatic graceful TF-IDF fallback), full unit tests, durable Timeline undo, Architect hunk review, MCP, context compaction, approval policies, and all prior v2.1.x improvements. See [CHANGELOG.md](CHANGELOG.md) for details.
+**Note**: Now at **v2.1.6** — adds **Custom repo-scoped Agents** (`.codepartner/agents/*.md` with YAML frontmatter for name/description/tools + custom system prompt; graceful fallback, full unit tests), terminal lint compliance (ESLint `curly` rule now `"error"`), hardened test runner (pinned VS Code ^1.93.0, timeouts/stability flags to fix ETIMEDOUT/ENOBUFS), real embedding-based `@workspace` search, and all prior v2.1.x improvements. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ---
 
