@@ -349,6 +349,37 @@ textarea::-webkit-scrollbar { display: none; }
 .pane-header svg { flex-shrink: 0; }
 .plan-progress { font-size: 10px; opacity: 0.6; font-weight: 600; }
 
+.icon-btn {
+  background: transparent; border: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
+  border-radius: var(--radius-sm); padding: 2px 8px; font-size: 9px; text-transform: none;
+  letter-spacing: normal; opacity: 0.8; cursor: pointer; color: var(--vscode-foreground);
+  transition: var(--transition);
+}
+.icon-btn:hover { opacity: 1; background: rgba(0,0,0,0.15); }
+
+#diagnostics-list { display: flex; flex-direction: column; gap: 6px; padding: 8px; overflow-y: auto; }
+.diagnostics-section-label {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
+  opacity: 0.5; margin: 8px 4px 2px;
+}
+.diagnostics-section-label:first-child { margin-top: 2px; }
+.diagnostic-item {
+  border-left: 3px solid var(--vscode-charts-red); border-radius: var(--radius-sm);
+  background: rgba(0,0,0,0.12); padding: 6px 10px;
+}
+.diagnostic-item.warning { border-left-color: #d29922; }
+.diagnostic-header {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 10px; font-weight: 700; margin-bottom: 3px;
+}
+.diagnostic-source { color: var(--vscode-textLink-foreground); }
+.diagnostic-severity { opacity: 0.6; text-transform: uppercase; font-size: 9px; }
+.diagnostic-message {
+  font-size: 11px; line-height: 1.4; opacity: 0.85; word-break: break-word;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+.diagnostic-result { opacity: 0.65; margin-top: 3px; white-space: pre-wrap; }
+
 #plan-list, #artifact-list { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; text-align: center; opacity: 0.4; font-size: 11px; padding: 30px; gap: 8px; }
 .empty-state svg { width: 32px; height: 32px; fill: currentColor; opacity: 0.3; }

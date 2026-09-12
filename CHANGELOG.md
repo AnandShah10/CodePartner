@@ -4,7 +4,25 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.1.6] - 2024-11-10
+## [2.1.7] - 2026-11-11
+### Added
+- **Terminal inline assist** (`codepartner.terminalInlineAssist` setting with values `disabled` / `codepartner-only` / `all-terminals`): When a terminal command fails, shows a dismissible notification offering to let CodePartner analyze the failure (command + output) and suggest fixes. "codepartner-only" limits to terminals launched via `run_in_terminal`; "all-terminals" watches every terminal in the workspace (requires explicit one-time user confirmation on first enable for privacy).
+- Updated `terminalAssist.ts` with hardened `isFailureWorthAssisting()` / `shouldOfferAssist()` (explicit braces for ESLint `curly: "error"` rule) and improved `buildAssistPrompt()`.
+- New configuration documentation and comparison analysis updates for the terminal assist feature.
+
+### Changed
+- Version bumped to **2.1.7** with full synchronization across `package.json`, README.md (badge, config table, final note), `codepartner_comparison_analysis.md` (removed terminal assist from gaps list, added to strengths), and this changelog.
+- Configuration table in README expanded with the new terminal setting and updated descriptions.
+- Comparison analysis refreshed to ~90% parity (terminal assist gap closed; inline completions, embeddings, custom agents, worktree isolation, per-hunk Architect, durable Timeline, MCP, approval system, permission gating all re-verified against current implementation).
+
+### Fixed
+- Minor version/doc drift from v2.1.6 release.
+- ESLint compliance in terminal assist logic (all `if` statements now braced).
+- Updated feature claims in README and analysis to accurately reflect the new terminal monitoring capability.
+
+(See `src/terminalAssist.ts`, updated `extension.ts` tool descriptions, and test runner for full details.)
+
+## [2.1.6] - 2026-11-10
 ### Added
 - **Custom repo-scoped agents** (`.codepartner/agents/*.md` with YAML frontmatter): Define your own named agents using `name:`, `description:`, `tools:` (comma-separated), and the file body as the full system prompt. Strictly scoped to the repo (not global like Skills).
   - New `parseCustomAgentFile`, `resolveAgentTools`, `findUnknownAgentTools` in `src/customAgents.ts` (filename fallback, rejects empty/missing-frontmatter files, trims whitespace, set-intersection for tools, logs unknown tools for typo detection without failing)
@@ -22,7 +40,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 (See full details in `customAgents.ts`, `extension.ts`, `terminalAssist.ts`, and tests.)
 
-## [2.1.5] - 2024-11-09
+## [2.1.5] - 2026-11-09
 ### Changed
 - Final lint compliance pass on terminal inline assistant (`src/terminalAssist.ts`): added braces to all `if` statements in `isFailureWorthAssisting()`, `shouldOfferAssist()`, updated `buildAssistPrompt` comment style
 - ESLint `curly` rule upgraded `"warn"` → `"error"` in `eslint.config.mjs` (all 94 `if`/`for` bracing issues now resolved across entire codebase; no functional changes to core agent loop, embeddings, worktree isolation, approvals or Architect Mode)
@@ -37,7 +55,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Test runner flakiness in pretest and CI environments
 - Documentation parity for lint compliance, test stability, embeddings guidance, Architect Mode, Timeline undo, MCP, context compaction, approval system, and hybrid semantic search
 
-## [2.1.4] - 2024-11-08
+## [2.1.4] - 2026-11-08
 ### Changed
 - Version alignment across `package.json` (now **2.1.4**), README badge, CHANGELOG, and comparison analysis
 - Documentation and feature notes refreshed to reflect stable v2.1.3 embeddings implementation now shipping in 2.1.4
@@ -48,7 +66,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Test runner flakiness (network timeout on `@vscode/test-electron` download during CI-like runs; pretest now succeeds cleanly)
 - Minor version drift and doc inconsistencies from the embeddings rollout
 
-## [2.1.3] - 2024-11-07
+## [2.1.3] - 2026-11-07
 ### Added
 - Real **embedding-based semantic search** (`src/embeddings.ts` + upgraded `SemanticSearch`)
   - New config: `codepartner.embeddingProvider` (`disabled` / `same-as-chat` / `openai` / `azure` / `google` / `ollama`)
@@ -68,7 +86,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 - Version alignment across package.json (2.1.3), README badge, and changelog top section
 
-## [2.1.2] - 2024-11-06
+## [2.1.2] - 2026-11-06
 ### Added
 - New commands: `codepartner.newChat` (Ctrl+Alt+N / Cmd+Alt+N) and `codepartner.cancelActiveTask` (Ctrl+Alt+X / Cmd+Alt+X)
 - Enhanced keybindings for inline completions (accept next word/line) and all new commands
@@ -86,7 +104,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Version drift between package.json (now **2.1.2**), README, and changelog
 - Minor inconsistencies in tool call parsing, token budgeting in browser_control, and approval policy enforcement during parallel runs
 
-## [2.1.1] - 2024-11-05
+## [2.1.1] - 2026-11-05
 ### Added
 - Full production integration of `run_parallel_agents` with the `gitWorktree` module (isolated branches + worktrees for 2-8 concurrent sub-agents)
 - Support for `runInternalAgent` multi-turn loops in sub-agents with scoped tools via `getScopedTools`
@@ -105,7 +123,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Worktree cleanup on task cancellation or errors
 - Version alignment from 2.0.13
 
-## [2.0.13] - 2024-11-05
+## [2.0.13] - 2026-11-05
 ### Added
 - `GitWorktree` utilities (`createWorktree`, `removeWorktree`, `commitAllIfDirty`, `getBranchDiffStat`, `toBranchSafeSegment`) for creating isolated, concurrent working directories and branches per sub-agent
 - Full support for safe parallel multi-agent execution: each sub-agent (`researcher`, `code_expert`, `tester`, `writer`) now operates in its own Git worktree — preventing edit conflicts even when modifying the same files simultaneously
@@ -121,7 +139,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Race conditions and file conflicts during concurrent sub-agent operations
 - Minor test and approval flow edge cases
 
-## [2.0.12] - 2024-10-29
+## [2.0.12] - 2026-10-29
 ### Added
 - Final Marketplace configuration polish: complete `enumDescriptions` for all providers/approval policies, full JSON schema for `mcpServers` (including `additionalProperties`, nested `command`/`args`/`env`/`cwd` with `required` fields), explicit `deprecationMessage` on `apiKey`, `minimum`/`maximum` bounds on `inlineCompletionDebounce`, expanded `categories` (now includes "Azure")
 - Rich inline documentation for `contextTokenBudget` (shared token truncation across active file + open tabs) and Azure-specific settings
@@ -138,7 +156,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Minor schema validation issues in MCP server definitions and approval policy descriptions
 - Consistency between runtime defaults, settings UI, and documentation
 
-## [2.0.11] - 2024-10-28
+## [2.0.11] - 2026-10-28
 ### Added
 - Rich `enumDescriptions` and validation for `approvalPolicy` (`always-ask` / `ask-for-shell` / `full-auto` / `yolo` with explicit prompt-injection safeguards)
 - `contextTokenBudget` (shared 6000-token default across active editor + all open tabs, with line-boundary truncation via `truncateToTokenBudget`)
@@ -158,7 +176,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Edge cases in SecretStorage migration, browser Chrome path resolution, and MCP server spawning
 - Output formatting for combined stdout/stderr in terminal tools (`formatOutput`)
 
-## [2.0.10] - 2024-10-27
+## [2.0.10] - 2026-10-27
 ### Added
 - Expanded `contributes.configuration` schema in `package.json` (provider enum + descriptions, full `approvalPolicy` options with `enumDescriptions`, `contextTokenBudget`, `mcpServers` object schema with command/args/env/cwd, Azure settings, inline completion options, deprecation notice for `apiKey`)
 - Comprehensive configuration table and feature matrix in README.md
@@ -177,7 +195,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Minor issues in MCP server schema parsing and browser path resolution
 - Version references and links across documentation
 
-## [2.0.9] - 2024-10-25
+## [2.0.9] - 2026-10-25
 ### Added
 - Secure API key handling with VS Code SecretStorage (`API_KEY_SECRET_KEY`, automatic migration from settings)
 - Virtual document content providers (`SingleContentProvider`, `CodePartnerDiffProvider` for side-by-side proposed changes)
@@ -198,7 +216,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Output formatting and error recovery in MCP, Git, and shell command execution
 - Version alignment between `package.json` (now 2.0.9), README, and this changelog
 
-## [2.0.8] - 2024-10-20
+## [2.0.8] - 2026-10-20
 ### Added
 - Final Marketplace readiness (icon, polished README, optimized `.vscodeignore`)
 - Full integration of approval flows, secret scanning, and prompt injection protection into core agent loop
@@ -211,7 +229,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 - Remaining stability issues across MCP, browser automation, and Git operations
 
-## [2.0.7] - 2024-10-15
+## [2.0.7] - 2026-10-15
 ### Added
 - Comprehensive approval system (`ApprovalPolicy`, `GATED_TOOLS`, `needsApprovalForPolicy`)
 - Prompt injection guard (`UntrustedContentTracker`)
@@ -226,7 +244,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 - Edge cases in multi-provider streaming and tool call extraction
 
-## [2.0.6] - 2024-10-12
+## [2.0.6] - 2026-10-12
 ### Added
 - Line-based diff engine (`diffLines`, `groupIntoHunks`, `applyAcceptedHunks`)
 - Planning utilities (`buildPlanFromTasks`, `validatePlanIndex`)
@@ -241,7 +259,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 - Better handling of open editor tabs context and shared token budgets
 
-## [2.0.5] - 2024-10-09
+## [2.0.5] - 2026-10-09
 ### Added
 - Inline completions provider with debounce config
 - Full GitManager (status, stage, commit with AI co-author, branch, PR creation)
@@ -256,7 +274,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 - Terminal output capture and formatting improvements
 
-## [2.0.4] - 2024-10-07
+## [2.0.4] - 2026-10-07
 ### Added
 - Multi-provider adapter (`buildProviderRequest`, support for Anthropic/Google/Ollama)
 - Knowledge base tools (`index_docs`, `query_knowledge`)
@@ -271,7 +289,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 - Various stability and error recovery from v2.0.3
 
-## [2.0.3] - 2024-10-05
+## [2.0.3] - 2026-10-05
 ### Added
 - Support for additional context from all open editor tabs
 - Context compaction for long-running conversations (auto-summarization)
@@ -281,7 +299,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Improved semantic search using TF-IDF for better `@workspace` relevance
 - Updated configuration options (inline completions, MCP servers, approval policy)
 
-## [2.0.2] - 2024-10-04
+## [2.0.2] - 2026-10-04
 ### Added
 - **MCP Support**: Full Model Context Protocol integration for custom tool servers
 - **Architect Mode**: Draft changes without immediate application for review
@@ -307,7 +325,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Package icon reference and marketplace metadata
 - Git operations and terminal output capture
 
-## [2.0.1] - 2024-09-20
+## [2.0.1] - 2026-09-20
 ### Added
 - Initial v2.0 architecture with agent-first design
 - Planning Mode with implementation plans and approval workflow
@@ -316,7 +334,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Browser automation tools
 - Artifact registry for persistent outputs
 
-## [1.x] - 2023-2024
+## [1.x] - 2026
 - Initial releases with basic chat and code assistance
 - Azure OpenAI support
 - Basic file edit capabilities

@@ -30,6 +30,7 @@ import { createWorktree, removeWorktree, getBranchDiffStat, commitAllIfDirty, to
 import { stripAnsiCodes } from "./ansiStrip";
 import { isFailureWorthAssisting, shouldOfferAssist, buildAssistPrompt, AssistOfferSignature } from "./terminalAssist";
 import { CustomAgentDefinition, parseCustomAgentFile, resolveAgentTools, findUnknownAgentTools } from "./customAgents";
+import { DiagnosticEntry, addDiagnostic } from "./diagnostics";
 
 import { API_KEY_SECRET_KEY } from "./secretKeys";
 
@@ -941,7 +942,7 @@ export function activate(context: vscode.ExtensionContext) {
       })
     );
   } catch (e: any) {
-    output.appendLine(`[CodePartner] Terminal inline assist unavailable (shell integration API not present in this VS Code version): ${e.message}`);
+    provider.logDiagnostic("error", "Terminal Assist", `Unavailable — shell integration API not present in this VS Code version: ${e.message}`);
   }
 
   // ── Inline Completion Provider ──
@@ -1055,6 +1056,14 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
    * and by a TTL as a fallback (see MENTION_CACHE_TTL_MS / getCachedWorkspaceFiles).
    */
   private mentionFileCache: MentionCacheState | null = null;
+  /**
+   * Diagnostics panel: a capped, most-recent-first log of actionable
+   * warnings/errors (not routine info logging, which stays in the output
+   * channel only) — distinct from timelineEvents' failed tool calls,
+   * which the Diagnostics tab shows alongside this via a client-side
+   * filter (no separate backend data needed for that half).
+   */
+  private diagnostics: DiagnosticEntry[] = [];
   /**
    * Per-turn git checkpoint fallback (Phase 2.4): turnId -> stash-create
    * SHA ("" means the tree was clean at checkpoint time, i.e. == HEAD).
@@ -1200,6 +1209,20 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Logs an actionable warning/error to both the output channel (as
+   * before — this doesn't replace that) and the Diagnostics tab, so it's
+   * still visible after the transient status toast (if any) is gone.
+   * Reserved for things worth a user's attention later, not routine info
+   * logging — most output.appendLine calls elsewhere are left as-is on
+   * purpose.
+   */
+  public logDiagnostic(severity: "warning" | "error", source: string, message: string): void {
+    this.output.appendLine(`[CodePartner] [${source}] ${message}`);
+    this.diagnostics = addDiagnostic(this.diagnostics, { severity, source, message });
+    this._view?.webview.postMessage({ type: "diagnostics", value: this.diagnostics });
+  }
+
+  /**
    * Phase 4.4: shows a one-time explanatory tip the first time a user
    * switches into a given mode, using globalState (not per-workspace) so
    * it doesn't re-appear in every new project once seen.
@@ -1264,7 +1287,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     if (setting === "same-as-chat") {
       const chatProvider = config.get<string>("provider") || "openai";
       if (chatProvider === "anthropic") {
-        this.output.appendLine("[CodePartner] embeddingProvider is \"same-as-chat\" but the chat provider (Anthropic) has no embeddings endpoint — using TF-IDF search instead. Set codepartner.embeddingProvider explicitly (e.g. \"openai\") to use embeddings anyway.");
+        this.logDiagnostic("warning", "Embeddings", "embeddingProvider is \"same-as-chat\" but the chat provider (Anthropic) has no embeddings endpoint — using TF-IDF search instead. Set codepartner.embeddingProvider explicitly (e.g. \"openai\") to use embeddings anyway.");
         this.semanticSearch.configureEmbeddings(null);
         return;
       }
@@ -1298,8 +1321,11 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const findings = scanForSecrets(text);
     if (findings.length === 0) {return;}
     const summary = summarizeFindings(findings, sourceLabel);
-    this.output.appendLine(`[CodePartner] ${summary}`);
     this._view?.webview.postMessage({ type: "status", value: summary });
+    // Also logged to Diagnostics (not just the transient status toast) —
+    // "why did the model see something that looked like a credential" is
+    // exactly the kind of thing worth being able to review later.
+    this.logDiagnostic("warning", "Secret Scan", summary);
   }
 
   /**
@@ -1358,7 +1384,7 @@ Provide a concise, high-quality result.`;
     const scopedTools = resolveAgentTools(agent, allTools);
     const unknown = findUnknownAgentTools(agent, allTools);
     if (unknown.length > 0) {
-      this.output.appendLine(`[CodePartner] Custom agent "${agent.name}" declares unknown tool(s) in its frontmatter, ignored: ${unknown.join(", ")}`);
+      this.logDiagnostic("warning", "Custom Agent", `Custom agent "${agent.name}" declares unknown tool(s) in its frontmatter, ignored: ${unknown.join(", ")}`);
     }
 
     const isolationNote = workingRoot ? `\n\nYou are working in an isolated copy of the repo on your own git branch — nothing you do here affects the user's actual files until they choose to merge your branch.` : "";
@@ -1618,6 +1644,12 @@ Provide a concise, high-quality result.`;
       if (this.timelineEvents.length > 0) {
         this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
       }
+      // Diagnostics are session-scoped (not persisted per-chat like the
+      // timeline), but still worth sending on every resolve so switching
+      // webview visibility doesn't lose what's accumulated this session.
+      if (this.diagnostics.length > 0) {
+        this._view?.webview.postMessage({ type: "diagnostics", value: this.diagnostics });
+      }
 
       this.output.appendLine("[CodePartner] Webview view resolved successfully.");
     } catch (e: any) {
@@ -1726,6 +1758,10 @@ Provide a concise, high-quality result.`;
           break;
         case "listTimeline":
           this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
+          break;
+        case "clearDiagnostics":
+          this.diagnostics = [];
+          this._view?.webview.postMessage({ type: "diagnostics", value: [] });
           break;
         case "saveSkillFromSuggestion":
           if (this.skillManager) {
@@ -4172,6 +4208,9 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       <button class="tab-btn" data-tab="skills" title="Skills">
         <svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>
       </button>
+      <button class="tab-btn" data-tab="diagnostics" title="Diagnostics">
+        <svg viewBox="0 0 16 16"><path d="M8 1a.75.75 0 0 1 .75.75v.5a5.5 5.5 0 0 1 4.702 4.702h.5a.75.75 0 0 1 0 1.5h-.5a5.5 5.5 0 0 1-4.702 4.702v.5a.75.75 0 0 1-1.5 0v-.5A5.5 5.5 0 0 1 2.548 8.452h-.5a.75.75 0 0 1 0-1.5h.5A5.5 5.5 0 0 1 7.25 2.25v-.5A.75.75 0 0 1 8 1zM8 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0 2a.75.75 0 0 1 .75.75v1.5h1.5a.75.75 0 0 1 0 1.5h-1.5v1.5a.75.75 0 0 1-1.5 0v-1.5h-1.5a.75.75 0 0 1 0-1.5h1.5v-1.5A.75.75 0 0 1 8 6z"/></svg>
+      </button>
     </div>
 
     <div id="main-content">
@@ -4236,6 +4275,16 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       <div id="tab-skills" class="tab-content">
         <div id="skill-list">
           <div class="empty-state">No skills learned yet. Ask to "save a skill".</div>
+        </div>
+      </div>
+
+      <div id="tab-diagnostics" class="tab-content">
+        <div class="pane-header">
+          <span>Diagnostics</span>
+          <button id="clear-diagnostics-btn" class="icon-btn" title="Clear system warnings (failed tool calls are part of the timeline and aren't cleared here)">Clear</button>
+        </div>
+        <div id="diagnostics-list">
+          <div class="empty-state">No warnings or errors yet. Failed tool calls and system warnings will show up here.</div>
         </div>
       </div>
 

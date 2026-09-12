@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.1.6-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.1.7-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.93.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -26,7 +26,7 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 ### 🛠️ Powerful Tools
 - **Safe File Operations**: Always `read_file` first, precise hunk-based edits (`diffLines` + selective apply), `create_file`, `grep_search`
 - **Approval & Safety**: Configurable policies (`always-ask` / `full-auto`), secret scanner, prompt injection guard
-- **Terminal & Testing**: Runs shell commands, auto-detects and runs tests (`run_tests`)
+- **Terminal & Testing**: Runs shell commands, auto-detects and runs tests (`run_tests`), with optional **inline assist** on failures (new `terminalInlineAssist` setting — offers CodePartner help with failed command + output)
 - **Browser Control**: Navigate, click, type, screenshot web pages for research (cross-platform via Puppeteer)
 - **Git Integration**: Status, stage, AI-generated commit messages (with Co-author), branches, and GitHub PR creation
 - **Web & Knowledge**: DuckDuckGo search, document indexing (`index_docs` + `query_knowledge`)
@@ -104,7 +104,8 @@ Key settings (full list in VS Code Settings → search "codepartner"):
 | `codepartner.apiKey` | `` | Set via **"CodePartner: Set API Key"** command (secure SecretStorage) |
 | `codepartner.model` | `gpt-4` | Chat model / deployment name |
 | `codepartner.apiEndpoint` | `https://api.openai.com/v1` | Custom chat endpoint |
-| `codepartner.approvalPolicy` | `always-ask` | Safety (`always-ask` / `ask-for-shell` / `full-auto` / `yolo`) |
+| `codepartner.approvalPolicy` | `always-ask` | Safety (`always-ask` / `ask-for-shell` / `full-auto` / `yolo`) — controls confirmation for shell, file edits, and git operations |
+| `codepartner.terminalInlineAssist` | `disabled` | **New in v2.1.7**: When terminal commands fail, optionally offer CodePartner help (`disabled` / `codepartner-only` / `all-terminals`). "all-terminals" watches every terminal (requires explicit permission confirmation) |
 | `codepartner.contextTokenBudget` | `6000` | Shared token budget for file context, open tabs, and `@file` mentions |
 | `codepartner.maxTokens` | `4096` | Max output tokens per response |
 | `codepartner.inlineCompletions` | `false` | Enable ghost-text inline completions |
@@ -199,7 +200,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.1.6** — adds **Custom repo-scoped Agents** (`.codepartner/agents/*.md` with YAML frontmatter for name/description/tools + custom system prompt; graceful fallback, full unit tests), terminal lint compliance (ESLint `curly` rule now `"error"`), hardened test runner (pinned VS Code ^1.93.0, timeouts/stability flags to fix ETIMEDOUT/ENOBUFS), real embedding-based `@workspace` search, and all prior v2.1.x improvements. See [CHANGELOG.md](CHANGELOG.md) for details.
+**Note**: Now at **v2.1.7** — adds **Terminal inline assist** (`codepartner.terminalInlineAssist` setting: offers CodePartner help on terminal command failures with configurable scope and explicit permission for "all-terminals"), plus prior v2.1.6 custom repo-scoped agents (`.codepartner/agents/*.md` YAML frontmatter), embeddings, Architect per-hunk review, worktree-isolated parallel agents, durable Timeline undo, approval policies, MCP, and all v2.1.x improvements. Terminal lint compliance and test runner hardening carried forward. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ---
 

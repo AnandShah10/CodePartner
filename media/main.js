@@ -91,6 +91,8 @@
   let isWaiting = false;
   let attachedFiles = [];
   let currentMode = 'fast';
+  let allTimelineEvents = [];
+  let systemDiagnostics = [];
 
   const ICONS = {
     SEND: '<svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>',
@@ -568,6 +570,12 @@
   if (applyHunksBtn) {
     applyHunksBtn.onclick = () => {
       vscode.postMessage({ type: 'applyArchitectHunks', value: collectAcceptedHunkSelections() });
+    };
+  }
+  const clearDiagnosticsBtn = document.getElementById('clear-diagnostics-btn');
+  if (clearDiagnosticsBtn) {
+    clearDiagnosticsBtn.onclick = () => {
+      vscode.postMessage({ type: 'clearDiagnostics' });
     };
   }
 
@@ -1240,11 +1248,20 @@
         break;
 
       case 'timeline':
+        allTimelineEvents = msg.value || [];
         renderTimeline(msg.value);
+        renderDiagnosticsTab();
         break;
 
       case 'timelineEvent':
+        allTimelineEvents.push(msg.value);
         renderTimelineEvent(msg.value);
+        renderDiagnosticsTab();
+        break;
+
+      case 'diagnostics':
+        systemDiagnostics = msg.value || [];
+        renderDiagnosticsTab();
         break;
 
       case 'suggestSkill':
@@ -1520,6 +1537,52 @@
 
     const counter = document.querySelector('.timeline-count');
     if (counter) counter.textContent = `${timelineList.querySelectorAll('.timeline-item').length} actions`;
+  }
+
+  // ── Diagnostics tab: system warnings/errors (backend-pushed) + a
+  // client-side filter of failed timeline events (no separate backend
+  // data needed for that half — timeline events already carry `success`).
+  function renderDiagnosticsTab() {
+    const list = document.getElementById('diagnostics-list');
+    if (!list) return;
+
+    const failures = allTimelineEvents.filter(e => e.success === false);
+
+    if (systemDiagnostics.length === 0 && failures.length === 0) {
+      list.innerHTML = '<div class="empty-state">No warnings or errors yet. Failed tool calls and system warnings will show up here.</div>';
+      return;
+    }
+
+    let html = '';
+
+    if (systemDiagnostics.length > 0) {
+      html += '<div class="diagnostics-section-label">System</div>';
+      html += systemDiagnostics.map(d => `
+        <div class="diagnostic-item ${d.severity}">
+          <div class="diagnostic-header">
+            <span class="diagnostic-source">${escapeHtml(d.source)}</span>
+            <span class="diagnostic-severity">${d.severity}</span>
+          </div>
+          <div class="diagnostic-message">${escapeHtml(d.message)}</div>
+        </div>
+      `).join('');
+    }
+
+    if (failures.length > 0) {
+      html += '<div class="diagnostics-section-label">Failed Tool Calls</div>';
+      html += failures.slice().reverse().map(e => `
+        <div class="diagnostic-item error">
+          <div class="diagnostic-header">
+            <span class="diagnostic-source">${escapeHtml(e.tool)}</span>
+            <span class="diagnostic-severity">${e.duration}ms</span>
+          </div>
+          <div class="diagnostic-message">${escapeHtml(e.argsSummary || '')}</div>
+          <div class="diagnostic-message diagnostic-result">${escapeHtml(e.resultPreview || '')}</div>
+        </div>
+      `).join('');
+    }
+
+    list.innerHTML = html;
   }
 
   // ── Proactive Skill Suggestion ──
