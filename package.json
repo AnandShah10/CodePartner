@@ -3,13 +3,14 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.0.1",
+  "version": "2.1.7",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/AnandShah10/CodePartner.git"
   },
   "engines": {
-    "vscode": "^1.86.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "AI",
@@ -47,6 +48,18 @@
       {
         "command": "codepartner.showDebugLog",
         "title": "CodePartner: Show Debug Log"
+      },
+      {
+        "command": "codepartner.setApiKey",
+        "title": "CodePartner: Set API Key"
+      },
+      {
+        "command": "codepartner.newChat",
+        "title": "CodePartner: New Chat"
+      },
+      {
+        "command": "codepartner.cancelActiveTask",
+        "title": "CodePartner: Cancel Active Task"
       }
     ],
     "keybindings": [
@@ -70,6 +83,33 @@
         "command": "codepartner.fixErrors",
         "key": "ctrl+shift+'",
         "mac": "cmd+shift+'"
+      },
+      {
+        "command": "codepartner.generateTests",
+        "key": "ctrl+alt+t",
+        "mac": "cmd+alt+t"
+      },
+      {
+        "command": "codepartner.newChat",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n"
+      },
+      {
+        "command": "codepartner.cancelActiveTask",
+        "key": "ctrl+alt+x",
+        "mac": "cmd+alt+x"
+      },
+      {
+        "command": "editor.action.inlineSuggest.acceptNextWord",
+        "key": "ctrl+right",
+        "mac": "cmd+right",
+        "when": "inlineSuggestionVisible && !editorReadonly"
+      },
+      {
+        "command": "editor.action.inlineSuggest.acceptNextLine",
+        "key": "ctrl+alt+right",
+        "mac": "cmd+alt+right",
+        "when": "inlineSuggestionVisible && !editorReadonly"
       }
     ],
     "viewsContainers": {
@@ -115,17 +155,82 @@
         "codepartner.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API key for the LLM provider."
+          "description": "Deprecated: no longer used. API keys are stored securely via the \"CodePartner: Set API Key\" command instead of settings.json. Any value found here is migrated automatically and then cleared.",
+          "deprecationMessage": "Deprecated — use the \"CodePartner: Set API Key\" command. Keys are no longer read from or stored in settings."
         },
         "codepartner.model": {
           "type": "string",
           "default": "gpt-4",
           "description": "Model name (OpenAI) or Deployment name (Azure)"
         },
+        "codepartner.approvalPolicy": {
+          "type": "string",
+          "enum": [
+            "always-ask",
+            "ask-for-shell",
+            "full-auto",
+            "yolo"
+          ],
+          "enumDescriptions": [
+            "Confirm every shell command, file edit/creation, and git commit/branch/PR before running it.",
+            "Only confirm shell commands. File edits and git operations run without a prompt.",
+            "Only confirm git commits, branches, and pull requests. Shell commands and file edits run without a prompt.",
+            "Full Auto — No Confirmations. Nothing prompts, ever (except actions flagged as possible prompt injection). Requires a one-time explicit confirmation to enable."
+          ],
+          "default": "always-ask",
+          "description": "Controls when CodePartner asks before running a shell command, writing a file, or making a git commit/branch/PR. Defaults to confirming everything."
+        },
         "codepartner.maxTokens": {
           "type": "number",
           "default": 4096,
           "description": "Max output tokens."
+        },
+        "codepartner.contextTokenBudget": {
+          "type": "number",
+          "default": 6000,
+          "description": "Approximate token budget shared across per-turn file context (active editor content, other open tabs, @file mentions). Replaces the old fixed character caps on each source individually — content is truncated (on a line boundary) to fit within this shared budget instead."
+        },
+        "codepartner.embeddingProvider": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "same-as-chat",
+            "openai",
+            "azure",
+            "google",
+            "ollama"
+          ],
+          "enumDescriptions": [
+            "@workspace uses TF-IDF (term-frequency ranked keyword search) only — the default, no extra API calls or cost.",
+            "Use real embeddings from whatever codepartner.provider is already configured. Falls back to TF-IDF if that's Anthropic (no embeddings endpoint).",
+            "Use OpenAI's embeddings API regardless of the chat provider.",
+            "Use Azure OpenAI's embeddings API regardless of the chat provider.",
+            "Use Google's embeddings API regardless of the chat provider.",
+            "Use a local Ollama embedding model — no API key needed."
+          ],
+          "default": "disabled",
+          "description": "Upgrades @workspace search from TF-IDF to real embedding-based semantic search. Reuses the API key already set via \"CodePartner: Set API Key\" (Ollama needs none). On any failure (bad key, network error, unreachable endpoint) this automatically falls back to TF-IDF rather than breaking @workspace."
+        },
+        "codepartner.embeddingModel": {
+          "type": "string",
+          "default": "",
+          "description": "Embedding model name. Leave blank to use a sensible default for the selected codepartner.embeddingProvider (e.g. text-embedding-3-small for OpenAI, nomic-embed-text for Ollama)."
+        },
+        "codepartner.embeddingEndpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Custom embeddings API endpoint. Leave blank to use the provider's public default (or, for \"same-as-chat\", the same endpoint as codepartner.apiEndpoint)."
+        },
+        "codepartner.terminalInlineAssist": {
+          "type": "string",
+          "enum": ["disabled", "codepartner-only", "all-terminals"],
+          "enumDescriptions": [
+            "No terminal monitoring — the default.",
+            "Offer help only when a command fails in CodePartner's own visible terminal (started via run_in_terminal).",
+            "Offer help when a command fails in ANY terminal in the workspace, including ones you opened and typed into yourself. Requires a one-time confirmation the first time it's enabled."
+          ],
+          "default": "disabled",
+          "description": "When a terminal command fails, shows a dismissable notification offering to ask CodePartner for help with the failure (the failed command + its output). \"all-terminals\" means CodePartner is watching everything typed into every terminal, not just its own — that's a real permission, not just a UI preference, hence the separate confirmation when you enable it."
         },
         "codepartner.azureApiVersion": {
           "type": "string",
@@ -213,7 +318,7 @@
     "@types/markdown-it": "^14.1.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "^22.19.11",
-    "@types/vscode": "^1.86.0",
+    "@types/vscode": "^1.93.0",
     "@vscode/test-cli": "^0.0.11",
     "@vscode/test-electron": "^2.5.2",
     "esbuild": "^0.27.2",

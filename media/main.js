@@ -1,6 +1,67 @@
 (function () {
   const vscode = acquireVsCodeApi();
 
+  // Phase 4.6: VS Code doesn't natively provide "-rgb" custom properties
+  // usable inside rgba(var(--x-rgb), alpha) — it only exposes theme
+  // colors as full CSS color values (e.g. "#1e1e1e"). This stylesheet
+  // references e.g. --vscode-editor-background-rgb throughout expecting
+  // a bare "r,g,b" triplet, but nothing ever defined it, so every one of
+  // those rgba() calls was silently using its hardcoded dark-theme
+  // fallback color regardless of the user's actual theme — including on
+  // a light theme. This computes real RGB triplets from the live theme
+  // and injects them as CSS custom properties so the fallbacks are only
+  // ever a genuine last resort.
+  const THEME_RGB_BASE_VARS = [
+    '--vscode-button-background',
+    '--vscode-charts-green',
+    '--vscode-charts-purple',
+    '--vscode-charts-red',
+    '--vscode-editor-background',
+    '--vscode-editorGroupHeader-tabsBackground',
+    '--vscode-input-background',
+    '--vscode-panel-border',
+    '--vscode-sideBar-background',
+    '--vscode-textLink-foreground',
+  ];
+
+  function parseColorToRgb(colorStr) {
+    if (!colorStr) return null;
+    colorStr = colorStr.trim();
+    let m = colorStr.match(/^#([0-9a-fA-F]{3})$/);
+    if (m) {
+      return m[1].split('').map(c => parseInt(c + c, 16));
+    }
+    m = colorStr.match(/^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/);
+    if (m) {
+      const hex = m[1];
+      return [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)];
+    }
+    m = colorStr.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+    if (m) {
+      return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+    }
+    return null;
+  }
+
+  function updateThemeRgbVariables() {
+    const computed = getComputedStyle(document.documentElement);
+    const rootStyle = document.documentElement.style;
+    THEME_RGB_BASE_VARS.forEach(baseVar => {
+      const raw = computed.getPropertyValue(baseVar);
+      const rgb = parseColorToRgb(raw);
+      if (rgb) {
+        rootStyle.setProperty(baseVar + '-rgb', rgb.join(','));
+      }
+    });
+  }
+
+  updateThemeRgbVariables();
+  // VS Code toggles a vscode-light/vscode-dark/vscode-high-contrast class
+  // on <body> when the user switches themes live — recompute when that happens.
+  if (document.body) {
+    new MutationObserver(updateThemeRgbVariables).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+  }
+
   const md = window.markdownit ? window.markdownit({ html: false, linkify: true, typographer: true }) : { render: (s) => `<p>${s.replace(/\n/g, '</p><p>')}</p>` };
   const chatHistory = document.getElementById('chat-history');
   const promptInput = document.getElementById('prompt-input');
@@ -30,6 +91,8 @@
   let isWaiting = false;
   let attachedFiles = [];
   let currentMode = 'fast';
+  let allTimelineEvents = [];
+  let systemDiagnostics = [];
 
   const ICONS = {
     SEND: '<svg viewBox="0 0 16 16"><path d="M1.724 1.053a.5.5 0 0 0-.714.545l1.403 4.85a.5.5 0 0 0 .397.354l5.69.953c.268.053.268.437 0 .49l-5.69.953a.5.5 0 0 0-.397.354l-1.403 4.85a.5.5 0 0 0 .714.545l13-6.5a.5.5 0 0 0 0-.894l-13-6.5Z"/></svg>',
@@ -433,7 +496,12 @@
     models.forEach(m => {
       const opt = document.createElement('option');
       opt.value = m.id;
-      opt.innerText = m.name || m.id;
+      // Phase 4.5: show context window size next to the name, where known,
+      // instead of just a bare model name.
+      opt.innerText = (m.name || m.id) + (m.contextWindowLabel ? ' (' + m.contextWindowLabel + ')' : '');
+      if (m.contextWindow) {
+        opt.title = 'Context window: ' + m.contextWindow.toLocaleString() + ' tokens';
+      }
       if (m.id === selected) {
         opt.selected = true;
       }
@@ -498,6 +566,18 @@
   document.getElementById('apply-drafts-btn').onclick = () => {
     vscode.postMessage({ type: 'applyArchitectDrafts' });
   };
+  const applyHunksBtn = document.getElementById('apply-hunks-btn');
+  if (applyHunksBtn) {
+    applyHunksBtn.onclick = () => {
+      vscode.postMessage({ type: 'applyArchitectHunks', value: collectAcceptedHunkSelections() });
+    };
+  }
+  const clearDiagnosticsBtn = document.getElementById('clear-diagnostics-btn');
+  if (clearDiagnosticsBtn) {
+    clearDiagnosticsBtn.onclick = () => {
+      vscode.postMessage({ type: 'clearDiagnostics' });
+    };
+  }
 
   // UI Event Listeners
   historyBtn.onclick = () => {
@@ -766,9 +846,25 @@
   }
 
   function syncOverlay() {
-    promptOverlay.innerHTML = formatMentionsForOverlay(promptInput.value);
-    promptOverlay.style.height = promptInput.style.height;
+    if (!promptOverlay || !promptInput) return;
+    promptOverlay.innerHTML = formatMentionsForOverlay(promptInput.value || '');
+    promptOverlay.style.height = promptInput.style.height || '44px';
     promptOverlay.scrollTop = promptInput.scrollTop;
+  }
+
+  // Phase 3.7: debounce @/-mention suggestion requests instead of firing
+  // one per keystroke — the backend now caches the file listing, but a
+  // request still crosses the extension-host boundary and re-filters, so
+  // there's no reason to fire one on every single character while typing
+  // fast. Local UI feedback (resize, overlay sync, hiding the list) stays
+  // synchronous; only the request to the backend is delayed.
+  let suggestionsDebounceTimer = null;
+  const SUGGESTIONS_DEBOUNCE_MS = 150;
+  function requestSuggestionsDebounced(type, query) {
+    clearTimeout(suggestionsDebounceTimer);
+    suggestionsDebounceTimer = setTimeout(() => {
+      vscode.postMessage({ type: 'getSuggestions', value: { type, query } });
+    }, SUGGESTIONS_DEBOUNCE_MS);
   }
 
   // Handle Input Auto-resize and Suggestions
@@ -777,6 +873,13 @@
     this.style.height = Math.min(this.scrollHeight, 200) + 'px';
     syncOverlay();
 
+    // Preserve cursor position (fixes cursor jumping bug with overlay/mentions)
+    const cursorPos = this.selectionStart;
+    // Force layout to ensure cursor position is correct after overlay sync
+    void this.offsetWidth;
+    this.selectionStart = cursorPos;
+    this.selectionEnd = cursorPos;
+
     const pos = promptInput.selectionStart;
     const val = promptInput.value;
     const lastAt = val.lastIndexOf('@', pos - 1);
@@ -784,11 +887,12 @@
 
     if (lastAt !== -1 && !val.slice(lastAt, pos).includes(' ') && lastAt >= lastSlash) {
       const query = val.slice(lastAt + 1, pos);
-      vscode.postMessage({ type: 'getSuggestions', value: { type: '@', query } });
+      requestSuggestionsDebounced('@', query);
     } else if (lastSlash !== -1 && !val.slice(lastSlash, pos).includes(' ') && lastSlash > lastAt) {
       const query = val.slice(lastSlash + 1, pos);
-      vscode.postMessage({ type: 'getSuggestions', value: { type: '/', query } });
+      requestSuggestionsDebounced('/', query);
     } else {
+      clearTimeout(suggestionsDebounceTimer);
       suggestionList.classList.add('hidden');
     }
   });
@@ -825,6 +929,34 @@
     }
   });
 
+  // Image paste support for chatbox
+  promptInput.addEventListener('paste', (e) => {
+    const items = (e.clipboardData || window.clipboardData)?.items || [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        e.preventDefault();
+        const file = items[i].getAsFile();
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const base64 = event.target.result.toString().split(',')[1];
+            const attached = [{
+              name: `pasted-image-${Date.now()}.png`,
+              mimeType: 'image/png',
+              data: base64
+            }];
+            attachedFiles.push(...attached);
+            renderAttachmentChips();
+            statusText.innerText = '📎 Image pasted and attached!';
+            setTimeout(() => { if (statusText) statusText.innerText = ''; }, 2500);
+          };
+          reader.readAsDataURL(file);
+          return;
+        }
+      }
+    }
+  });
+  
   modelSelector.onchange = () => {
     vscode.postMessage({ type: 'changeModel', value: modelSelector.value });
   };
@@ -833,11 +965,73 @@
     vscode.postMessage({ type: 'attachFiles' });
   };
 
-  const applyDraftsBtn = document.getElementById('apply-drafts-btn');
-  if (applyDraftsBtn) {
-    applyDraftsBtn.onclick = () => {
-      vscode.postMessage({ type: 'applyDrafts' });
-    };
+  // Drag-and-drop file attachment: reuses the exact same attachedFiles
+  // pipeline as the file picker / attachBtn above. Two cases, since a
+  // browser drag event carries different data depending on the source:
+  //  - Dragging a file in from the OS file manager: dataTransfer.files
+  //    gives real File objects, readable client-side via FileReader.
+  //  - Dragging a file from VS Code's own Explorer: it's an in-app drag,
+  //    not a real filesystem drop, so dataTransfer only carries a
+  //    text/uri-list — the extension host reads that file from disk
+  //    (see the "attachFilesByPath" case in extension.ts).
+  const dropZone = document.getElementById('input-outer');
+  let dragDepth = 0;
+
+  function readFileAsAttachment(file) {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result || '';
+        const commaIdx = dataUrl.indexOf(',');
+        const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : '';
+        resolve({ name: file.name, mimeType: file.type || 'application/octet-stream', data: base64 });
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  if (dropZone) {
+    dropZone.addEventListener('dragenter', (e) => {
+      e.preventDefault();
+      dragDepth++;
+      dropZone.classList.add('drag-over');
+    });
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+    });
+    dropZone.addEventListener('dragleave', () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) {
+        dropZone.classList.remove('drag-over');
+      }
+    });
+    dropZone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      dragDepth = 0;
+      dropZone.classList.remove('drag-over');
+
+      const dt = e.dataTransfer;
+      if (!dt) { return; }
+
+      if (dt.files && dt.files.length > 0) {
+        const results = await Promise.all(Array.from(dt.files).map(readFileAsAttachment));
+        const valid = results.filter(Boolean);
+        if (valid.length > 0) {
+          attachedFiles.push(...valid);
+          renderAttachmentChips();
+        }
+        return;
+      }
+
+      const uriList = dt.getData('text/uri-list');
+      if (uriList) {
+        const uris = uriList.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+        if (uris.length > 0) {
+          vscode.postMessage({ type: 'attachFilesByPath', value: uris });
+        }
+      }
+    });
   }
 
   // Handle Send/Stop click
@@ -1054,11 +1248,20 @@
         break;
 
       case 'timeline':
+        allTimelineEvents = msg.value || [];
         renderTimeline(msg.value);
+        renderDiagnosticsTab();
         break;
 
       case 'timelineEvent':
+        allTimelineEvents.push(msg.value);
         renderTimelineEvent(msg.value);
+        renderDiagnosticsTab();
+        break;
+
+      case 'diagnostics':
+        systemDiagnostics = msg.value || [];
+        renderDiagnosticsTab();
         break;
 
       case 'suggestSkill':
@@ -1071,18 +1274,69 @@
     }
   });
 
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
   function renderArchitectDrafts(drafts) {
     if (!drafts || drafts.length === 0 || (Array.isArray(drafts) && drafts.length === 0)) {
       architectDraftsContainer.classList.add('hidden');
       return;
     }
     architectDraftsContainer.classList.remove('hidden');
-    draftsList.innerHTML = drafts.map(d => `
-      <div class="draft-item">
-        <span class="draft-path">${d.path}</span>
-        <span class="draft-lines">${d.lines} lines pending</span>
-      </div>
-    `).join('');
+    draftsList.innerHTML = drafts.map(d => {
+      const hunks = d.hunks || [];
+      const hunksHtml = hunks.map(h => {
+        const linesHtml = h.lines.map(l => {
+          const prefix = l.type === 'add' ? '+' : l.type === 'remove' ? '-' : ' ';
+          const cls = l.type === 'add' ? 'hunk-line-add' : l.type === 'remove' ? 'hunk-line-remove' : 'hunk-line-context';
+          return `<div class="${cls}">${prefix} ${escapeHtml(l.value)}</div>`;
+        }).join('');
+        return `
+          <div class="hunk-item" data-hunk-id="${escapeHtml(h.id)}">
+            <label class="hunk-toggle">
+              <input type="checkbox" class="hunk-accept-checkbox" data-hunk-id="${escapeHtml(h.id)}" checked />
+              <span>@@ -${h.oldStart} +${h.newStart} @@</span>
+            </label>
+            <div class="hunk-lines">${linesHtml}</div>
+          </div>
+        `;
+      }).join('');
+
+      return `
+        <div class="draft-item-wrapper" data-draft-path="${escapeHtml(d.path)}">
+          <div class="draft-item">
+            <span class="draft-path">${escapeHtml(d.path)}</span>
+            <span class="draft-lines">${d.lines} lines pending</span>
+            ${hunks.length > 0 ? `<button class="draft-review-toggle" type="button">Review ${hunks.length} hunk${hunks.length === 1 ? '' : 's'}</button>` : ''}
+          </div>
+          <div class="hunks-container hidden">${hunksHtml}</div>
+        </div>
+      `;
+    }).join('');
+
+    // Wire per-file expand/collapse toggles.
+    draftsList.querySelectorAll('.draft-review-toggle').forEach(btn => {
+      btn.onclick = () => {
+        const wrapper = btn.closest('.draft-item-wrapper');
+        const hunksContainer = wrapper.querySelector('.hunks-container');
+        hunksContainer.classList.toggle('hidden');
+      };
+    });
+  }
+
+  function collectAcceptedHunkSelections() {
+    const selections = {};
+    draftsList.querySelectorAll('.draft-item-wrapper').forEach(wrapper => {
+      const filePath = wrapper.getAttribute('data-draft-path');
+      const accepted = Array.from(wrapper.querySelectorAll('.hunk-accept-checkbox:checked')).map(cb => cb.getAttribute('data-hunk-id'));
+      selections[filePath] = accepted;
+    });
+    return selections;
   }
 
 
@@ -1285,6 +1539,52 @@
     if (counter) counter.textContent = `${timelineList.querySelectorAll('.timeline-item').length} actions`;
   }
 
+  // ── Diagnostics tab: system warnings/errors (backend-pushed) + a
+  // client-side filter of failed timeline events (no separate backend
+  // data needed for that half — timeline events already carry `success`).
+  function renderDiagnosticsTab() {
+    const list = document.getElementById('diagnostics-list');
+    if (!list) return;
+
+    const failures = allTimelineEvents.filter(e => e.success === false);
+
+    if (systemDiagnostics.length === 0 && failures.length === 0) {
+      list.innerHTML = '<div class="empty-state">No warnings or errors yet. Failed tool calls and system warnings will show up here.</div>';
+      return;
+    }
+
+    let html = '';
+
+    if (systemDiagnostics.length > 0) {
+      html += '<div class="diagnostics-section-label">System</div>';
+      html += systemDiagnostics.map(d => `
+        <div class="diagnostic-item ${d.severity}">
+          <div class="diagnostic-header">
+            <span class="diagnostic-source">${escapeHtml(d.source)}</span>
+            <span class="diagnostic-severity">${d.severity}</span>
+          </div>
+          <div class="diagnostic-message">${escapeHtml(d.message)}</div>
+        </div>
+      `).join('');
+    }
+
+    if (failures.length > 0) {
+      html += '<div class="diagnostics-section-label">Failed Tool Calls</div>';
+      html += failures.slice().reverse().map(e => `
+        <div class="diagnostic-item error">
+          <div class="diagnostic-header">
+            <span class="diagnostic-source">${escapeHtml(e.tool)}</span>
+            <span class="diagnostic-severity">${e.duration}ms</span>
+          </div>
+          <div class="diagnostic-message">${escapeHtml(e.argsSummary || '')}</div>
+          <div class="diagnostic-message diagnostic-result">${escapeHtml(e.resultPreview || '')}</div>
+        </div>
+      `).join('');
+    }
+
+    list.innerHTML = html;
+  }
+
   // ── Proactive Skill Suggestion ──
   function renderSkillSuggestion(data) {
     const existing = document.getElementById('skill-suggestion-banner');
@@ -1339,5 +1639,10 @@
     chatHistory.parentElement.prepend(banner);
     setTimeout(() => { if (banner.parentElement) banner.remove(); }, 30000);
   }
+
+  // Ensure overlay is initialized (fixes text visibility in input)
+  setTimeout(() => {
+    syncOverlay();
+  }, 50);
 
 })();

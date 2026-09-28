@@ -10,6 +10,41 @@ import { GitManager } from "./git";
 import { CodePartnerInlineCompletionProvider } from "./inlineCompletion";
 import { SemanticSearch } from "./semanticSearch";
 import { MCPManager } from "./mcp";
+import { applyEdit, NOT_FOUND } from "./editUtils";
+import { scanForSecrets, summarizeFindings } from "./secretScanner";
+import { ApprovalPolicy, GatedCategory, GATED_TOOLS, needsApprovalForPolicy, describeToolCall, commandPrefix, matchesApprovedPrefix } from "./approvals";
+import { UntrustedContentTracker } from "./promptInjectionGuard";
+import { repairJsonParse } from "./jsonRepair";
+import { isGitRepo, createGitCheckpoint, restoreFileFromCheckpoint } from "./gitCheckpoint";
+import { buildProviderRequest, extractNonStreamedText, extractToolCalls, extractAssistantMessage, ProviderMessage } from "./aiProviderAdapter";
+import { getScopedTools } from "./subAgentTools";
+import { diffLines, groupIntoHunks, applyAcceptedHunks } from "./lineDiff";
+import { buildPlanFromTasks, validatePlanIndex } from "./planUtils";
+import { estimateTokens, truncateToTokenBudget } from "./tokenEstimate";
+import { findAutoTriggeredSkills } from "./skillAutoTrigger";
+import { filterCachedFiles, isCacheFresh, MentionCacheState } from "./mentionCache";
+import { isToolResultSuccess } from "./toolResultStatus";
+import { extractUsageFromStreamEvent, formatTokenCount } from "./usageExtraction";
+import { getModelMetadata, formatContextWindow } from "./modelMetadata";
+import { createWorktree, removeWorktree, getBranchDiffStat, commitAllIfDirty, toBranchSafeSegment } from "./gitWorktree";
+import { stripAnsiCodes } from "./ansiStrip";
+import { isFailureWorthAssisting, shouldOfferAssist, buildAssistPrompt, AssistOfferSignature } from "./terminalAssist";
+import { CustomAgentDefinition, parseCustomAgentFile, resolveAgentTools, findUnknownAgentTools } from "./customAgents";
+import { DiagnosticEntry, addDiagnostic } from "./diagnostics";
+
+import { API_KEY_SECRET_KEY } from "./secretKeys";
+
+/** Combines a spawned process's stdout/stderr into one trimmed string for display/prompt use. */
+function formatOutput(stdout: string, stderr: string): string {
+  const parts = [stdout.trim()];
+  if (stderr.trim()) {
+    parts.push(`STDERR:\n${stderr.trim()}`);
+  }
+  return parts.filter(Boolean).join("\n\n").trim();
+}
+
+/** Phase 3.7: how long the @-mention file listing cache is trusted before a re-scan, if no invalidating file-system event fired first. */
+const MENTION_CACHE_TTL_MS = 30000;
 
 class SingleContentProvider implements vscode.TextDocumentContentProvider {
   private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
@@ -102,8 +137,8 @@ class AgentManager {
     provider.updateStatus(`Agent ${agentType} starting task: ${task.substring(0, 30)}...`);
     subtask.status = "running";
 
-    // Simulate complex sub-agent logic (In reality, this would be a separate LLM call)
-    // For now, we'll use a basic internal prompt or delegate back to handlePrompt with a "subagent" flag
+    // runInternalAgent now runs a real multi-turn, tool-using loop scoped
+    // to this agentType (Phase 3.1) — see its doc comment in extension.ts.
     try {
       const result = await provider.runInternalAgent(agentType, task, personality);
       subtask.status = "done";
@@ -219,8 +254,10 @@ class BrowserManager {
           await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
           const title = await page.title();
           // @ts-ignore
-          const content = await page.evaluate(() => document.body.innerText.substring(0, 5000));
-          return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}`;
+          const fullContent: string = await page.evaluate(() => document.body.innerText);
+          const { text: content, truncated } = truncateToTokenBudget(fullContent, 1250); // ~ previous 5000-char cap
+          const suffix = truncated ? "\n... (truncated — page content continues, use grep_search or a narrower selector for more)" : "";
+          return `Navigated to ${url}. Title: ${title}\nContent Preview: ${content}${suffix}`;
         }
         case "screenshot": {
           if (url) { await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 }); }
@@ -239,8 +276,10 @@ class BrowserManager {
           await page.click(selector);
           await page.waitForNetworkIdle({ timeout: 3000 }).catch(() => { });
           // @ts-ignore
-          const clickContent = await page.evaluate(() => document.body.innerText.substring(0, 3000));
-          return `Clicked "${selector}". Page content after click:\n${clickContent}`;
+          const fullClickContent: string = await page.evaluate(() => document.body.innerText);
+          const { text: clickContent, truncated: clickTruncated } = truncateToTokenBudget(fullClickContent, 750); // ~ previous 3000-char cap
+          const clickSuffix = clickTruncated ? "\n... (truncated — page content continues)" : "";
+          return `Clicked "${selector}". Page content after click:\n${clickContent}${clickSuffix}`;
         }
         case "type": {
           if (!selector || !text) { return "Error: selector and text required for type."; }
@@ -262,7 +301,7 @@ class BrowserManager {
   }
 }
 
-// â”€â”€â”€ System Prompts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── System Prompts ───────────────────────────────────────────────────────────
 const BASE_SYSTEM = `You are CodePartner, a powerful agentic AI coding assistant.
 
 Capabilities:
@@ -320,9 +359,8 @@ DO NOT execute any code changes until the user explicitly approves.
 
 ### Phase 3: EXECUTION (Only After User Approval)
 Once the user says 'proceed', 'approved', 'go ahead', 'yes', or similar:
-- Create a "task" artifact to track progress
-- Execute changes one by one, marking tasks as complete
-- Use \`[x]\` for done, \`[ ]\` for pending, \`[/]\` for in-progress
+- Call \`create_plan\` once with the ordered list of implementation steps from your plan, so progress is tracked in the Plan panel
+- Execute changes one by one, calling \`update_plan_task\` to mark each step done as you finish it
 
 ### Phase 4: VERIFICATION & WALKTHROUGH
 - Run tests if applicable using \`run_tests\`
@@ -341,8 +379,20 @@ Do NOT use "run_command" unless explicitly asked. Focus on generating code chang
 const TOOLS = [
   {
     name: "run_command",
-    description: "Run a shell command in the workspace root.",
+    description: "Run a shell command in the workspace root, hidden from the user (runs in a spawned background process, not a visible terminal). Use this for routine commands. For anything the user should watch or might want to type into — dev servers, watch/build processes, interactive CLIs — use run_in_terminal instead.",
     parameters: { type: "object", properties: { command: { type: "string", description: "The command to run." } }, required: ["command"] },
+  },
+  {
+    name: "run_in_terminal",
+    description: "Runs a command in a VISIBLE terminal panel the user can see and interact with, unlike run_command which runs hidden. Use this for dev servers, watch/build processes, interactive CLIs, or anything long-running or worth the user's attention. Set background=true for a command that doesn't exit on its own (e.g. a dev server) to start it and return immediately without waiting for it to finish. Output/exit-code capture depends on VS Code's shell integration being available for the user's shell — when it isn't, the command still runs visibly but output can't be captured automatically.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The command to run." },
+        background: { type: "boolean", description: "If true, start the command and return immediately without waiting for it to finish (for servers/watchers that run indefinitely). Default false." },
+      },
+      required: ["command"],
+    },
   },
   {
     name: "list_dir",
@@ -386,7 +436,7 @@ const TOOLS = [
   },
   {
     name: "call_subagent",
-    description: "Dispatch a specialized SubAgent for a concurrent sub-task.",
+    description: "Dispatch a specialized SubAgent to independently work a sub-task using its own tools and message history, scoped to its type: researcher (web search, docs, read-only file/code search), code_expert (read, edit, create files, run commands), tester (run tests/commands, read files), writer (create files, read files, web search). Request multiple call_subagent calls in one turn to run them concurrently. These agents SHARE the real workspace — for concurrent agents editing the same files, use run_parallel_agents instead. If the repo defines its own custom agent personas (.codepartner/agents/*.md), use list_custom_agents / call_custom_agent instead of one of these fixed built-in types.",
     parameters: {
       type: "object",
       properties: {
@@ -395,6 +445,48 @@ const TOOLS = [
         personality: { type: "string", description: "Optional persona trait (e.g. 'Strict Reviewer', 'Creative Prototyper') to modify behavior." },
       },
       required: ["agent_type", "task"],
+    },
+  },
+  {
+    name: "list_custom_agents",
+    description: "Lists custom agent personas the repo has defined in .codepartner/agents/*.md (name, description, and which tools each one has). Check this before assuming only the four built-in agent types (researcher/code_expert/tester/writer) are available — a repo may define its own, more specific personas.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "call_custom_agent",
+    description: "Runs a repo-defined custom agent persona (from .codepartner/agents/*.md) as a multi-turn, tool-using sub-agent — same underlying mechanism as call_subagent, but the persona/system prompt and tool access come from the repo's own file instead of a fixed built-in type. Use list_custom_agents first to see what's defined.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The custom agent's name, from list_custom_agents." },
+        task: { type: "string", description: "Specific instruction for the agent." },
+      },
+      required: ["name", "task"],
+    },
+  },
+  {
+    name: "run_parallel_agents",
+    description: "Runs 2-8 sub-agents concurrently, each FULLY ISOLATED in its own git branch and checked-out worktree — unlike call_subagent, these can safely edit the same files without conflicting with each other or the user's real working tree, since each operates on its own copy of the repo. Use this for trying several independent approaches to the same problem side by side (e.g. different implementations, different fixes) so the user can compare and pick one. Requires the workspace to be a git repository. Nothing is merged or applied automatically — each agent's branch is left in place with a diff summary for the user to review and merge manually.",
+    parameters: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          minItems: 2,
+          maxItems: 8,
+          items: {
+            type: "object",
+            properties: {
+              agent_type: { type: "string", enum: ["researcher", "code_expert", "tester", "writer"] },
+              task: { type: "string", description: "Specific instruction for this agent — should be independent of the other agents' tasks." },
+              personality: { type: "string" },
+            },
+            required: ["agent_type", "task"],
+          },
+          description: "2-8 independent tasks to run in parallel, each in its own isolated branch.",
+        },
+      },
+      required: ["tasks"],
     },
   },
   {
@@ -408,6 +500,33 @@ const TOOLS = [
         type: { type: "string", enum: ["code", "markdown", "log"], description: "Format of the artifact." },
       },
       required: ["title", "content", "type"],
+    },
+  },
+  {
+    name: "create_plan",
+    description: "Create or replace the structured task checklist shown in the Plan panel, as a JSON array of task descriptions. Call once, after research, with the full ordered list of implementation steps. Use update_plan_task to mark steps done as you complete them.",
+    parameters: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          items: { type: "string" },
+          description: "Ordered list of concise, one-line task descriptions.",
+        },
+      },
+      required: ["tasks"],
+    },
+  },
+  {
+    name: "update_plan_task",
+    description: "Mark a task in the current plan done or not done, by its 0-based index.",
+    parameters: {
+      type: "object",
+      properties: {
+        index: { type: "number", description: "0-based index of the task in the plan." },
+        done: { type: "boolean", description: "Whether the task is now complete." },
+      },
+      required: ["index", "done"],
     },
   },
   {
@@ -425,7 +544,7 @@ const TOOLS = [
   },
   {
     name: "use_skill",
-    description: "Retrieve instructions from a previously saved skill.",
+    description: "Retrieve instructions from a previously saved skill by name. Note: skills whose description keyword-matches the user's current message are already auto-loaded into context at the start of the turn — check context before assuming you need this. Use this for a skill that didn't auto-trigger, or one you want by exact name.",
     parameters: {
       type: "object",
       properties: {
@@ -436,7 +555,7 @@ const TOOLS = [
   },
   {
     name: "list_skills",
-    description: "List all currently available skills.",
+    description: "List all currently available skills (name + description) to see what exists, e.g. before deciding whether to create a new one or call use_skill on an existing one that didn't auto-trigger.",
     parameters: { type: "object", properties: {} },
   },
   {
@@ -527,7 +646,7 @@ const TOOLS = [
   },
   {
     name: "commit_git_changes",
-    description: "Commits staged changes to the git repository.",
+    description: "Commits staged changes to the git repository. If the user's request implies opening a PR (or after committing to a feature branch), consider offering create_pull_request as the next step rather than stopping at the local commit.",
     parameters: {
       type: "object",
       properties: {
@@ -538,7 +657,7 @@ const TOOLS = [
   },
   {
     name: "create_pull_request",
-    description: "Create a GitHub pull request for the current branch.",
+    description: "Push the current branch (setting upstream if needed) and create a GitHub pull request for it against a base branch. Requires GitHub authentication (VS Code will prompt to sign in if needed) and a GitHub remote. Fails clearly if the current branch is the same as the base branch — create a feature branch first.",
     parameters: {
       type: "object",
       properties: {
@@ -552,10 +671,152 @@ const TOOLS = [
 ];
 
 // ─── Activate ─────────────────────────────────────────────────────────────────
+/**
+ * One-time migration: if a plaintext API key is still sitting in
+ * settings.json (old versions stored it via codepartner.apiKey), move it
+ * into SecretStorage and blank out the setting everywhere it's set.
+ *
+ * Settings Sync and workspace settings.json are not safe places for a
+ * credential — SecretStorage is backed by the OS keychain and never syncs
+ * as plaintext.
+ */
+async function migrateApiKeyToSecretStorage(context: vscode.ExtensionContext, output: vscode.OutputChannel): Promise<void> {
+  const config = vscode.workspace.getConfiguration("codepartner");
+  const inspected = config.inspect<string>("apiKey");
+  const plaintextValues = [
+    { value: inspected?.globalValue, target: vscode.ConfigurationTarget.Global },
+    { value: inspected?.workspaceValue, target: vscode.ConfigurationTarget.Workspace },
+    { value: inspected?.workspaceFolderValue, target: vscode.ConfigurationTarget.WorkspaceFolder },
+  ].filter((v) => typeof v.value === "string" && v.value.trim() !== "");
+
+  if (plaintextValues.length === 0) {
+    return;
+  }
+
+  // Only move it into SecretStorage if nothing is stored there yet, so we
+  // never clobber a key the user has already set via the new command.
+  const existingSecret = await context.secrets.get(API_KEY_SECRET_KEY);
+  if (!existingSecret) {
+    const newest = plaintextValues[0].value!.trim();
+    await context.secrets.store(API_KEY_SECRET_KEY, newest);
+    output.appendLine("[CodePartner] Migrated API key from settings.json to SecretStorage.");
+  }
+
+  for (const { target } of plaintextValues) {
+    try {
+      await config.update("apiKey", undefined, target);
+    } catch {
+      // Target scope may not apply (e.g. no workspace folder) — safe to ignore.
+    }
+  }
+  output.appendLine("[CodePartner] Cleared plaintext API key from settings.");
+  vscode.window.showInformationMessage(
+    "CodePartner: your API key was moved out of settings.json into secure storage. Use \"CodePartner: Set API Key\" to update it going forward."
+  );
+}
+
+/**
+ * Phase 1.6 — the most permissive autonomy tier ("yolo") is deliberately
+ * hard to enable by accident: every time it's active without having been
+ * confirmed this session, show a blocking modal explaining exactly what
+ * it does. Declining reverts the setting instead of silently proceeding.
+ */
+const YOLO_CONFIRMED_KEY = "codepartner.yoloConfirmedThisSession";
+
+async function confirmYoloModeIfNeeded(context: vscode.ExtensionContext, output: vscode.OutputChannel): Promise<void> {
+  const config = vscode.workspace.getConfiguration("codepartner");
+  const policy = config.get<string>("approvalPolicy");
+  if (policy !== "yolo") {
+    await context.workspaceState.update(YOLO_CONFIRMED_KEY, false);
+    return;
+  }
+  const alreadyConfirmed = context.workspaceState.get<boolean>(YOLO_CONFIRMED_KEY, false);
+  if (alreadyConfirmed) {
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    "CodePartner is set to \"Full Auto — No Confirmations.\" It will run shell commands, edit/create files, and make git commits, branches, and pull requests with NO approval prompts. (Actions whose content matches a web search, indexed doc, or @-mentioned file are still confirmed, as a prompt-injection safeguard.)",
+    { modal: true },
+    "I understand, enable it",
+    "Revert to Always Ask"
+  );
+  if (choice === "I understand, enable it") {
+    await context.workspaceState.update(YOLO_CONFIRMED_KEY, true);
+    output.appendLine("[CodePartner] Full Auto (\"yolo\") mode confirmed by user.");
+  } else {
+    await config.update("approvalPolicy", "always-ask", vscode.ConfigurationTarget.Global);
+    output.appendLine("[CodePartner] Full Auto (\"yolo\") mode declined — reverted to always-ask.");
+  }
+}
+
+/** Shows a persistent status bar warning while approvalPolicy is "yolo". */
+function updateAutonomyStatusBar(item: vscode.StatusBarItem): void {
+  const policy = vscode.workspace.getConfiguration("codepartner").get<string>("approvalPolicy");
+  if (policy === "yolo") {
+    item.text = "$(warning) CodePartner: FULL AUTO";
+    item.tooltip = "No approval prompts for shell commands, file edits, or git operations. Click to review settings.";
+    item.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+    item.command = "workbench.action.openSettings";
+    item.show();
+  } else {
+    item.hide();
+  }
+}
+
+/**
+ * Terminal inline assist's "all-terminals" scope means CodePartner is
+ * watching everything typed into every terminal in the workspace, not
+ * just its own — a real permission, same reasoning as yolo mode above:
+ * confirm it explicitly the first time it's active each session, and
+ * revert rather than silently proceed if declined.
+ */
+const TERMINAL_ASSIST_ALL_CONFIRMED_KEY = "codepartner.terminalAssistAllConfirmedThisSession";
+
+async function confirmAllTerminalsAssistIfNeeded(context: vscode.ExtensionContext, output: vscode.OutputChannel): Promise<void> {
+  const config = vscode.workspace.getConfiguration("codepartner");
+  const setting = config.get<string>("terminalInlineAssist");
+  if (setting !== "all-terminals") {
+    await context.workspaceState.update(TERMINAL_ASSIST_ALL_CONFIRMED_KEY, false);
+    return;
+  }
+  const alreadyConfirmed = context.workspaceState.get<boolean>(TERMINAL_ASSIST_ALL_CONFIRMED_KEY, false);
+  if (alreadyConfirmed) {
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    "CodePartner's terminal assist is set to watch ALL terminals in this workspace — not just its own. When any command fails (including ones you type yourself), it'll offer to help, using the failed command and its output. Nothing is sent anywhere unless you click \"Ask CodePartner\" on that offer.",
+    { modal: true },
+    "I understand, enable it",
+    "Revert to CodePartner-only"
+  );
+  if (choice === "I understand, enable it") {
+    await context.workspaceState.update(TERMINAL_ASSIST_ALL_CONFIRMED_KEY, true);
+    output.appendLine("[CodePartner] All-terminals inline assist confirmed by user.");
+  } else {
+    await config.update("terminalInlineAssist", "codepartner-only", vscode.ConfigurationTarget.Global);
+    output.appendLine("[CodePartner] All-terminals inline assist declined — reverted to codepartner-only.");
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("CodePartner");
   context.subscriptions.push(output);
   output.appendLine("CodePartner v2.0 extension activated.");
+
+  migrateApiKeyToSecretStorage(context, output).catch((e) => {
+    output.appendLine(`[CodePartner] API key migration error: ${e.message}`);
+  });
+
+  const autonomyStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+  context.subscriptions.push(autonomyStatusBarItem);
+  confirmYoloModeIfNeeded(context, output).then(() => updateAutonomyStatusBar(autonomyStatusBarItem));
+  confirmAllTerminalsAssistIfNeeded(context, output);
+
+  // Phase 4.1: session token-usage counter. Hidden until the first real
+  // usage data arrives (see updateTokenStatusBar in the provider class).
+  const tokenStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1);
+  tokenStatusBarItem.name = "CodePartner Token Usage";
+  context.subscriptions.push(tokenStatusBarItem);
 
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(
@@ -564,7 +825,7 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  const provider = new CodePartnerSidebarProvider(context, output);
+  const provider = new CodePartnerSidebarProvider(context, output, tokenStatusBarItem);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("codepartner-sidebar", provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -575,12 +836,117 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("codepartner")) {
         provider.refreshModels();
+        provider.applyEmbeddingConfig().catch(() => {});
+        confirmYoloModeIfNeeded(context, output).then(() => updateAutonomyStatusBar(autonomyStatusBarItem));
+        confirmAllTerminalsAssistIfNeeded(context, output);
       }
     })
   );
 
+  // Phase 3.7: invalidate the @-mention file cache on any workspace file
+  // create/delete/rename, so it can't serve a stale listing for longer
+  // than MENTION_CACHE_TTL_MS would already bound it to. A broad watcher
+  // pattern is fine here — invalidation is just clearing one in-memory
+  // field, not a rescan; the rescan itself only happens lazily on the
+  // next @-mention request.
+  const mentionWatcher = vscode.workspace.createFileSystemWatcher("**/*");
+  context.subscriptions.push(mentionWatcher);
+  context.subscriptions.push(mentionWatcher.onDidCreate(() => provider.invalidateMentionCache()));
+  context.subscriptions.push(mentionWatcher.onDidDelete(() => provider.invalidateMentionCache()));
+  context.subscriptions.push(vscode.workspace.onDidRenameFiles(() => provider.invalidateMentionCache()));
+
+  /**
+   * Terminal inline assist: offers to help when a terminal command
+   * fails. Scope (own terminal only, or all terminals in the workspace)
+   * is gated by codepartner.terminalInlineAssist, defaulting to
+   * "disabled" — see confirmAllTerminalsAssistIfNeeded above for why the
+   * broader "all-terminals" scope gets its own one-time confirmation.
+   *
+   * VERIFICATION NOTE: same caveat as run_in_terminal — this depends on
+   * VS Code's Terminal Shell Integration API (onDidStartTerminalShellExecution,
+   * onDidEndTerminalShellExecution), which I could not compile or run
+   * against real typings/a live host in this sandbox. Wrapped in
+   * try/catch so a wrong assumption here disables the feature silently
+   * (logged, not thrown) rather than breaking activation.
+   */
+  try {
+    const terminalOutputBuffers = new WeakMap<vscode.TerminalShellExecution, string>();
+    const terminalIds = new WeakMap<vscode.Terminal, number>();
+    let nextTerminalId = 1;
+    let lastAssistOffer: AssistOfferSignature | null = null;
+
+    const getTerminalId = (terminal: vscode.Terminal): string => {
+      let id = terminalIds.get(terminal);
+      if (id === undefined) {
+        id = nextTerminalId++;
+        terminalIds.set(terminal, id);
+      }
+      return String(id);
+    };
+
+    context.subscriptions.push(
+      vscode.window.onDidStartTerminalShellExecution((e) => {
+        terminalOutputBuffers.set(e.execution, "");
+        (async () => {
+          try {
+            for await (const chunk of e.execution.read()) {
+              terminalOutputBuffers.set(e.execution, (terminalOutputBuffers.get(e.execution) || "") + chunk);
+            }
+          } catch {
+            // Reading can fail if the terminal closes mid-command, etc. —
+            // safe to ignore; the assist offer just won't have output.
+          }
+        })();
+      })
+    );
+
+    context.subscriptions.push(
+      vscode.window.onDidEndTerminalShellExecution((e) => {
+        const setting = vscode.workspace.getConfiguration("codepartner").get<string>("terminalInlineAssist") || "disabled";
+        if (setting === "disabled") {
+          terminalOutputBuffers.delete(e.execution);
+          return;
+        }
+        if (setting === "codepartner-only" && !provider.isOwnTerminal(e.terminal)) {
+          terminalOutputBuffers.delete(e.execution);
+          return;
+        }
+        if (!isFailureWorthAssisting(e.exitCode)) {
+          terminalOutputBuffers.delete(e.execution);
+          return;
+        }
+
+        const commandLine = e.execution.commandLine?.value || "(unknown command)";
+        const capturedOutput = terminalOutputBuffers.get(e.execution) || "";
+        terminalOutputBuffers.delete(e.execution);
+
+        const signature: AssistOfferSignature = {
+          terminalId: getTerminalId(e.terminal),
+          commandLine,
+          exitCode: e.exitCode as number,
+          timestamp: Date.now(),
+        };
+        if (!shouldOfferAssist(lastAssistOffer, signature)) {
+          return;
+        }
+        lastAssistOffer = signature;
+
+        const shortCommand = commandLine.length > 60 ? `${commandLine.slice(0, 60)}...` : commandLine;
+        vscode.window.showInformationMessage(`Command failed (exit ${e.exitCode}): ${shortCommand}`, "Ask CodePartner")
+          .then((choice) => {
+            if (choice === "Ask CodePartner") {
+              const cleaned = stripAnsiCodes(capturedOutput);
+              provider.submitExternalPrompt(buildAssistPrompt(commandLine, e.exitCode as number, cleaned));
+            }
+          });
+      })
+    );
+  } catch (e: any) {
+    provider.logDiagnostic("error", "Terminal Assist", `Unavailable — shell integration API not present in this VS Code version: ${e.message}`);
+  }
+
   // ── Inline Completion Provider ──
-  const inlineProvider = new CodePartnerInlineCompletionProvider(output);
+  const inlineProvider = new CodePartnerInlineCompletionProvider(context, output);
   context.subscriptions.push(
     vscode.languages.registerInlineCompletionItemProvider(
       { pattern: "**" },
@@ -628,6 +994,41 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.newChat", () => {
+      provider.newChat();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.cancelActiveTask", () => {
+      provider.cancelActiveTask();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.setApiKey", async () => {
+      const key = await vscode.window.showInputBox({
+        title: "CodePartner: Set API Key",
+        prompt: "Enter your LLM provider API key. It's stored in your OS keychain, never in settings.json.",
+        password: true,
+        ignoreFocusOut: true,
+        placeHolder: "sk-...",
+      });
+      if (key === undefined) {
+        return; // User cancelled.
+      }
+      if (key.trim() === "") {
+        await context.secrets.delete(API_KEY_SECRET_KEY);
+        vscode.window.showInformationMessage("CodePartner: API key cleared.");
+      } else {
+        await context.secrets.store(API_KEY_SECRET_KEY, key.trim());
+        vscode.window.showInformationMessage("CodePartner: API key saved securely.");
+      }
+      provider.refreshModels();
+    })
+  );
+
   output.appendLine("CodePartner: All providers and commands registered.");
 }
 
@@ -644,6 +1045,32 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private modifiedFiles: Set<string> = new Set();
   private fileBackups: Map<string, string> = new Map();
   private fileChangeStats: Map<string, { added: number, removed: number }> = new Map();
+  // Phase 1 — permission model state (session-scoped: resets on window/extension reload).
+  private approvedCommandPrefixes: Set<string> = new Set();
+  private sessionAutoApprove: { fileWrite: boolean; gitWrite: boolean } = { fileWrite: false, gitWrite: false };
+  private untrustedContent = new UntrustedContentTracker();
+  /**
+   * Phase 3.7: cached workspace file listing for @-mention suggestions,
+   * replacing a fresh vscode.workspace.findFiles glob scan on every
+   * keystroke. Invalidated by the file-watcher registered in activate()
+   * and by a TTL as a fallback (see MENTION_CACHE_TTL_MS / getCachedWorkspaceFiles).
+   */
+  private mentionFileCache: MentionCacheState | null = null;
+  /**
+   * Diagnostics panel: a capped, most-recent-first log of actionable
+   * warnings/errors (not routine info logging, which stays in the output
+   * channel only) — distinct from timelineEvents' failed tool calls,
+   * which the Diagnostics tab shows alongside this via a client-side
+   * filter (no separate backend data needed for that half).
+   */
+  private diagnostics: DiagnosticEntry[] = [];
+  /**
+   * Per-turn git checkpoint fallback (Phase 2.4): turnId -> stash-create
+   * SHA ("" means the tree was clean at checkpoint time, i.e. == HEAD).
+   * Used by revertTimelineAction/revertTurn only when the primary
+   * revertContent backup for a given edit isn't available.
+   */
+  private turnGitCheckpoints: Map<string, string> = new Map();
   private agentManager: AgentManager;
   private artifactRegistry?: ArtifactRegistry;
   private browserManager?: BrowserManager;
@@ -655,15 +1082,26 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private executionMode: "planning" | "fast" | "architect" = "fast";
   private skillManager?: SkillManager;
   private architectDrafts: Map<string, string> = new Map();
-  private terminal?: vscode.Terminal;
+  /** The persistent, user-visible terminal used by run_in_terminal (Phase: interactive terminal). Distinct from the hidden spawned processes runCommand/runTests use. */
+  private visibleTerminal?: vscode.Terminal;
+
+  /** True if `terminal` is the one CodePartner itself created via run_in_terminal — used by the terminal inline assistant's "codepartner-only" scope. */
+  public isOwnTerminal(terminal: vscode.Terminal): boolean {
+    return terminal === this.visibleTerminal;
+  }
+  /** The currently in-flight shell command / test run, if any — killed on cancel (Phase 2.1/2.2). */
+  private runningChildProcess?: cp.ChildProcess;
   private gitManager: GitManager;
   private semanticSearch: SemanticSearch;
   private mcpManager: MCPManager;
   private customInstructions: string = "";
+  /** Phase 4.1: cumulative real token usage for this session (from actual API usage data, not an estimate). */
+  private sessionTokenUsage = { input: 0, output: 0 };
 
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly output: vscode.OutputChannel
+    private readonly output: vscode.OutputChannel,
+    private readonly tokenStatusBarItem?: vscode.StatusBarItem
   ) {
     this.currentChatId = Date.now().toString();
     this.messageHistory = [{ role: "system", content: FAST_SYSTEM_PROMPT }];
@@ -689,6 +1127,14 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
 
     // Build semantic search index in the background
     this.semanticSearch.buildIndex().catch(() => {});
+    this.applyEmbeddingConfig().catch((e) => {
+      this.output.appendLine(`[CodePartner] Embedding config error: ${e.message}`);
+    });
+
+    // Phase 4.3: restore the last selected model per workspace, so it
+    // survives a VS Code restart instead of silently falling back to
+    // codepartner.model every time.
+    this.selectedModelId = this.context.workspaceState.get<string>("cp-selected-model-id") || undefined;
 
     // Try to restore last chat
     const lastChatId = this.context.workspaceState.get<string>("cp-last-chat-id");
@@ -700,6 +1146,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
         this.messageHistory = chat.messages;
         this.currentPlan = chat.plan || [];
         this.currentArtifacts = chat.artifacts || [];
+        // Bug: timelineEvents (and therefore every edit_file/create_file's
+        // revertContent backup) was saved to workspaceState by
+        // saveCurrentChat() but never read back in here, so the Timeline
+        // "revert" button had nothing to revert after a reload even
+        // though the backup data was sitting in storage the whole time.
+        this.timelineEvents = chat.timeline || [];
+        this.turnGitCheckpoints = new Map(chat.gitCheckpoints || []);
       }
     }
   }
@@ -738,70 +1191,427 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     this.handleSlashCommand(command);
   }
 
+  /**
+   * Reveals the sidebar and submits a full prompt as if the user had
+   * typed and sent it — used by the terminal inline assistant's "Ask
+   * CodePartner" action. Mirrors executeSlashCommand's reveal-then-wait
+   * pattern, but calls handlePrompt directly since this is a full prompt
+   * (a failed command + its output), not a "/command" shorthand.
+   */
+  public async submitExternalPrompt(promptText: string): Promise<void> {
+    await vscode.commands.executeCommand("workbench.view.extension.codepartner-view-container");
+    await new Promise(r => setTimeout(r, 300));
+    this.handlePrompt(promptText);
+  }
+
   public updateStatus(msg: string) {
     this._view?.webview.postMessage({ type: "status", value: msg });
   }
 
-  public async runInternalAgent(agentType: string, task: string, personality?: string): Promise<string> {
-    // This is a specialized sub-call to the LLM
+  /**
+   * Logs an actionable warning/error to both the output channel (as
+   * before — this doesn't replace that) and the Diagnostics tab, so it's
+   * still visible after the transient status toast (if any) is gone.
+   * Reserved for things worth a user's attention later, not routine info
+   * logging — most output.appendLine calls elsewhere are left as-is on
+   * purpose.
+   */
+  public logDiagnostic(severity: "warning" | "error", source: string, message: string): void {
+    this.output.appendLine(`[CodePartner] [${source}] ${message}`);
+    this.diagnostics = addDiagnostic(this.diagnostics, { severity, source, message });
+    this._view?.webview.postMessage({ type: "diagnostics", value: this.diagnostics });
+  }
+
+  /**
+   * Phase 4.4: shows a one-time explanatory tip the first time a user
+   * switches into a given mode, using globalState (not per-workspace) so
+   * it doesn't re-appear in every new project once seen.
+   */
+  private showFirstRunTipIfNeeded(mode: "architect" | "planning", tip: string): void {
+    const key = `cp-seen-tip-${mode}`;
+    if (this.context.globalState.get<boolean>(key)) {
+      return;
+    }
+    this.context.globalState.update(key, true);
+    const label = mode === "architect" ? "Architect Mode" : "Planning Mode";
+    vscode.window.showInformationMessage(`CodePartner — ${label} ${tip}`);
+  }
+
+  /**
+   * Phase 4.1: refreshes the status bar with this session's real
+   * cumulative token usage (from actual API usage data — see the doc
+   * comment on usageExtraction.ts for why this shows token counts rather
+   * than a dollar-cost estimate).
+   */
+  private updateTokenStatusBar(): void {
+    if (!this.tokenStatusBarItem) {return;}
+    const total = this.sessionTokenUsage.input + this.sessionTokenUsage.output;
+    if (total === 0) {
+      this.tokenStatusBarItem.hide();
+      return;
+    }
+    this.tokenStatusBarItem.text = `$(symbol-numeric) ${formatTokenCount(total)}`;
+    this.tokenStatusBarItem.tooltip = `CodePartner session usage: ${this.sessionTokenUsage.input.toLocaleString()} input, ${this.sessionTokenUsage.output.toLocaleString()} output tokens (from provider-reported usage, this session only).`;
+    this.tokenStatusBarItem.show();
+  }
+
+  /**
+   * Reads the LLM provider API key from SecretStorage. This is the only
+   * supported way to read the key — see migrateApiKeyToSecretStorage() for
+   * why it no longer lives in settings.json.
+   */
+  private async getApiKey(): Promise<string> {
+    const key = await this.context.secrets.get(API_KEY_SECRET_KEY);
+    return (key || "").trim();
+  }
+
+  /**
+   * Reads embedding-search settings and pushes them into SemanticSearch.
+   * Strictly opt-in — codepartner.embeddingProvider defaults to
+   * "disabled", meaning TF-IDF-only, zero behavior/cost change from
+   * before this feature existed. "same-as-chat" resolves to whatever
+   * codepartner.provider is configured, EXCEPT Anthropic, which has no
+   * embeddings endpoint — that case logs once and falls back to TF-IDF
+   * (configureEmbeddings(null)) rather than trying and failing repeatedly.
+   */
+  public async applyEmbeddingConfig(): Promise<void> {
+    const config = vscode.workspace.getConfiguration("codepartner");
+    const setting = config.get<string>("embeddingProvider") || "disabled";
+
+    if (setting === "disabled") {
+      this.semanticSearch.configureEmbeddings(null);
+      return;
+    }
+
+    let providerType: "openai" | "azure" | "google" | "ollama";
+    if (setting === "same-as-chat") {
+      const chatProvider = config.get<string>("provider") || "openai";
+      if (chatProvider === "anthropic") {
+        this.logDiagnostic("warning", "Embeddings", "embeddingProvider is \"same-as-chat\" but the chat provider (Anthropic) has no embeddings endpoint — using TF-IDF search instead. Set codepartner.embeddingProvider explicitly (e.g. \"openai\") to use embeddings anyway.");
+        this.semanticSearch.configureEmbeddings(null);
+        return;
+      }
+      if (chatProvider !== "openai" && chatProvider !== "azure" && chatProvider !== "google" && chatProvider !== "ollama") {
+        // A custom/OpenAI-compatible chat endpoint — treat as openai-shaped.
+        providerType = "openai";
+      } else {
+        providerType = chatProvider as "openai" | "azure" | "google" | "ollama";
+      }
+    } else if (setting === "openai" || setting === "azure" || setting === "google" || setting === "ollama") {
+      providerType = setting;
+    } else {
+      this.semanticSearch.configureEmbeddings(null);
+      return;
+    }
+
+    const apiKey = providerType === "ollama" ? "" : await this.getApiKey();
+    const apiEndpoint = config.get<string>("embeddingEndpoint")?.trim() || (setting === "same-as-chat" ? config.get<string>("apiEndpoint")?.trim() || "" : "");
+    const model = config.get<string>("embeddingModel")?.trim() || "";
+
+    this.semanticSearch.configureEmbeddings({ providerType, apiEndpoint, apiKey, model });
+  }
+
+  /**
+   * Scans text that's about to be sent somewhere external (an LLM prompt,
+   * or a GitHub issue in the feedback path) for anything that looks like a
+   * credential, and — if found — warns visibly without stripping it. See
+   * secretScanner.ts for the rationale.
+   */
+  private warnIfSecrets(text: string, sourceLabel: string): void {
+    const findings = scanForSecrets(text);
+    if (findings.length === 0) {return;}
+    const summary = summarizeFindings(findings, sourceLabel);
+    this._view?.webview.postMessage({ type: "status", value: summary });
+    // Also logged to Diagnostics (not just the transient status toast) —
+    // "why did the model see something that looked like a credential" is
+    // exactly the kind of thing worth being able to review later.
+    this.logDiagnostic("warning", "Secret Scan", summary);
+  }
+
+  /**
+   * Runs a sub-agent's task as a real multi-turn, tool-using loop (Phase
+   * 3.1) — previously this was a single non-tool-using completion, which
+   * is why the system prompt's "Multi-Agent" claim didn't match reality.
+   * Each sub-agent gets its own message history (not shared with the
+   * main conversation) and a tool list scoped to its agentType (see
+   * subAgentTools.ts). Tool execution still goes through the same
+   * executeTool() as the main agent, so approval gating, secret
+   * scanning, and the prompt-injection guard all still apply.
+   *
+   * When the top-level model requests multiple call_subagent calls in
+   * one turn, executeTool's existing Promise.all over that turn's tool
+   * calls already runs them concurrently — this method didn't need its
+   * own concurrency mechanism, just to stop being a single blocking call.
+   *
+   * `workingRoot` (Phase 5.5): when set, this agent's file/shell tool
+   * calls are scoped to that directory (a git worktree) instead of the
+   * real workspace root — see runParallelAgents.
+   */
+  public async runInternalAgent(agentType: string, task: string, personality?: string, workingRoot?: string): Promise<string> {
+    const allTools = [...TOOLS, ...this.mcpManager.getTools()];
+    const scopedTools = getScopedTools(agentType, allTools);
+
+    const personalityText = personality ? `\nAdopt this personality trait: ${personality}` : "";
+    const isolationNote = workingRoot ? `\nYou are working in an isolated copy of the repo on your own git branch — nothing you do here affects the user's actual files until they choose to merge your branch.` : "";
+    const toolsNote = scopedTools.length > 0
+      ? `\nYou have access to these tools: ${scopedTools.map((t) => t.name).join(", ")}. Use them as needed, then give your final answer as plain text once done.`
+      : `\nYou do not have tool access for this task — answer directly from reasoning.`;
+    const subPrompt = `You are a specialized SubAgent: ${agentType}.${personalityText}${isolationNote}
+Your task is: ${task}${toolsNote}
+Provide a concise, high-quality result.`;
+
+    return this.runAgentLoop(`Sub-agent (${agentType})`, subPrompt, scopedTools, workingRoot);
+  }
+
+  /**
+   * Runs a repo-defined custom agent (.codepartner/agents/*.md — see
+   * customAgents.ts) through the same multi-turn tool-using loop as the
+   * built-in sub-agent types. Unlike the four built-ins, tool access
+   * comes from the file's own `tools:` frontmatter, not a fixed map, and
+   * the file's body IS the system prompt (no persona template wrapping
+   * it) — a custom agent should read as exactly what the repo author
+   * wrote, not "SubAgent: <name>. <their text>."
+   */
+  public async runCustomAgent(name: string, task: string, workingRoot?: string): Promise<string> {
+    const agents = await this.loadCustomAgents();
+    const agent = agents.find((a) => a.name === name);
+    if (!agent) {
+      const available = agents.length > 0 ? agents.map((a) => a.name).join(", ") : "(none found)";
+      return `Error: no custom agent named "${name}" in .codepartner/agents/. Available: ${available}`;
+    }
+
+    const allTools = [...TOOLS, ...this.mcpManager.getTools()];
+    const scopedTools = resolveAgentTools(agent, allTools);
+    const unknown = findUnknownAgentTools(agent, allTools);
+    if (unknown.length > 0) {
+      this.logDiagnostic("warning", "Custom Agent", `Custom agent "${agent.name}" declares unknown tool(s) in its frontmatter, ignored: ${unknown.join(", ")}`);
+    }
+
+    const isolationNote = workingRoot ? `\n\nYou are working in an isolated copy of the repo on your own git branch — nothing you do here affects the user's actual files until they choose to merge your branch.` : "";
+    const toolsNote = scopedTools.length > 0
+      ? `\n\nYou have access to these tools: ${scopedTools.map((t) => t.name).join(", ")}.`
+      : `\n\nYou do not have tool access for this task — answer directly from reasoning.`;
+    const systemPrompt = `${agent.instructions}${isolationNote}${toolsNote}\n\nYour current task: ${task}`;
+
+    return this.runAgentLoop(`Custom agent (${agent.name})`, systemPrompt, scopedTools, workingRoot);
+  }
+
+  /**
+   * The multi-turn, tool-using loop shared by runInternalAgent (built-in
+   * sub-agent types) and runCustomAgent (repo-defined .agent.md
+   * personas) — extracted so custom agents didn't need a second copy of
+   * this logic. `agentLabel` is only used for status/error messages.
+   */
+  private async runAgentLoop(agentLabel: string, systemPrompt: string, scopedTools: any[], workingRoot?: string): Promise<string> {
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const apiKey = config.get<string>("apiKey")?.trim() || "";
+    const apiKey = await this.getApiKey();
     const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
 
-    const personalityText = personality ? `\nAdopt this personality trait: ${personality}` : "";
-    const subPrompt = `You are a specialized SubAgent: ${agentType}.${personalityText}
-Your task is: ${task}
-Provide a concise, high-quality result. Do not use tools. Just answer.`;
+    const scopedToolNames = new Set(scopedTools.map((t) => t.name));
+    const subMessages: ProviderMessage[] = [{ role: "system", content: systemPrompt }];
+    const MAX_SUBAGENT_ITERATIONS = 6; // Smaller than the main loop's 15 — sub-agent tasks should be narrowly scoped.
 
-    let url = "";
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    let body: any = {};
+    for (let i = 0; i < MAX_SUBAGENT_ITERATIONS; i++) {
+      const { url, headers, body } = buildProviderRequest({
+        providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
+        messages: subMessages,
+        tools: scopedTools.length > 0 ? scopedTools : undefined,
+        useSystemRole: true,
+        maxTokens: 2048,
+        stream: false,
+      });
 
-    const endpoint = apiEndpoint.replace(/\/$/, "");
+      let res;
+      try {
+        res = await axios.post(url, body, { headers });
+      } catch (e: any) {
+        return `Error in ${agentLabel}: ${e.response?.data?.error?.message || e.message}`;
+      }
 
-    if (providerType === "azure") {
-      url = `${endpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
-      headers["api-key"] = apiKey;
-      body = {
-        messages: [{ role: "system", content: subPrompt }],
-        max_tokens: 2048,
-      };
-    } else if (providerType === "anthropic") {
-      url = apiEndpoint || "https://api.anthropic.com/v1/messages";
-      headers["x-api-key"] = apiKey;
-      headers["anthropic-version"] = "2023-06-01";
-      body = {
-        model: modelId,
-        system: subPrompt,
-        messages: [{ role: "user", content: "Begin your task." }],
-        max_tokens: 2048,
-      };
-    } else if (providerType === "google") {
-      url = `${apiEndpoint || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`;
-      headers["Authorization"] = `Bearer ${apiKey}`;
-      body = {
-        model: modelId,
-        messages: [{ role: "system", content: subPrompt }],
-        max_tokens: 2048,
-      };
-    } else {
-      url = `${endpoint || "https://api.openai.com/v1"}/chat/completions`;
-      headers["Authorization"] = `Bearer ${apiKey}`;
-      body = {
-        model: modelId,
-        messages: [{ role: "system", content: subPrompt }],
-        max_tokens: 2048,
-      };
+      const assistantMsg = extractAssistantMessage(providerType, res.data);
+      subMessages.push(assistantMsg);
+
+      const toolCalls = extractToolCalls(providerType, res.data);
+      if (toolCalls.length === 0) {
+        return (assistantMsg.content as string) || `(${agentLabel} returned no content.)`;
+      }
+
+      this.updateStatus(`${agentLabel}${workingRoot ? " (isolated)" : ""}: using ${toolCalls.map((tc) => tc.function.name).join(", ")}...`);
+
+      for (const tc of toolCalls) {
+        let toolResult: string;
+        if (!scopedToolNames.has(tc.function.name)) {
+          // Defense in depth: refuse here too, not just by omitting the
+          // tool from the request — a model can still hallucinate a call
+          // to a tool it wasn't offered.
+          toolResult = `Error: the "${tc.function.name}" tool is not available to ${agentLabel}.`;
+        } else {
+          const parsed = repairJsonParse(tc.function.arguments);
+          if (parsed === null) {
+            toolResult = `Error: could not parse arguments for "${tc.function.name}". Retry with valid JSON.`;
+          } else {
+            toolResult = await this.executeTool(tc.function.name, parsed.value, workingRoot);
+          }
+        }
+        subMessages.push({ role: "tool", content: typeof toolResult === "string" ? toolResult : JSON.stringify(toolResult), tool_call_id: tc.id, name: tc.function.name });
+      }
     }
 
-    const res = await axios.post(url, body, { headers });
-    if (providerType === "anthropic") {
-      return res.data.content[0].text;
+    return `${agentLabel} reached its iteration limit (${MAX_SUBAGENT_ITERATIONS}) without a final answer. It may have made partial progress via tool calls above.`;
+  }
+
+  /** Scans .codepartner/agents/*.md in the workspace root for custom agent definitions (see customAgents.ts). Returns an empty array if the folder doesn't exist or no workspace is open. */
+  private async loadCustomAgents(): Promise<CustomAgentDefinition[]> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {return [];}
+    const agentsDir = path.join(root, ".codepartner", "agents");
+    if (!fs.existsSync(agentsDir)) {return [];}
+
+    const agents: CustomAgentDefinition[] = [];
+    try {
+      const files = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
+      for (const file of files) {
+        try {
+          const content = fs.readFileSync(path.join(agentsDir, file), "utf8");
+          const parsed = parseCustomAgentFile(path.basename(file, ".md"), content);
+          if (parsed) {agents.push(parsed);}
+        } catch (e: any) {
+          this.output.appendLine(`[CodePartner] Failed to read custom agent file ${file}: ${e.message}`);
+        }
+      }
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] Failed to list .codepartner/agents: ${e.message}`);
     }
-    return res.data.choices[0].message.content;
+    return agents;
+  }
+
+  /** Tool implementation for list_custom_agents — a plain text summary, matching how list_skills reports back to the model. */
+  private async listCustomAgentsTool(): Promise<string> {
+    const agents = await this.loadCustomAgents();
+    if (agents.length === 0) {
+      return "No custom agents defined. Add .md files to .codepartner/agents/ in the workspace root to define repo-specific agent personas.";
+    }
+    return agents
+      .map((a) => `- ${a.name}: ${a.description}${a.tools.length > 0 ? ` (tools: ${a.tools.join(", ")})` : " (no tool access)"}`)
+      .join("\n");
+  }
+
+  /**
+   * Phase 5.5: runs 2-8 sub-agents concurrently, each isolated in its own
+   * git worktree + branch, so they can safely edit the same files without
+   * conflicting with each other or the user's real working tree.
+   *
+   * Sequencing: worktrees are created SEQUENTIALLY (git worktree add
+   * briefly locks the repo's .git directory; doing this concurrently
+   * risked lock contention I couldn't fully rule out without a way to
+   * stress-test it against a real concurrent-access scenario). Once each
+   * worktree exists as an isolated directory, the actual agent runs (the
+   * expensive part — LLM calls and tool use) DO run concurrently via
+   * Promise.all, which is safe since each agent's filesystem is already
+   * fully separate by that point.
+   *
+   * Each agent's uncommitted work is auto-committed before its worktree
+   * is removed — verified against a real repo that this is genuinely
+   * lossless (the branch survives worktree removal with all changes
+   * intact) before relying on it. Worktrees are cleaned up after each
+   * run to avoid leaving scratch directories behind; the branches
+   * themselves are NOT deleted and nothing is merged automatically —
+   * reviewing and merging is left to the user.
+   *
+   * Known limitation: cancellation (the "cancel" button) only tracks one
+   * in-flight process at a time (this.runningChildProcess), so if
+   * multiple isolated agents are running shell commands concurrently,
+   * cancel may not stop all of them. Flagged rather than silently
+   * accepted — a full fix would need per-agent process tracking.
+   */
+  private async runParallelAgents(tasks: any): Promise<string> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return "Error: No workspace open.";
+    }
+    if (!isGitRepo(root)) {
+      return "Error: run_parallel_agents requires the workspace to be a git repository (each agent needs its own branch/worktree).";
+    }
+    if (!Array.isArray(tasks) || tasks.length < 2 || tasks.length > 8) {
+      return "Error: \"tasks\" must be an array of 2 to 8 {agent_type, task} entries.";
+    }
+
+    const runId = Date.now().toString().slice(-6);
+    const scratchDir = path.join(os.tmpdir(), "codepartner-worktrees");
+    if (!fs.existsSync(scratchDir)) {
+      fs.mkdirSync(scratchDir, { recursive: true });
+    }
+
+    interface AgentPlan { agentType: string; task: string; personality?: string; branchName: string; worktreePath: string; }
+    const plans: AgentPlan[] = tasks.map((t: any, i: number) => {
+      const agentType = String(t?.agent_type || "code_expert");
+      const task = String(t?.task || "");
+      const branchName = `codepartner/${agentType}-${toBranchSafeSegment(task)}-${runId}-${i}`;
+      const worktreePath = path.join(scratchDir, `${runId}-${i}`);
+      return { agentType, task, personality: t?.personality, branchName, worktreePath };
+    });
+
+    // Create worktrees sequentially — see method doc comment.
+    const created: AgentPlan[] = [];
+    const setupErrors: string[] = [];
+    for (const plan of plans) {
+      const result = createWorktree(root, plan.worktreePath, plan.branchName);
+      if (result.ok) {
+        created.push(plan);
+      } else {
+        setupErrors.push(`${plan.agentType} (${plan.branchName}): failed to create worktree — ${result.error}`);
+      }
+    }
+
+    if (created.length === 0) {
+      return `Error: could not create any worktrees.\n${setupErrors.join("\n")}`;
+    }
+
+    this._view?.webview.postMessage({ type: "status", value: `Running ${created.length} agents in parallel, isolated on separate branches...` });
+
+    let baseBranchResult = "";
+    try {
+      baseBranchResult = cp.execFileSync("git", ["branch", "--show-current"], { cwd: root, encoding: "utf8" }).trim();
+    } catch {
+      // Detached HEAD or another edge case — fall back to HEAD below rather than aborting the whole run.
+    }
+
+    const outcomes = await Promise.all(created.map(async (plan) => {
+      let finalAnswer: string;
+      try {
+        finalAnswer = await this.runInternalAgent(plan.agentType, plan.task, plan.personality, plan.worktreePath);
+      } catch (e: any) {
+        finalAnswer = `Error: ${e.message}`;
+      }
+
+      const commitResult = commitAllIfDirty(plan.worktreePath, `codepartner: ${plan.agentType} — ${plan.task.slice(0, 72)}`);
+      const diffResult = getBranchDiffStat(root, baseBranchResult || "HEAD", plan.branchName);
+      removeWorktree(root, plan.worktreePath, true);
+
+      return {
+        plan,
+        finalAnswer,
+        committed: commitResult.ok ? commitResult.committed : false,
+        diffSummary: diffResult.ok ? diffResult.summary : `(could not compute diff: ${diffResult.error})`,
+      };
+    }));
+
+    const sections = outcomes.map((o, i) =>
+      `### Agent ${i + 1}: ${o.plan.agentType} — branch \`${o.plan.branchName}\`\n` +
+      `Task: ${o.plan.task}\n\n` +
+      `${o.committed ? "Changes committed to this branch." : "No file changes were made."}\n\n` +
+      `Files changed:\n${o.diffSummary}\n\n` +
+      `Result: ${o.finalAnswer}`
+    );
+
+    const displayBaseBranch = baseBranchResult || "HEAD";
+    const header = `Ran ${created.length} agents in parallel, each isolated on its own branch (nothing was applied to your working tree or merged — review each branch and merge whichever you want, e.g. \`git diff ${displayBaseBranch}...codepartner/...\` or check one out).`;
+    const errorNote = setupErrors.length > 0 ? `\n\n${setupErrors.length} task(s) could not start:\n${setupErrors.join("\n")}` : "";
+
+    return `${header}${errorNote}\n\n${sections.join("\n\n---\n\n")}`;
   }
 
   public resolveWebviewView(
@@ -828,6 +1638,18 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
         this.currentArtifacts.forEach(a => this._view?.webview.postMessage({ type: "artifact", value: a }));
       }
+      // Restored separately from the messageHistory check above: a chat
+      // can have timeline/revert data worth showing even when this is the
+      // very first webview resolve after a restart.
+      if (this.timelineEvents.length > 0) {
+        this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
+      }
+      // Diagnostics are session-scoped (not persisted per-chat like the
+      // timeline), but still worth sending on every resolve so switching
+      // webview visibility doesn't lose what's accumulated this session.
+      if (this.diagnostics.length > 0) {
+        this._view?.webview.postMessage({ type: "diagnostics", value: this.diagnostics });
+      }
 
       this.output.appendLine("[CodePartner] Webview view resolved successfully.");
     } catch (e: any) {
@@ -840,15 +1662,26 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         case "attachFiles":
           this.handleAttachFiles();
           break;
+        case "attachFilesByPath": {
+          // Phase: drag-and-drop of a file dragged from VS Code's own
+          // Explorer — the webview only got URI strings (text/uri-list),
+          // not file content. vscode.Uri.parse(...).fsPath handles the
+          // platform-specific parts (Windows drive letters, encoding)
+          // correctly, rather than hand-parsing the URI string in JS.
+          const uris: string[] = data.value || [];
+          const fsPaths = uris
+            .map(u => {
+              try { return vscode.Uri.parse(u).fsPath; } catch { return null; }
+            })
+            .filter((p): p is string => !!p);
+          this.attachFilesFromPaths(fsPaths);
+          break;
+        }
         case "prompt":
           this.handlePrompt(data.value, data.attachments);
           break;
         case "cancel":
-          if (this.abortController) {
-            this.abortController.abort();
-            this.abortController = undefined;
-            this.output.appendLine("[CodePartner] Cancelled by user.");
-          }
+          this.cancelActiveTask();
           break;
         case "applyDiff":
           this.showDiffView(data.value);
@@ -880,6 +1713,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           break;
         case "changeModel":
           this.selectedModelId = data.value;
+          this.context.workspaceState.update("cp-selected-model-id", this.selectedModelId);
           this.output.appendLine(`[CodePartner] Model changed to: ${this.selectedModelId}`);
           break;
         case "changeMode":
@@ -887,8 +1721,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           let promptToUse = FAST_SYSTEM_PROMPT;
           if (this.executionMode === "planning") {
             promptToUse = PLANNING_SYSTEM_PROMPT;
+            this.showFirstRunTipIfNeeded("planning", "requires an approved plan (via create_plan) before it will edit or create files — it drafts the plan first and waits for your OK.");
           } else if (this.executionMode === "architect") {
             promptToUse = ARCHITECT_SYSTEM_PROMPT;
+            this.showFirstRunTipIfNeeded("architect", "drafts file edits instead of applying them immediately — review the hunks and choose \"Apply Selected Hunks\" or \"Apply All Drafts\" when ready.");
           }
           this.messageHistory[0] = { role: "system", content: promptToUse };
           this.output.appendLine(`[CodePartner] Mode changed to: ${this.executionMode}`);
@@ -923,6 +1759,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         case "listTimeline":
           this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
           break;
+        case "clearDiagnostics":
+          this.diagnostics = [];
+          this._view?.webview.postMessage({ type: "diagnostics", value: [] });
+          break;
         case "saveSkillFromSuggestion":
           if (this.skillManager) {
             const skillResult = this.skillManager.createSkill(data.name, data.description, data.instructions);
@@ -932,6 +1772,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           break;
         case "applyArchitectDrafts":
           this.applyArchitectDrafts();
+          break;
+        case "applyArchitectHunks":
+          this.applyArchitectHunks(data.value || {});
           break;
         case "revertTimelineAction":
           this.revertTimelineAction(data.chatId, data.timestamp);
@@ -954,7 +1797,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       const editor = vscode.window.activeTextEditor;
       if (editor) {
         const doc = editor.document;
-        codeContent = `\n\n**Attached Code** (\`${path.basename(doc.fileName)}\`):\n\`\`\`\n${doc.getText().substring(0, 3000)}\n\`\`\``;
+        const snippet = doc.getText().substring(0, 3000);
+        // This snippet goes into a public GitHub issue, so warn loudly.
+        this.warnIfSecrets(snippet, `attached code (${path.basename(doc.fileName)}) — this will be posted to a public GitHub issue`);
+        codeContent = `\n\n**Attached Code** (\`${path.basename(doc.fileName)}\`):\n\`\`\`\n${snippet}\n\`\`\``;
       }
     }
 
@@ -983,14 +1829,14 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     try {
       const success = await vscode.env.openExternal(vscode.Uri.parse(issueUrl));
       if (success) {
-        this._view?.webview.postMessage({ type: "status", value: "âœ… Feedback prepared in your email client! Please click 'Send'." });
+        this._view?.webview.postMessage({ type: "status", value: "✅ Feedback prepared in your email client! Please click 'Send'." });
       } else {
         throw new Error("Could not open email client.");
       }
     } catch (e) {
       const fullText = `Title: ${title}\n\n${body}`;
       await vscode.env.clipboard.writeText(fullText);
-      this._view?.webview.postMessage({ type: "status", value: "âš ï¸ Couldn't open mail client. Feedback copied to clipboard instead!" });
+      this._view?.webview.postMessage({ type: "status", value: "⚠️ Couldn't open mail client. Feedback copied to clipboard instead!" });
       vscode.window.showWarningMessage("Could not open your email client. The feedback has been copied to your clipboard.");
     }
   }
@@ -1013,6 +1859,10 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       plan: this.currentPlan,
       artifacts: this.currentArtifacts,
       timeline: this.timelineEvents,
+      // Phase 2.4: persist the git checkpoint refs for this chat's turns
+      // too, so the revert fallback still works after a reload, not just
+      // the primary revertContent backups embedded in `timeline` above.
+      gitCheckpoints: Array.from(this.turnGitCheckpoints.entries()),
       timestamp: Date.now()
     };
 
@@ -1040,6 +1890,11 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       this.currentPlan = chat.plan || [];
       this.currentArtifacts = chat.artifacts || [];
       this.timelineEvents = chat.timeline || [];
+      this.turnGitCheckpoints = new Map(chat.gitCheckpoints || []);
+      // Phase 4.1: token usage counter tracks the active chat, not a
+      // running total across whichever chats were opened this session.
+      this.sessionTokenUsage = { input: 0, output: 0 };
+      this.updateTokenStatusBar();
 
       // Add hiddenFromUI flag to context-heavy messages for UI reloading
       const uiHistory = this.messageHistory.map((m, idx) => ({
@@ -1080,13 +1935,31 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     }
   }
 
-  private newChat() {
+  /** Stops the current turn's LLM stream and/or any in-flight shell command or test run. Also callable via the codepartner.cancelActiveTask keybinding, not just the webview's Stop button. */
+  public cancelActiveTask() {
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = undefined;
+      this.output.appendLine("[CodePartner] Cancelled by user.");
+    }
+    if (this.runningChildProcess) {
+      this.runningChildProcess.kill();
+      this.output.appendLine("[CodePartner] Killed in-flight command/test run.");
+      this.runningChildProcess = undefined;
+    }
+  }
+
+  public newChat() {
     // Save current if it has history
     if (this.messageHistory.length > 1) {
       this.saveCurrentChat();
     }
 
     this.currentChatId = Date.now().toString();
+    // Phase 4.1: token usage counter tracks the current chat, not the
+    // whole VS Code session — a fresh chat is a fresh task, so a fresh count.
+    this.sessionTokenUsage = { input: 0, output: 0 };
+    this.updateTokenStatusBar();
     let sysPrompt = FAST_SYSTEM_PROMPT;
     if (this.executionMode === "planning") {
       sysPrompt = PLANNING_SYSTEM_PROMPT;
@@ -1097,6 +1970,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     this.currentPlan = [];
     this.currentArtifacts = [];
     this.timelineEvents = [];
+    this.turnGitCheckpoints.clear();
     this.architectDrafts.clear();
     this._view?.webview.postMessage({ type: "loadMessages", value: [] });
     this._view?.webview.postMessage({ type: "plan", value: [] });
@@ -1104,7 +1978,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     this.context.workspaceState.update("cp-last-chat-id", this.currentChatId);
     this.sendChatsToWebview();
 
-    const welcomeMsg = "ðŸ‘‹ **Hello! I'm CodePartner.** How can I help you with your code today?\n\nI can help you:\n- ðŸš€ **Build features** and write code\n- ðŸž **Debug issues** and fix errors\n- ðŸ“ **Manage files** and workspace structure\n- ðŸ™ **Automate Git** (diffs, commits, branches)\n- âš¡ **Run commands** in the terminal\n\nWhat are we working on?";
+    const welcomeMsg = "👋 **Hello! I'm CodePartner.** How can I help you with your code today?\n\nI can help you:\n- 🚀 **Build features** and write code\n- 🐞 **Debug issues** and fix errors\n- 📁 **Manage files** and workspace structure\n- 🐙 **Automate Git** (diffs, commits, branches)\n- ⚡ **Run commands** in the terminal\n\nWhat are we working on?";
     this._view?.webview.postMessage({ type: "partial", value: md.render(welcomeMsg) });
     this.messageHistory.push({ role: "assistant", content: welcomeMsg });
   }
@@ -1139,16 +2013,15 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         suggestions.push({ label: "@web", detail: "Search the web", type: "special" });
         suggestions.push({ label: "@workspace", detail: "Entire workspace context", type: "special" });
 
-        // Find files
-        const files = await vscode.workspace.findFiles(
-          `**/*${q}*`,
-          "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}",
-          20
-        );
+        // Phase 3.7: filter the cached workspace listing in memory
+        // instead of re-running vscode.workspace.findFiles on every
+        // keystroke.
+        const cachedFiles = await this.getCachedWorkspaceFiles(root);
+        const matched = filterCachedFiles(cachedFiles, q, 20);
 
-        for (const f of files) {
+        for (const f of matched) {
           suggestions.push({
-            label: "@" + vscode.workspace.asRelativePath(f),
+            label: "@" + f.relPath,
             detail: f.fsPath,
             type: "file"
           });
@@ -1168,24 +2041,37 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
           }
         }
       }
-      // Find folders (manual list shared root)
-      const dirs = fs.readdirSync(root, { withFileTypes: true })
-        .filter(d => d.isDirectory() && !d.name.startsWith(".") && d.name !== "node_modules");
-
-      for (const d of dirs) {
-        if (d.name.toLowerCase().includes(q)) {
-          suggestions.push({
-            label: "@" + d.name + "/",
-            detail: "Folder",
-            type: "folder"
-          });
-        }
-      }
 
       this._view?.webview.postMessage({ type: "suggestions", value: suggestions });
     } catch {
       // ignore
     }
+  }
+
+  /**
+   * Returns the workspace file listing used for @-mention suggestions,
+   * from cache when fresh (Phase 3.7). A fresh full scan only happens
+   * when the cache is empty, stale past MENTION_CACHE_TTL_MS, or was
+   * explicitly invalidated by the file-system watcher registered in
+   * activate().
+   */
+  private async getCachedWorkspaceFiles(root: string): Promise<{ relPath: string; fsPath: string }[]> {
+    if (isCacheFresh(this.mentionFileCache, MENTION_CACHE_TTL_MS)) {
+      return this.mentionFileCache!.files;
+    }
+    const uris = await vscode.workspace.findFiles(
+      "**/*",
+      "{**/node_modules/**,**/.git/**,**/dist/**,**/out/**}",
+      5000
+    );
+    const files = uris.map((f) => ({ relPath: vscode.workspace.asRelativePath(f), fsPath: f.fsPath }));
+    this.mentionFileCache = { files, fetchedAt: Date.now() };
+    return files;
+  }
+
+  /** Drops the cached @-mention file listing so the next request re-scans. Call on any file create/delete/rename. */
+  public invalidateMentionCache(): void {
+    this.mentionFileCache = null;
   }
 
   public refreshModels() {
@@ -1196,8 +2082,8 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
     const config = vscode.workspace.getConfiguration("codepartner");
     const provider = config.get<string>("provider") || "openai";
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const apiKey = config.get<string>("apiKey")?.trim() || "";
-    let currentModel = this.selectedModelId || config.get<string>("model") || "";
+    const apiKey = await this.getApiKey();
+    let currentModel = (this.selectedModelId || config.get<string>("model") || "").trim();
 
     if (provider === "azure") {
       const deployments = config.get<string[]>("azureDeployments") || [];
@@ -1321,9 +2207,16 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
   }
 
   private sendModelsToWebview(selectedId: string) {
+    // Phase 4.5: attach context-window metadata per model, where known,
+    // without mutating this.availableModels itself (keeps the stored
+    // list simple and provider-shaped).
+    const modelsWithMetadata = this.availableModels.map((m) => {
+      const meta = getModelMetadata(m.id);
+      return meta ? { ...m, contextWindow: meta.contextWindow, contextWindowLabel: formatContextWindow(meta.contextWindow) } : m;
+    });
     this._view?.webview.postMessage({
       type: "models",
-      value: this.availableModels,
+      value: modelsWithMetadata,
       selected: selectedId
     });
   }
@@ -1344,12 +2237,25 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       return;
     }
 
+    await this.attachFilesFromPaths(files.map(f => f.fsPath));
+  }
+
+  /**
+   * Reads files from disk and attaches them, in the shape the webview's
+   * existing attachment pipeline already expects. Shared by the file
+   * picker (handleAttachFiles) and drag-and-drop of a file dragged from
+   * VS Code's own Explorer (where the browser drag event carries a
+   * vscode-file:// URI, not real file content the webview can read
+   * directly — unlike dragging a file in from the OS file manager, which
+   * the webview reads client-side; see the "drop" handler in main.js).
+   */
+  private async attachFilesFromPaths(fsPaths: string[]): Promise<void> {
     const attached = [];
-    for (const file of files) {
+    for (const fsPath of fsPaths) {
       try {
-        const content = await fs.promises.readFile(file.fsPath);
+        const content = await fs.promises.readFile(fsPath);
         const base64 = content.toString("base64");
-        const ext = path.extname(file.fsPath).toLowerCase().substring(1);
+        const ext = path.extname(fsPath).toLowerCase().substring(1);
         let mimeType = "application/octet-stream";
 
         if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
@@ -1361,7 +2267,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         }
 
         attached.push({
-          name: path.basename(file.fsPath),
+          name: path.basename(fsPath),
           mimeType,
           data: base64
         });
@@ -1370,7 +2276,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       }
     }
 
-    this._view?.webview.postMessage({ type: "fileAttached", value: attached });
+    if (attached.length > 0) {
+      this._view?.webview.postMessage({ type: "fileAttached", value: attached });
+    }
   }
 
   private async openFileInEditor(relPath: string) {
@@ -1523,7 +2431,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         await editor.edit((editBuilder) => {
           editBuilder.replace(fullRange, aiCode);
         });
-        vscode.window.showInformationMessage("âœ… CodePartner: File updated with AI changes.");
+        vscode.window.showInformationMessage("✅ CodePartner: File updated with AI changes.");
       }
     } catch (err) {
       vscode.window.showErrorMessage("Failed to apply changes: " + err);
@@ -1555,7 +2463,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         "vscode.diff",
         originalUri,
         proposedUri,
-        "CodePartner: Review Changes (Selection) â† Original | AI Proposal â†’"
+        "CodePartner: Review Changes (Selection) ← Original | AI Proposal →"
       );
 
       setTimeout(() => {
@@ -1573,13 +2481,22 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         "vscode.diff",
         originalUri,
         proposedUri,
-        `CodePartner: Review Changes â† ${document.fileName} | AI Suggestion â†’`
+        `CodePartner: Review Changes ← ${document.fileName} | AI Suggestion →`
       );
     }
     vscode.window.showInformationMessage("Review the diff. Use the buttons in the diff editor to Accept or Revert changes.");
   }
 
-  private async getFileMentionsContext(prompt: string): Promise<string> {
+  /**
+   * Phase 3.4: injects @-mentioned file content within a shared token
+   * budget, instead of the previous unbounded injection (this was the
+   * one file-context source with NO cap at all before this change — the
+   * others had fixed character caps, this one had none). `budget` is
+   * shared with the active-editor/other-tabs context added later in the
+   * same turn, so heavy use of one source leaves less room for the rest
+   * rather than each source getting its own independent allowance.
+   */
+  private async getFileMentionsContext(prompt: string, budget: { remaining: number }): Promise<string> {
     const mentionRegex = /@([a-zA-Z0-9_\-./\\]+)/g;
     let match;
     let context = "";
@@ -1595,6 +2512,11 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       }
       seen.add(filename);
 
+      if (budget.remaining <= 0) {
+        this.output.appendLine(`[CodePartner] Skipped @${filename}: context token budget exhausted.`);
+        continue;
+      }
+
       try {
         let files = await vscode.workspace.findFiles(`**/${filename}`, "{**/node_modules/**,**/.git/**,**/dist/**}", 1);
         if (!files.length) {
@@ -1603,8 +2525,14 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         if (files.length) {
           const doc = await vscode.workspace.openTextDocument(files[0]);
           const rel = vscode.workspace.asRelativePath(files[0]);
-          context += `\n--- File: ${rel} ---\n\`\`\`\n${doc.getText()}\n\`\`\`\n\n`;
-          this.output.appendLine(`[CodePartner] Injected file: ${rel}`);
+          const text = doc.getText();
+          this.warnIfSecrets(text, rel);
+          this.untrustedContent.track(text);
+          const { text: capped, truncated } = truncateToTokenBudget(text, budget.remaining);
+          budget.remaining -= estimateTokens(capped);
+          const suffix = truncated ? "\n... (truncated to fit context token budget)" : "";
+          context += `\n--- File: ${rel} ---\n\`\`\`\n${capped}${suffix}\n\`\`\`\n\n`;
+          this.output.appendLine(`[CodePartner] Injected file: ${rel}${truncated ? " (truncated)" : ""}`);
         }
       } catch {
         this.output.appendLine(`[CodePartner] Could not read: ${filename}`);
@@ -1623,7 +2551,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       return "";
     }
 
-    this._view?.webview.postMessage({ type: "status", value: "ðŸ” Searching the web..." });
+    this._view?.webview.postMessage({ type: "status", value: "🔍 Searching the web..." });
 
     try {
       this.output.appendLine(`[CodePartner] Web search: ${query}`);
@@ -1649,7 +2577,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
       }
 
       if (parts.length > 0) {
-        return `\n--- Web Search Results for "${query}" ---\n` + parts.map((p, i) => `${i + 1}. ${p}`).join("\n\n") + "\n\n";
+        const context = `\n--- Web Search Results for "${query}" ---\n` + parts.map((p, i) => `${i + 1}. ${p}`).join("\n\n") + "\n\n";
+        this.untrustedContent.track(context);
+        return context;
       }
 
       const htmlRes = await axios.get(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, { timeout: 8000, headers: { "User-Agent": "Mozilla/5.0" } });
@@ -1661,7 +2591,9 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
         snippets.push(m[1].replace(/<[^>]+>/g, "").trim());
       }
       if (snippets.length) {
-        return `\n--- Web Search Results for "${query}" ---\n` + snippets.map((s, i) => `${i + 1}. ${s}`).join("\n\n") + "\n\n";
+        const context = `\n--- Web Search Results for "${query}" ---\n` + snippets.map((s, i) => `${i + 1}. ${s}`).join("\n\n") + "\n\n";
+        this.untrustedContent.track(context);
+        return context;
       }
     } catch (e: any) {
       this.output.appendLine(`[CodePartner] Web search error: ${e.message}`);
@@ -1691,6 +2623,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
 
       let context = `\n--- Semantic Workspace Search for "${query}" ---\n`;
       results.forEach((r, i) => {
+        this.warnIfSecrets(r.excerpt, r.path);
         context += `\n[${i + 1}] File: ${r.path} (Score: ${r.score.toFixed(2)})\n${r.excerpt}\n`;
       });
       return context + "\n";
@@ -1704,7 +2637,7 @@ Provide a concise, high-quality result. Do not use tools. Just answer.`;
    * Compact the conversation context by summarizing old messages.
    */
   private async compactContext() {
-    if (this.messageHistory.length < 15) return;
+    if (this.messageHistory.length < 15) {return;}
 
     this.output.appendLine("[CodePartner] Compacting context...");
     this.updateStatus("🗜️ Compacting context...");
@@ -1724,46 +2657,22 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       // Call LLM for summary (using fast mode parameters)
       const config = vscode.workspace.getConfiguration("codepartner");
       const providerType = config.get<string>("provider") || "openai";
-      const apiEndpoint = (config.get<string>("apiEndpoint")?.trim() || "").replace(/\/$/, "");
-      const apiKey = config.get<string>("apiKey")?.trim() || "";
+      const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
+      const apiKey = await this.getApiKey();
       const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
       const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
 
-      let url = `${apiEndpoint}/chat/completions`;
-      let headers: any = { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" };
-      let body: any = {
-        model: modelId,
+      const { url, headers, body } = buildProviderRequest({
+        providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
         messages: [{ role: "user", content: prompt }],
-        max_tokens: 1000,
-        temperature: 0.3
-      };
-
-      if (providerType === "anthropic") {
-        url = apiEndpoint || "https://api.anthropic.com/v1/messages";
-        headers = { 
-          "x-api-key": apiKey, 
-          "anthropic-version": "2023-06-01", 
-          "Content-Type": "application/json" 
-        };
-        body = {
-          model: modelId,
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 1000,
-          temperature: 0.3
-        };
-      } else if (providerType === "azure") {
-        url = `${apiEndpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
-        headers = { "api-key": apiKey, "Content-Type": "application/json" };
-      }
+        useSystemRole: true,
+        maxTokens: 1000,
+        temperature: 0.3,
+        stream: false,
+      });
 
       const res = await axios.post(url, body, { headers });
-
-      let summary: string;
-      if (providerType === "anthropic") {
-        summary = res.data?.content?.[0]?.text || "Conversation compacted.";
-      } else {
-        summary = res.data?.choices?.[0]?.message?.content || "Conversation compacted.";
-      }
+      const summary = extractNonStreamedText(providerType, res.data) || "Conversation compacted.";
       
       this.messageHistory = [
         systemMsg,
@@ -1836,14 +2745,27 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       return;
     }
 
+    // Fresh turn — clear anything tracked for the prompt-injection guard
+    // from the previous turn so stale content can't suppress a real check.
+    this.untrustedContent.reset();
+
     // Check for slash command
     if (prompt.startsWith("/")) {
       this.handleSlashCommand(prompt);
       return;
     }
 
-    // Auto-compact if history is getting long
-    if (this.messageHistory.length > 40) {
+    // Auto-compact when history is getting long — either by message count
+    // (the original heuristic) or by an estimated token count (Phase 3.4).
+    // Message count alone can miss a handful of very large messages (e.g.
+    // large pasted files) that approach context limits well before 40
+    // messages accumulate.
+    const HISTORY_TOKEN_COMPACTION_THRESHOLD = 20000; // conservative; most current models have well more headroom than this
+    const estimatedHistoryTokens = this.messageHistory.reduce(
+      (sum, m) => sum + estimateTokens(typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")),
+      0
+    );
+    if (this.messageHistory.length > 40 || estimatedHistoryTokens > HISTORY_TOKEN_COMPACTION_THRESHOLD) {
       await this.compactContext();
     }
 
@@ -1851,7 +2773,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
     const config = vscode.workspace.getConfiguration("codepartner");
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const apiKey = config.get<string>("apiKey")?.trim() || "";
+    const apiKey = await this.getApiKey();
     const modelId = this.selectedModelId || config.get<string>("model")?.trim() || "";
     const providerType = config.get<string>("provider") || "openai";
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
@@ -1867,7 +2789,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     if ((needsEndpoint && !apiEndpoint) || (needsKey && !apiKey) || !modelId) {
       this._view.webview.postMessage({
         type: "error",
-        value: "âš ï¸ **CodePartner not configured.**\\n\\nOpen **Settings** and set:\\n- `codepartner.provider`\\n- `codepartner.apiEndpoint`\\n- `codepartner.apiKey`\\n- `codepartner.model`"
+        value: "⚠️ **CodePartner not configured.**\\n\\nOpen **Settings** and set `codepartner.provider`, `codepartner.apiEndpoint`, and `codepartner.model`, then run **CodePartner: Set API Key** from the Command Palette."
       });
       return;
     }
@@ -1876,7 +2798,31 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       let contextHeader = "";
     contextHeader += await this.getWebSearchContext(prompt);
     contextHeader += await this.getWorkspaceContext(prompt);
-    contextHeader += await this.getFileMentionsContext(prompt);
+
+    // Phase 3.4: token-aware context budget, shared across @file mentions,
+    // the active editor's content, and other open tabs — replacing what
+    // used to be independent fixed character caps per source (or, for
+    // @file mentions, no cap at all).
+    const contextBudget = { remaining: vscode.workspace.getConfiguration("codepartner").get<number>("contextTokenBudget") || 6000 };
+
+    contextHeader += await this.getFileMentionsContext(prompt, contextBudget);
+
+    // Phase 3.5: auto-trigger skills whose description keyword-matches
+    // this prompt, instead of relying on the model remembering to call
+    // list_skills then use_skill. Still counts against the same shared
+    // context budget as everything else above.
+    if (this.skillManager) {
+      const availableSkills = this.skillManager.listSkills();
+      const autoSkills = findAutoTriggeredSkills(prompt, availableSkills);
+      for (const s of autoSkills) {
+        if (contextBudget.remaining <= 0) {break;}
+        const skillContent = this.skillManager.useSkill(s.name);
+        const { text: cappedSkill, truncated } = truncateToTokenBudget(skillContent, contextBudget.remaining);
+        contextBudget.remaining -= estimateTokens(cappedSkill);
+        contextHeader += cappedSkill + (truncated ? "\n... (skill truncated to fit context token budget)\n" : "");
+        this.output.appendLine(`[CodePartner] Auto-triggered skill: ${s.name}`);
+      }
+    }
 
     const editor = vscode.window.activeTextEditor;
     if (editor) {
@@ -1885,11 +2831,15 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const fileName = document.fileName.split(/[/\\]/).pop();
       if (!selection.isEmpty) {
         const code = document.getText(selection);
+        this.warnIfSecrets(code, fileName || "selection");
         contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nSelected Code:\n\`\`\`\n${code}\n\`\`\`\n`;
       } else {
         const text = document.getText();
-        const capped = text.length > 8000 ? text.substring(0, 8000) + "\nâ€¦ (truncated)" : text;
-        contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nContent:\n\`\`\`\n${capped}\n\`\`\`\n`;
+        this.warnIfSecrets(text, fileName || "active file");
+        const { text: capped, truncated } = truncateToTokenBudget(text, contextBudget.remaining);
+        contextBudget.remaining -= estimateTokens(capped);
+        const suffix = truncated ? "\n... (truncated to fit context token budget)" : "";
+        contextHeader += `\n--- Context ---\nFile: \`${fileName}\`\nContent:\n\`\`\`\n${capped}${suffix}\n\`\`\`\n`;
       }
     }
 
@@ -1899,8 +2849,15 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const doc = oe.document;
       const name = path.basename(doc.fileName);
       const text = doc.getText();
-      const capped = text.length > 2000 ? text.substring(0, 2000) + "\n... (truncated)" : text;
-      contextHeader += `\n--- Context from Open Tab ---\nFile: \`${name}\`\nContent:\n\`\`\`\n${capped}\n\`\`\`\n`;
+      this.warnIfSecrets(text, name);
+      if (contextBudget.remaining <= 0) {
+        this.output.appendLine(`[CodePartner] Skipped open tab ${name}: context token budget exhausted.`);
+        continue;
+      }
+      const { text: capped, truncated } = truncateToTokenBudget(text, contextBudget.remaining);
+      contextBudget.remaining -= estimateTokens(capped);
+      const suffix = truncated ? "\n... (truncated to fit context token budget)" : "";
+      contextHeader += `\n--- Context from Open Tab ---\nFile: \`${name}\`\nContent:\n\`\`\`\n${capped}${suffix}\n\`\`\`\n`;
     }
 
     // Feature 7: Custom Instructions
@@ -1940,178 +2897,40 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     let toolUsedInThisTurn = false;
     const turnId = Date.now().toString();
 
+    // Phase 2.4: capture a git-backed fallback checkpoint for this turn,
+    // in addition to the per-file revertContent backups taken as each
+    // edit happens. Only covers tracked files in a git repo; harmless
+    // no-op otherwise.
+    const checkpointRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (checkpointRoot && isGitRepo(checkpointRoot)) {
+      const ref = createGitCheckpoint(checkpointRoot, `codepartner turn ${turnId}`);
+      if (ref !== null) {
+        this.turnGitCheckpoints.set(turnId, ref);
+      }
+    }
+
     while (iteration < maxIterations) {
       iteration++;
       this.abortController = new AbortController();
       let fullResponse = "";
       let fullReasoning = "";
       let toolCalls: any[] = [];
+      let turnInputTokens: number | undefined;
+      let turnOutputTokens: number | undefined;
       this.modifiedFiles.clear();
 
-      const endpoint = apiEndpoint.replace(/\/$/, "");
-      let url = "";
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      let body: Record<string, unknown> = {};
+      // Tool definitions in the flat shape buildProviderRequest expects.
+      const toolDefs = useTools ? [...TOOLS, ...this.mcpManager.getTools()] : undefined;
 
-      // Build OpenAI-compatible messages (used by openai, azure, google, ollama)
-      const openaiMessages = this.messageHistory.map((m) => {
-        const msg: any = { role: m.role === "system" && !useSystemRole ? "user" : m.role, content: m.content };
-        if (m.tool_calls) {
-          msg.tool_calls = m.tool_calls;
-        }
-        if (m.tool_call_id) {
-          msg.tool_call_id = m.tool_call_id;
-          if (m.name) {
-            msg.name = m.name;
-          }
-        }
-        if (m.name && m.role !== "tool") {
-          msg.name = m.name;
-        }
-        return msg;
+      const { url, headers, body } = buildProviderRequest({
+        providerType, apiEndpoint, apiKey, modelId, azureApiVersion,
+        messages: this.messageHistory,
+        tools: toolDefs,
+        useSystemRole,
+        maxTokens,
+        temperature: 0.4,
+        stream: true,
       });
-
-      // Build tools in OpenAI format
-      const openaiToolDefs = useTools
-        ? [...TOOLS, ...this.mcpManager.getTools()].map((t) => ({ type: "function" as const, function: t }))
-        : undefined;
-
-      // ─── Provider-specific request construction ─────────────────────────
-      if (providerType === "anthropic") {
-        // Anthropic Messages API
-        url = endpoint || "https://api.anthropic.com/v1/messages";
-        headers["x-api-key"] = apiKey;
-        headers["anthropic-version"] = "2023-06-01";
-        // Don't add invalid beta header for newer models
-        if (modelId.includes("claude-3-5") || modelId.includes("claude-3.5")) {
-          headers["anthropic-beta"] = "max-tokens-3-5-sonnet-2024-07-15";
-        }
-
-        // Convert messages to Anthropic format
-        const anthropicMessages: any[] = [];
-        for (const m of this.messageHistory) {
-          if (m.role === "system") continue;
-
-          if (m.role === "tool") {
-            anthropicMessages.push({
-              role: "user",
-              content: [{
-                type: "tool_result",
-                tool_use_id: m.tool_call_id,
-                content: typeof m.content === "string" ? m.content : JSON.stringify(m.content)
-              }]
-            });
-          } else if (m.role === "assistant" && m.tool_calls) {
-            const contentBlocks: any[] = [];
-            if (m.content) contentBlocks.push({ type: "text", text: m.content });
-            for (const tc of m.tool_calls) {
-              let parsedInput = {};
-              try { parsedInput = JSON.parse(tc.function.arguments); } catch { parsedInput = {}; }
-              contentBlocks.push({
-                type: "tool_use",
-                id: tc.id,
-                name: tc.function.name,
-                input: parsedInput
-              });
-            }
-            anthropicMessages.push({ role: "assistant", content: contentBlocks });
-          } else {
-            anthropicMessages.push({
-              role: m.role === "assistant" ? "assistant" : "user",
-              content: typeof m.content === "string" ? m.content : JSON.stringify(m.content)
-            });
-          }
-        }
-
-        body = {
-          model: modelId,
-          max_tokens: maxTokens,
-          messages: anthropicMessages,
-          stream: true,
-          temperature: 0.4
-        };
-
-        const sysMsg = this.messageHistory.find(m => m.role === "system");
-        if (sysMsg) {
-          body.system = sysMsg.content;
-        }
-
-        if (useTools) {
-          const allToolDefs = [...TOOLS, ...this.mcpManager.getTools()];
-          body.tools = allToolDefs.map(t => {
-            const schema: any = {
-              type: "object",
-              properties: t.parameters.properties || {}
-            };
-            if (t.parameters.required && t.parameters.required.length > 0) {
-              schema.required = t.parameters.required;
-            }
-            return { name: t.name, description: t.description, input_schema: schema };
-          });
-        }
-
-      } else if (providerType === "azure") {
-        // Azure OpenAI
-        url = `${endpoint}/openai/deployments/${modelId}/chat/completions?api-version=${azureApiVersion}`;
-        headers["api-key"] = apiKey;
-        body = {
-          messages: openaiMessages,
-          max_tokens: maxTokens,
-          temperature: 0.4,
-          stream: true,
-        };
-        if (openaiToolDefs) {
-          body.tools = openaiToolDefs;
-          body.tool_choice = "auto";
-        }
-
-      } else if (providerType === "google") {
-        // Google Gemini (OpenAI-compatible endpoint)
-        url = `${endpoint || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`;
-        headers["Authorization"] = `Bearer ${apiKey}`;
-        body = {
-          model: modelId,
-          messages: openaiMessages,
-          max_tokens: maxTokens,
-          temperature: 0.4,
-          stream: true,
-        };
-        if (openaiToolDefs) {
-          body.tools = openaiToolDefs;
-          body.tool_choice = "auto";
-        }
-
-      } else if (providerType === "ollama") {
-        // Ollama (OpenAI-compatible endpoint)
-        url = `${endpoint || "http://localhost:11434/v1"}/chat/completions`;
-        body = {
-          model: modelId,
-          messages: openaiMessages,
-          max_tokens: maxTokens,
-          temperature: 0.4,
-          stream: true,
-        };
-        if (openaiToolDefs) {
-          body.tools = openaiToolDefs;
-          body.tool_choice = "auto";
-        }
-
-      } else {
-        // OpenAI / OpenAI-compatible
-        url = `${endpoint || "https://api.openai.com/v1"}/chat/completions`;
-        headers["Authorization"] = `Bearer ${apiKey}`;
-        body = {
-          model: modelId,
-          messages: openaiMessages,
-          max_tokens: maxTokens,
-          temperature: 0.4,
-          stream: true,
-        };
-        if (openaiToolDefs) {
-          body.tools = openaiToolDefs;
-          body.tool_choice = "auto";
-        }
-      }
 
       this.output.appendLine(`[CodePartner] Request: provider=${providerType}, model=${modelId}, url=${url}, tools=${useTools ? (body.tools as any[])?.length || 0 : 'disabled'}, messages=${(body.messages as any[])?.length || 0}`);
 
@@ -2130,7 +2949,15 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
             }
             try {
               const parsed = JSON.parse(event.data);
-              
+
+              // Phase 4.1: real token usage for the status bar counter —
+              // additive, doesn't affect existing content/tool_call parsing.
+              const usage = extractUsageFromStreamEvent(providerType, parsed);
+              if (usage) {
+                if (usage.inputTokens !== undefined) {turnInputTokens = usage.inputTokens;}
+                if (usage.outputTokens !== undefined) {turnOutputTokens = usage.outputTokens;}
+              }
+
               // Anthropic format
               if (parsed.type === "content_block_delta" && parsed.delta?.text) {
                 fullResponse += parsed.delta.text;
@@ -2190,6 +3017,12 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
           response.data.on("error", reject);
         });
 
+        // Phase 4.1: accumulate real token usage into the session total
+        // and refresh the status bar.
+        if (turnInputTokens !== undefined) {this.sessionTokenUsage.input += turnInputTokens;}
+        if (turnOutputTokens !== undefined) {this.sessionTokenUsage.output += turnOutputTokens;}
+        this.updateTokenStatusBar();
+
         let shouldBreakLoop = false;
 
         if (toolCalls.length > 0) {
@@ -2204,7 +3037,17 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
             const toolStartTime = Date.now();
             let result;
             try {
-              const args = JSON.parse(tc.function.arguments);
+              const parsed = repairJsonParse(tc.function.arguments);
+              if (parsed === null) {
+                const errResult = `Error: Could not parse arguments for tool "${tc.function.name}" as JSON, even after attempting basic repair (unterminated string / unbalanced brackets / trailing comma). Raw arguments began with: ${String(tc.function.arguments).substring(0, 200)}\n\nRetry this tool call with strictly valid JSON arguments.`;
+                this.output.appendLine(`[CodePartner] Tool call JSON parse failed for ${tc.function.name}, arguments unrecoverable.`);
+                this._view?.webview.postMessage({ type: "status", value: `⚠️ Malformed arguments for ${tc.function.name} — asked the model to retry.` });
+                return { id: tc.id, name: tc.function.name, content: errResult };
+              }
+              if (parsed.repaired) {
+                this.output.appendLine(`[CodePartner] Repaired malformed JSON arguments for ${tc.function.name}.`);
+              }
+              const args = parsed.value;
               result = await this.executeTool(tc.function.name, args);
 
               if (tc.function.name === "edit_file" && !result.startsWith("Error")) {
@@ -2225,7 +3068,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
                 tool: tc.function.name,
                 argsSummary,
                 resultPreview: (typeof result === "string" ? result : JSON.stringify(result)).substring(0, 120),
-                success: !(typeof result === "string" && result.startsWith("Error")),
+                success: isToolResultSuccess(result),
                 timestamp: toolStartTime,
                 duration: Date.now() - toolStartTime,
                 revertContent,
@@ -2308,7 +3151,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
               const errorData = JSON.parse(rawBody);
               msg = errorData?.error?.message || errorData?.message || errorData?.error?.type || msg;
             } catch {
-              if (rawBody.length > 0) msg = rawBody.substring(0, 500);
+              if (rawBody.length > 0) {msg = rawBody.substring(0, 500);}
             }
           } catch (e) {
             this.output.appendLine(`[CodePartner] Failed to read error stream: ${e}`);
@@ -2396,52 +3239,60 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private extractPlan(response: string): { task: string; done: boolean }[] {
-    const lines = response.split("\n");
-    let inPlan = false;
-    const tasks: { task: string; done: boolean }[] = [];
-    for (const line of lines) {
-      if (/^#{1,3}\s*(implementation\s*plan|plan|tasks?|todo|roadmap|steps)/i.test(line)) {
-        inPlan = true;
-        continue;
-      }
-      if (inPlan && /^#{1,3}\s/.test(line) && !/plan|task|step/i.test(line)) {
-        break;
-      }
-      if (inPlan) {
-        const taskMatch = line.match(/^[\s]*(?:[-*]|\d+\.)\s*(?:\[[ x]\]\s*)?(.+)/);
-        if (taskMatch) {
-          const done = /\[x\]/i.test(line);
-          tasks.push({ task: taskMatch[1].trim(), done });
-        }
+  /**
+   * `rootOverride` (Phase 5.5): when a tool call is being executed on
+   * behalf of an isolated parallel sub-agent (see runParallelAgents),
+   * this points at that agent's git worktree directory instead of the
+   * real workspace root, so its file/shell tools operate there. Omitted
+   * for the main agent and regular (non-isolated) sub-agents, which
+   * behave exactly as before.
+   */
+  private async executeTool(name: string, args: any, rootOverride?: string): Promise<any> {
+    if (this.executionMode === "planning") {
+      const hasPlan = this.currentPlan.length > 0 || this.currentArtifacts.some(a => a.title.toLowerCase().includes("plan"));
+      if (!hasPlan && (name === "edit_file" || name === "create_file")) {
+        return `Error: You are in PLANNING MODE but have not created a plan yet. Create the implementation plan artifact (create_artifact, title including "implementation_plan") and the structured task checklist (create_plan) before making code changes.`;
       }
     }
-    return tasks;
-  }
 
-  private async executeTool(name: string, args: any): Promise<any> {
-    if (this.executionMode === "planning") {
-      const hasPlan = this.currentArtifacts.some(a => a.title.toLowerCase().includes("plan"));
-      if (!hasPlan && (name === "edit_file" || name === "create_file")) {
-        return `Error: You are in PLANNING MODE but have not created the "implementation_plan.md" artifact yet. You MUST create the implementation plan and get user approval BEFORE executing code modifications. Use the create_artifact tool.`;
+    // Phase 1: permission gate. Architect mode already only drafts file
+    // edits (applied later via an explicit "Apply" action), which is
+    // itself the safe default, so the approval popup would be redundant
+    // for file-write calls made while in that mode.
+    const gatedCategory = GATED_TOOLS[name];
+    if (gatedCategory) {
+      const skipBecauseArchitectDraft = gatedCategory === "file-write" && this.executionMode === "architect";
+      if (!skipBecauseArchitectDraft) {
+        const decision = await this.requestApprovalIfNeeded(name, gatedCategory, args, rootOverride);
+        if (decision !== "allow") {
+          return `Denied: the user did not approve this ${gatedCategory.replace("-", " ")} action (${name}). Explain what you intended to do and why, then ask how they'd like to proceed.`;
+        }
       }
     }
 
     switch (name) {
       case "run_command":
-        return this.runCommand(args.command);
+        return this.runCommand(args.command, rootOverride);
+      case "run_in_terminal":
+        return this.runInTerminal(args.command, !!args.background, rootOverride);
       case "list_dir":
-        return this.listDir(args.path);
+        return this.listDir(args.path, rootOverride);
       case "read_file":
-        return this.readFile(args.path);
+        return this.readFile(args.path, rootOverride);
       case "edit_file":
-        return this.editFile(args.path, args.search, args.replace);
+        return this.editFile(args.path, args.search, args.replace, rootOverride);
       case "create_file":
-        return this.createFile(args.path, args.content);
+        return this.createFile(args.path, args.content, rootOverride);
       case "web_search":
         return this.getWebSearchContext(`@web ${args.query}`);
       case "call_subagent":
         return this.agentManager.dispatch(args.agent_type, args.task, this, args.personality);
+      case "list_custom_agents":
+        return this.listCustomAgentsTool();
+      case "call_custom_agent":
+        return this.runCustomAgent(args.name, args.task, rootOverride);
+      case "run_parallel_agents":
+        return this.runParallelAgents(args.tasks);
       case "create_artifact":
         if (this.artifactRegistry) {
           const art = this.artifactRegistry.create(args.title, args.content, args.type);
@@ -2450,6 +3301,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
           return `Artifact created: ${art.title} (ID: ${art.id})`;
         }
         return "Error: Workspace not open, cannot create artifact.";
+      case "create_plan":
+        return this.createPlan(args.tasks);
+      case "update_plan_task":
+        return this.updatePlanTask(args.index, args.done);
       case "browser_control":
         if (!this.browserManager) {
           return "Error: Workspace not open, browser control disabled.";
@@ -2473,9 +3328,9 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         this._view?.webview.postMessage({ type: "skills", value: skills });
         return `Found ${skills.length} skills. Sent to UI.`;
       case "grep_search":
-        return this.grepSearch(args.pattern, args.path, args.include);
+        return this.grepSearch(args.pattern, args.path, args.include, rootOverride);
       case "run_tests":
-        return this.runTests(args.command);
+        return this.runTests(args.command, rootOverride);
       case "index_docs":
         return this.indexDocs(args.url, args.title);
       case "query_knowledge":
@@ -2502,56 +3357,246 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private async runCommand(command: string): Promise<string> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  /**
+   * Phase 1 permission gate. Decides whether a shell/file/git tool call
+   * needs a visible confirmation, then shows it if so.
+   *
+   * The prompt-injection check (untrustedContent.matches) runs regardless
+   * of policy and regardless of the session allow-list — see
+   * promptInjectionGuard.ts for why.
+   */
+  private async requestApprovalIfNeeded(name: string, category: GatedCategory, args: any, rootOverride?: string): Promise<"allow" | "deny"> {
+    const config = vscode.workspace.getConfiguration("codepartner");
+    const policy = (config.get<string>("approvalPolicy") as ApprovalPolicy) || "always-ask";
+
+    const argsText = JSON.stringify(args ?? {});
+    const flaggedByInjectionGuard = this.untrustedContent.matches(argsText);
+
+    let needsPrompt = flaggedByInjectionGuard || needsApprovalForPolicy(category, policy);
+
+    if (!flaggedByInjectionGuard && needsPrompt) {
+      // Session allow-list shortcuts only apply to non-flagged calls.
+      if (category === "shell" && matchesApprovedPrefix(args?.command || "", this.approvedCommandPrefixes)) {
+        needsPrompt = false;
+      } else if (category === "file-write" && this.sessionAutoApprove.fileWrite) {
+        needsPrompt = false;
+      } else if (category === "git-write" && this.sessionAutoApprove.gitWrite) {
+        needsPrompt = false;
+      }
+    }
+
+    if (!needsPrompt) {
+      return "allow";
+    }
+
+    const description = describeToolCall(name, args);
+    const warningPrefix = flaggedByInjectionGuard
+      ? "⚠️ This content closely matches text pulled from a web search, indexed docs, or an @-mentioned file. Confirming even though your autonomy setting would normally skip this — review carefully before allowing.\n\n"
+      : "";
+    // Phase 5.5: make it unmistakable when this action is happening in an
+    // isolated worktree, not the user's real working tree.
+    const isolationNote = rootOverride
+      ? `📦 Isolated parallel agent run (${rootOverride}) — this does NOT touch your actual working tree.\n\n`
+      : "";
+
+    this.output.appendLine(`[CodePartner] Requesting approval for ${name}${flaggedByInjectionGuard ? " (flagged: possible prompt injection)" : ""}${rootOverride ? " (isolated worktree)" : ""}: ${description}`);
+
+    const buttons = flaggedByInjectionGuard ? ["Allow", "Deny"] : ["Allow", "Always Allow This Session", "Deny"];
+    const choice = await vscode.window.showWarningMessage(
+      `${isolationNote}${warningPrefix}CodePartner wants to: ${description}`,
+      { modal: true },
+      ...buttons
+    );
+
+    if (choice === "Always Allow This Session") {
+      if (category === "shell") {
+        this.approvedCommandPrefixes.add(commandPrefix(args?.command || ""));
+      } else if (category === "file-write") {
+        this.sessionAutoApprove.fileWrite = true;
+      } else if (category === "git-write") {
+        this.sessionAutoApprove.gitWrite = true;
+      }
+      return "allow";
+    }
+    if (choice === "Allow") {
+      return "allow";
+    }
+    this.output.appendLine(`[CodePartner] Denied: ${name}`);
+    return "deny";
+  }
+
+  /**
+   * Runs a shell command via child_process.spawn, streaming stdout/stderr
+   * and resolving on the "close" event — replaces the old temp-file
+   * polling hack, which resolved as soon as the output file had ANY bytes
+   * (so a slow-but-fine command could return truncated output) and had no
+   * way to actually stop a hung process, just stop waiting on it.
+   */
+  private async runCommand(command: string, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return "No workspace open.";
     }
 
-    if (!this.terminal || (this.terminal as any).exitStatus !== undefined) {
-      this.terminal = vscode.window.createTerminal({
-        name: "CodePartner Agent",
-        cwd: root
-      });
-    }
-    this.terminal.show(true);
+    const TIMEOUT_MS = 120000; // 2 minutes — real builds/tests can be slow; this isn't a snappy-command assumption.
 
-    const tempOutputFile = path.join(os.tmpdir(), `cp_output_${Date.now()}.txt`);
-    const isWin = process.platform === "win32";
-    
-    // Use a slightly different redirection for Windows PowerShell vs Bash
-    const fullCommand = isWin 
-      ? `${command} | Out-File -FilePath "${tempOutputFile}" -Encoding utf8; Get-Content "${tempOutputFile}"`
-      : `${command} > "${tempOutputFile}" 2>&1; cat "${tempOutputFile}"`;
+    this._view?.webview.postMessage({ type: "status", value: `Running: ${command}` });
+    this.output.appendLine(`[CodePartner] $ ${command}`);
 
-    this.terminal.sendText(fullCommand);
-
-    // Wait for the file to be created and populated
-    // This is a simple polling mechanism. In a real production app, we might use a more robust watcher.
     return new Promise((resolve) => {
-      let checks = 0;
-      const interval = setInterval(() => {
-        checks++;
-        if (fs.existsSync(tempOutputFile)) {
-          const stats = fs.statSync(tempOutputFile);
-          // If file hasn't changed in the last 500ms and has content, or we timed out
-          if (stats.size > 0 || checks > 100) {
-            clearInterval(interval);
-            const content = fs.readFileSync(tempOutputFile, "utf8");
-            try { fs.unlinkSync(tempOutputFile); } catch {}
-            resolve(content || "(Command executed, no output captured)");
-          }
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+
+      const child = cp.spawn(command, { cwd: root, shell: true, env: process.env });
+      this.runningChildProcess = child;
+
+      const finish = (message: string) => {
+        if (settled) {return;}
+        settled = true;
+        clearTimeout(timeoutHandle);
+        if (this.runningChildProcess === child) {
+          this.runningChildProcess = undefined;
         }
-        if (checks > 200) { // 20 second timeout
-          clearInterval(interval);
-          resolve("Command timed out or produced no output in terminal.");
-        }
-      }, 100);
+        resolve(message);
+      };
+
+      const timeoutHandle = setTimeout(() => {
+        child.kill();
+        const combined = formatOutput(stdout, stderr);
+        this.warnIfSecrets(combined, `terminal output (${command})`);
+        finish(`Command timed out after ${TIMEOUT_MS / 1000}s and was killed. Partial output:\n${combined || "(none)"}`);
+      }, TIMEOUT_MS);
+
+      child.stdout?.on("data", (d) => { stdout += d.toString(); });
+      child.stderr?.on("data", (d) => { stderr += d.toString(); });
+
+      child.on("error", (err) => {
+        finish(`Error running command: ${err.message}`);
+      });
+
+      child.on("close", (code) => {
+        const combined = formatOutput(stdout, stderr);
+        this.warnIfSecrets(combined, `terminal output (${command})`);
+        finish(`Exit code: ${code}\n${combined || "(no output)"}`);
+      });
     });
   }
 
-  private listDir(relPath: string): string {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  /**
+   * Runs a command in a VISIBLE VS Code terminal (unlike runCommand,
+   * which is deliberately hidden — spawned, not shown), for anything the
+   * user should watch or might want to type into: dev servers, watchers,
+   * interactive CLIs.
+   *
+   * VERIFICATION NOTE: this uses VS Code's Terminal Shell Integration API
+   * (Terminal.shellIntegration, TerminalShellExecution.read(),
+   * onDidChangeTerminalShellIntegration, onDidEndTerminalShellExecution),
+   * which stabilized in VS Code 1.93 — this extension's minimum version
+   * was bumped accordingly (see package.json). I could not compile this
+   * against real @vscode/types or run it against a live VS Code instance
+   * in this sandbox (no network access to install the updated typings),
+   * so the exact shape of these APIs is written from documented,
+   * remembered behavior, not verified. Every call into it is
+   * feature-detected and wrapped so a wrong assumption here degrades to
+   * the plain sendText fallback (command still runs visibly, just
+   * without captured output/exit code) rather than throwing — please
+   * test this specifically against a real VS Code 1.93+ before relying
+   * on captured output/exit codes from it.
+   */
+  private async runInTerminal(command: string, background: boolean, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return "No workspace open.";
+    }
+
+    if (!this.visibleTerminal || this.visibleTerminal.exitStatus !== undefined) {
+      this.visibleTerminal = vscode.window.createTerminal({ name: "CodePartner", cwd: root });
+    }
+    const terminal = this.visibleTerminal;
+    terminal.show(true); // reveal the terminal without stealing focus from wherever the user currently is
+
+    if (background) {
+      // Long-running/never-exiting process (dev server, watcher) — start
+      // it and return immediately. Don't bother with shell integration
+      // here; there's no "finish" to wait for.
+      terminal.sendText(command, true);
+      return `Started "${command}" in the visible CodePartner terminal (background — not waiting for it to finish). Check the terminal panel to see its output.`;
+    }
+
+    let shellIntegration: vscode.TerminalShellIntegration | undefined;
+    try {
+      shellIntegration = terminal.shellIntegration;
+      if (!shellIntegration) {
+        // Shell integration activates asynchronously after terminal
+        // creation, even for a shell that supports it — give it a short
+        // window before falling back, so we don't give up on a shell
+        // that would have worked half a second later.
+        shellIntegration = await new Promise<vscode.TerminalShellIntegration | undefined>((resolve) => {
+          const timer = setTimeout(() => { disposable.dispose(); resolve(undefined); }, 3000);
+          const disposable = vscode.window.onDidChangeTerminalShellIntegration((e) => {
+            if (e.terminal === terminal) {
+              clearTimeout(timer);
+              disposable.dispose();
+              resolve(e.shellIntegration);
+            }
+          });
+        });
+      }
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] Shell integration check failed, falling back to sendText: ${e.message}`);
+      shellIntegration = undefined;
+    }
+
+    if (!shellIntegration) {
+      terminal.sendText(command, true);
+      return `Command sent to the visible CodePartner terminal: ${command}\nThis shell doesn't support VS Code's shell integration (or it hasn't activated yet), so output and exit code can't be captured automatically — check the terminal panel to see the result.`;
+    }
+
+    const TIMEOUT_MS = 120000;
+    try {
+      const execution = shellIntegration.executeCommand(command);
+      let output = "";
+      const readPromise = (async () => {
+        for await (const chunk of execution.read()) {
+          output += chunk;
+        }
+      })();
+
+      const timedOut = await Promise.race([
+        readPromise.then(() => false),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(true), TIMEOUT_MS)),
+      ]);
+
+      const cleaned = stripAnsiCodes(output).trim();
+      this.warnIfSecrets(cleaned, `terminal output (${command})`);
+
+      if (timedOut) {
+        return `Command is still running after ${TIMEOUT_MS / 1000}s in the visible CodePartner terminal (not killed — check the terminal panel). Output so far:\n${cleaned || "(none yet)"}`;
+      }
+
+      const exitCode = await new Promise<number | undefined>((resolve) => {
+        const timer = setTimeout(() => { disposable.dispose(); resolve(undefined); }, 5000);
+        const disposable = vscode.window.onDidEndTerminalShellExecution((e) => {
+          if (e.execution === execution) {
+            clearTimeout(timer);
+            disposable.dispose();
+            resolve(e.exitCode);
+          }
+        });
+      });
+
+      return `Exit code: ${exitCode ?? "(unknown)"}\n${cleaned || "(no output)"}`;
+    } catch (e: any) {
+      this.output.appendLine(`[CodePartner] run_in_terminal shell-integration path failed, falling back to sendText: ${e.message}`);
+      terminal.sendText(command, true);
+      return `Command sent to the visible CodePartner terminal: ${command}\nCould not capture output automatically (${e.message}) — check the terminal panel to see the result.`;
+    }
+  }
+
+
+  private listDir(relPath: string, rootOverride?: string): string {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return "No workspace open.";
     }
@@ -2571,8 +3616,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private readFile(relPath: string): string {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private readFile(relPath: string, rootOverride?: string): string {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return "No workspace open.";
     }
@@ -2581,14 +3626,16 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       if (!fs.existsSync(fullPath)) {
         return `File does not exist: ${relPath}`;
       }
-      return fs.readFileSync(fullPath, "utf8");
+      const content = fs.readFileSync(fullPath, "utf8");
+      this.warnIfSecrets(content, relPath);
+      return content;
     } catch (e: any) {
       return `Error reading file: ${e.message}`;
     }
   }
 
-  private async editFile(relPath: string, search: string, replace: string): Promise<string> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private async editFile(relPath: string, search: string, replace: string, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "Error: No workspace folder open."; }
     const fullPath = path.join(root, relPath);
     try {
@@ -2596,7 +3643,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         return `Error: File does not exist: ${relPath}. Use create_file for new files.`;
       }
 
-      const originalContent = this.executionMode === "architect" && this.architectDrafts.has(relPath)
+      const originalContent = this.executionMode === "architect" && !rootOverride && this.architectDrafts.has(relPath)
         ? this.architectDrafts.get(relPath)!
         : fs.readFileSync(fullPath, "utf8");
 
@@ -2604,35 +3651,21 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         this.fileBackups.set(relPath, fs.readFileSync(fullPath, "utf8"));
       }
 
-      // Exact match first
-      let newContent: string;
-      if (originalContent.includes(search)) {
-        newContent = originalContent.replace(search, replace);
-      } else {
-        // Fuzzy fallback: trim whitespace on each line and try matching
-        const searchTrimmed = search.split("\n").map(l => l.trim()).join("\n");
-        const contentLines = originalContent.split("\n");
-        const contentTrimmed = contentLines.map(l => l.trim()).join("\n");
-        const idx = contentTrimmed.indexOf(searchTrimmed);
-        if (idx === -1) {
+      const editResult = applyEdit(originalContent, search, replace);
+      if (!editResult.ok) {
+        if (editResult.error === NOT_FOUND) {
           return `Error: Could not find the search text in ${relPath}. Please read_file first and use the exact text.`;
         }
-        // Find the original line range
-        const beforeTrimmed = contentTrimmed.substring(0, idx);
-        const startLine = beforeTrimmed.split("\n").length - 1;
-        const searchLineCount = searchTrimmed.split("\n").length;
-        const beforeLines = contentLines.slice(0, startLine);
-        const afterLines = contentLines.slice(startLine + searchLineCount);
-        newContent = [...beforeLines, replace, ...afterLines].join("\n");
+        // Ambiguous match (multiple occurrences) — refuse rather than
+        // silently editing the wrong one. See editUtils.ts.
+        return `Error: ${editResult.error}`;
       }
-
-      const oldLines = originalContent.split(/\r?\n/).filter(l => l.trim() !== "");
-      const newLines = newContent.split(/\r?\n/).filter(l => l.trim() !== "");
-      const removed = oldLines.filter(l => !newLines.includes(l)).length;
-      const added = newLines.filter(l => !oldLines.includes(l)).length;
+      const { content: newContent, added, removed } = editResult;
       this.fileChangeStats.set(relPath, { added, removed });
 
-      if (this.executionMode === "architect") {
+      // See createFile()'s comment: Architect Mode drafting is a
+      // main-workspace concept, bypassed for isolated sub-agents.
+      if (this.executionMode === "architect" && !rootOverride) {
         this.architectDrafts.set(relPath, newContent);
         this.sendArchitectDrafts();
         return `[Architect Draft] File ${relPath} updated. +${added} -${removed} lines. Pending Apply.`;
@@ -2645,8 +3678,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private async createFile(relPath: string, content: string): Promise<string> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private async createFile(relPath: string, content: string, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "Error: No workspace folder open."; }
     const fullPath = path.join(root, relPath);
     try {
@@ -2659,7 +3692,11 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       const lines = content.split(/\r?\n/).filter(l => l.trim() !== "").length;
       this.fileChangeStats.set(relPath, { added: lines, removed: 0 });
 
-      if (this.executionMode === "architect") {
+      // Architect Mode's "draft, don't apply" behavior is a main-workspace
+      // concept — an isolated parallel sub-agent (rootOverride set) writes
+      // directly into its own worktree instead; review happens at the
+      // branch/diff level (see runParallelAgents), not per-file drafts.
+      if (this.executionMode === "architect" && !rootOverride) {
         this.architectDrafts.set(relPath, content);
         this.sendArchitectDrafts();
         return `[Architect Draft] File ${relPath} created. ${lines} lines. Pending Apply.`;
@@ -2672,8 +3709,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private grepSearch(pattern: string, searchPath?: string, include?: string): string {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  private grepSearch(pattern: string, searchPath?: string, include?: string, rootOverride?: string): string {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "No workspace open."; }
     const targetPath = searchPath ? path.join(root, searchPath) : root;
     try {
@@ -2696,8 +3733,14 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
-  private runTests(customCommand?: string): string {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  /**
+   * Auto-detects and runs the test suite via child_process.spawn (async,
+   * streamed), instead of the old cp.execSync call which blocked the
+   * entire extension host for up to 60s on every test run. Supports
+   * cancellation via the "cancel" webview message (see runningChildProcess).
+   */
+  private async runTests(customCommand?: string, rootOverride?: string): Promise<string> {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "No workspace open."; }
     let command = customCommand;
     if (!command) {
@@ -2727,13 +3770,59 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         return "Could not auto-detect test runner. Please provide a command (e.g., 'npm test', 'pytest').";
       }
     }
-    this._view?.webview.postMessage({ type: "status", value: `ðŸ§ª Running tests: ${command}` });
-    try {
-      const output = cp.execSync(command, { cwd: root, encoding: "utf8", timeout: 60000, maxBuffer: 1024 * 1024 * 5 });
-      return `âœ… Tests passed.\n\n${output}`;
-    } catch (e: any) {
-      return `âŒ Tests failed.\n\nSTDOUT:\n${e.stdout || "(none)"}\n\nSTDERR:\n${e.stderr || "(none)"}`;
-    }
+
+    const TIMEOUT_MS = 300000; // 5 minutes — test suites commonly run longer than a typical shell command.
+    const testCommand = command;
+    this._view?.webview.postMessage({ type: "status", value: `Running tests: ${testCommand}` });
+    this.output.appendLine(`[CodePartner] $ ${testCommand} (tests)`);
+
+    return new Promise((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      let lastStreamedLength = 0;
+
+      const child = cp.spawn(testCommand, { cwd: root, shell: true, env: process.env });
+      this.runningChildProcess = child;
+
+      const streamPartial = () => {
+        const total = stdout.length + stderr.length;
+        if (total - lastStreamedLength >= 200) {
+          lastStreamedLength = total;
+          this._view?.webview.postMessage({ type: "status", value: `Running tests: ${testCommand} (${total}b output so far)` });
+        }
+      };
+
+      const finish = (message: string) => {
+        if (settled) {return;}
+        settled = true;
+        clearTimeout(timeoutHandle);
+        if (this.runningChildProcess === child) {
+          this.runningChildProcess = undefined;
+        }
+        resolve(message);
+      };
+
+      const timeoutHandle = setTimeout(() => {
+        child.kill();
+        const combined = formatOutput(stdout, stderr);
+        this.warnIfSecrets(combined, `test output (${testCommand})`);
+        finish(`Tests timed out after ${TIMEOUT_MS / 1000}s and were killed. Partial output:\n${combined || "(none)"}`);
+      }, TIMEOUT_MS);
+
+      child.stdout?.on("data", (d) => { stdout += d.toString(); streamPartial(); });
+      child.stderr?.on("data", (d) => { stderr += d.toString(); streamPartial(); });
+
+      child.on("error", (err) => {
+        finish(`Error running tests: ${err.message}`);
+      });
+
+      child.on("close", (code) => {
+        const combined = formatOutput(stdout, stderr);
+        this.warnIfSecrets(combined, `test output (${testCommand})`);
+        finish(code === 0 ? `Tests passed.\n\n${combined}` : `Tests failed (exit code ${code}).\n\n${combined}`);
+      });
+    });
   }
 
   private async indexDocs(url: string, title: string): Promise<string> {
@@ -2742,7 +3831,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       fs.mkdirSync(knowledgeDir, { recursive: true });
     }
 
-    this._view?.webview.postMessage({ type: "status", value: `ðŸ“– Indexing docs: ${url}...` });
+    this._view?.webview.postMessage({ type: "status", value: `📖 Indexing docs: ${url}...` });
 
     try {
       if (!this.browserManager) {
@@ -2786,6 +3875,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       }
     }
 
+    if (results) {
+      this.warnIfSecrets(results, "indexed docs");
+      this.untrustedContent.track(results);
+    }
     return results || `No relevant information found for "${query}" in indexed documentation.`;
   }
 
@@ -2808,7 +3901,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       "vscode.diff",
       originalUri,
       currentUri,
-      `${relPath} (Original â†” Agentic Change)`
+      `${relPath} (Original ↔ Agentic Change)`
     );
   }
 
@@ -2842,11 +3935,64 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     vscode.window.showWarningMessage(`Reverted changes in ${relPath}.`);
   }
 
+  /** Reads the on-disk content a draft is being compared against, or "" for a file that doesn't exist yet (Phase 3.2). */
+  private getArchitectOriginalContent(root: string, relPath: string): string {
+    const fullPath = path.join(root, relPath);
+    if (fs.existsSync(fullPath)) {
+      try {
+        return fs.readFileSync(fullPath, "utf8");
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  }
+
+  /**
+   * Phase 3.3: structured plan creation, replacing the dead extractPlan()
+   * regex parser (it was defined but never actually called anywhere in
+   * the codebase — the Plan panel's UI was fully built and working, but
+   * nothing ever populated real data into it for a fresh conversation).
+   * The model now sets the checklist directly as JSON instead of the
+   * fragile approach of asking it to write `[x]`/`[ ]` markdown into an
+   * artifact and hoping a regex parses it correctly.
+   */
+  private createPlan(tasks: any): string {
+    const result = buildPlanFromTasks(tasks);
+    if ("error" in result) {
+      return `Error: ${result.error}`;
+    }
+    this.currentPlan = result.plan;
+    this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
+    this.saveCurrentChat();
+    return `Plan created with ${this.currentPlan.length} task(s).`;
+  }
+
+  private updatePlanTask(index: number, done: boolean): string {
+    const validation = validatePlanIndex(this.currentPlan, index);
+    if (!validation.ok) {
+      return `Error: ${validation.error}`;
+    }
+    this.currentPlan[index].done = !!done;
+    this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
+    this.saveCurrentChat();
+    return `Task ${index} ("${this.currentPlan[index].task}") marked as ${done ? "done" : "not done"}.`;
+  }
+
   private sendArchitectDrafts() {
-    const drafts = Array.from(this.architectDrafts.entries()).map(([path, content]) => ({
-      path,
-      lines: content.split(/\r?\n/).length
-    }));
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const drafts = Array.from(this.architectDrafts.entries()).map(([relPath, content]) => {
+      const original = root ? this.getArchitectOriginalContent(root, relPath) : "";
+      // Phase 3.2: per-hunk diff review data, alongside the existing
+      // whole-file summary so "Apply All Drafts" still works unchanged.
+      const dl = diffLines(original, content);
+      const hunks = groupIntoHunks(dl, 3);
+      return {
+        path: relPath,
+        lines: content.split(/\r?\n/).length,
+        hunks: hunks.map((h) => ({ id: h.id, oldStart: h.oldStart, newStart: h.newStart, lines: h.lines })),
+      };
+    });
     this._view?.webview.postMessage({ type: "architectDrafts", value: drafts });
   }
 
@@ -2872,30 +4018,87 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
     }));
     this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
-    this._view?.webview.postMessage({ type: "status", value: `ðŸ—ï¸ Architect Mode: Applied ${count} drafted files.` });
+    this._view?.webview.postMessage({ type: "status", value: `🏗️ Architect Mode: Applied ${count} drafted files.` });
     vscode.window.showInformationMessage(`Applied ${count} drafted files.`);
+  }
+
+  /**
+   * Applies only the accepted hunks per file (Phase 3.2), instead of the
+   * whole draft. `selections` maps relPath -> array of accepted hunk ids
+   * (from the webview's per-hunk checkboxes). A file with zero accepted
+   * hunks is left untouched on disk but still cleared from the draft
+   * queue, matching a full per-file reject.
+   */
+  private applyArchitectHunks(selections: Record<string, string[]>) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) { return; }
+
+    let filesChanged = 0;
+    for (const [relPath, content] of this.architectDrafts.entries()) {
+      const acceptedIds = new Set(selections[relPath] || []);
+      const original = this.getArchitectOriginalContent(root, relPath);
+      const dl = diffLines(original, content);
+      const hunks = groupIntoHunks(dl, 3);
+      const finalContent = applyAcceptedHunks(dl, hunks, acceptedIds);
+
+      if (finalContent !== original) {
+        const fullPath = path.join(root, relPath);
+        const dir = path.dirname(fullPath);
+        if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
+        fs.writeFileSync(fullPath, finalContent, "utf8");
+        this.modifiedFiles.add(relPath);
+        filesChanged++;
+      }
+    }
+
+    this.architectDrafts.clear();
+    this.sendArchitectDrafts();
+
+    const stats = Array.from(this.modifiedFiles).map(f => ({
+      path: f,
+      ...(this.fileChangeStats.get(f) || { added: 0, removed: 0 })
+    }));
+    this._view?.webview.postMessage({ type: "modifiedFiles", value: stats });
+    this._view?.webview.postMessage({ type: "status", value: `🏗️ Architect Mode: Applied selected hunks in ${filesChanged} file(s).` });
+    vscode.window.showInformationMessage(`Applied selected hunks in ${filesChanged} file(s).`);
   }
 
   private revertTimelineAction(chatId: string, timestamp: number) {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!root) return;
+    if (!root) {return;}
 
     const event = this.timelineEvents.find(e => e.chatId === chatId && e.timestamp === timestamp);
-    if (!event || event.revertContent === undefined || !event.path) {
+    if (!event || !event.path) {
+      vscode.window.showErrorMessage("Cannot revert this action: No backup found.");
+      return;
+    }
+
+    // Phase 2.4: fall back to the git checkpoint for this turn when the
+    // primary revertContent backup isn't available (e.g. an older chat
+    // saved before this field existed).
+    const gitRef = this.turnGitCheckpoints.get(event.turnId);
+    if (event.revertContent === undefined && gitRef === undefined) {
       vscode.window.showErrorMessage("Cannot revert this action: No backup found.");
       return;
     }
 
     const fullPath = path.join(root, event.path);
     try {
-      if (event.revertContent === "") {
-        // Was created by agent, so reverting means deleting it
-        if (fs.existsSync(fullPath)) {
-          fs.unlinkSync(fullPath);
+      if (event.revertContent !== undefined) {
+        if (event.revertContent === "") {
+          // Was created by agent, so reverting means deleting it
+          if (fs.existsSync(fullPath)) {
+            fs.unlinkSync(fullPath);
+          }
+        } else {
+          // Was edited, revert to previous content
+          fs.writeFileSync(fullPath, event.revertContent, "utf8");
         }
-      } else {
-        // Was edited, revert to previous content
-        fs.writeFileSync(fullPath, event.revertContent, "utf8");
+      } else if (gitRef !== undefined) {
+        const ok = restoreFileFromCheckpoint(root, gitRef, event.path);
+        if (!ok) {
+          throw new Error("no revertContent backup, and the git checkpoint fallback couldn't restore this file (it may not have existed at checkpoint time)");
+        }
       }
 
       // Update UI
@@ -2909,22 +4112,32 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
   private revertTurn(turnId: string) {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!root) return;
+    if (!root) {return;}
 
-    const eventsToRevert = this.timelineEvents.filter(e => e.turnId === turnId && !e.reverted && e.revertContent !== undefined);
+    const gitRef = this.turnGitCheckpoints.get(turnId);
+    const eventsToRevert = this.timelineEvents.filter(e =>
+      e.turnId === turnId && !e.reverted && (e.revertContent !== undefined || gitRef !== undefined)
+    );
     eventsToRevert.sort((a, b) => b.timestamp - a.timestamp);
 
     let revertedCount = 0;
     for (const event of eventsToRevert) {
-      if (!event.path) continue;
+      if (!event.path) {continue;}
       const fullPath = path.join(root, event.path);
       try {
-        if (event.revertContent === "") {
-          if (fs.existsSync(fullPath)) {
-            fs.unlinkSync(fullPath);
+        if (event.revertContent !== undefined) {
+          if (event.revertContent === "") {
+            if (fs.existsSync(fullPath)) {
+              fs.unlinkSync(fullPath);
+            }
+          } else {
+            fs.writeFileSync(fullPath, event.revertContent, "utf8");
           }
-        } else {
-          fs.writeFileSync(fullPath, event.revertContent, "utf8");
+        } else if (gitRef !== undefined) {
+          const ok = restoreFileFromCheckpoint(root, gitRef, event.path);
+          if (!ok) {
+            throw new Error("git checkpoint fallback couldn't restore this file");
+          }
         }
         event.reverted = true;
         revertedCount++;
@@ -2995,6 +4208,9 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       <button class="tab-btn" data-tab="skills" title="Skills">
         <svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>
       </button>
+      <button class="tab-btn" data-tab="diagnostics" title="Diagnostics">
+        <svg viewBox="0 0 16 16"><path d="M8 1a.75.75 0 0 1 .75.75v.5a5.5 5.5 0 0 1 4.702 4.702h.5a.75.75 0 0 1 0 1.5h-.5a5.5 5.5 0 0 1-4.702 4.702v.5a.75.75 0 0 1-1.5 0v-.5A5.5 5.5 0 0 1 2.548 8.452h-.5a.75.75 0 0 1 0-1.5h.5A5.5 5.5 0 0 1 7.25 2.25v-.5A.75.75 0 0 1 8 1zM8 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0 2a.75.75 0 0 1 .75.75v1.5h1.5a.75.75 0 0 1 0 1.5h-1.5v1.5a.75.75 0 0 1-1.5 0v-1.5h-1.5a.75.75 0 0 1 0-1.5h1.5v-1.5A.75.75 0 0 1 8 6z"/></svg>
+      </button>
     </div>
 
     <div id="main-content">
@@ -3014,7 +4230,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
             <div id="architect-drafts" class="hidden">
               <div class="drafts-header">Architect Drafts Pending</div>
               <div id="drafts-list"></div>
-              <button id="apply-drafts-btn">Apply All Drafts</button>
+              <div class="drafts-actions">
+                <button id="apply-hunks-btn" class="secondary">Apply Selected Hunks</button>
+                <button id="apply-drafts-btn">Apply All Drafts</button>
+              </div>
             </div>
             <div id="suggestion-list" class="hidden"></div>
             <div id="attachment-chips" class="hidden"></div>
@@ -3056,6 +4275,16 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       <div id="tab-skills" class="tab-content">
         <div id="skill-list">
           <div class="empty-state">No skills learned yet. Ask to "save a skill".</div>
+        </div>
+      </div>
+
+      <div id="tab-diagnostics" class="tab-content">
+        <div class="pane-header">
+          <span>Diagnostics</span>
+          <button id="clear-diagnostics-btn" class="icon-btn" title="Clear system warnings (failed tool calls are part of the timeline and aren't cleared here)">Clear</button>
+        </div>
+        <div id="diagnostics-list">
+          <div class="empty-state">No warnings or errors yet. Failed tool calls and system warnings will show up here.</div>
         </div>
       </div>
 

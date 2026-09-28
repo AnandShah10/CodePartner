@@ -74,6 +74,12 @@ html, body {
   display: flex; background: var(--vscode-sideBar-background);
   border-bottom: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
   height: var(--tab-height); flex-shrink: 0; position: relative;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+#tab-bar::-webkit-scrollbar {
+  display: none;
 }
 .tab-btn {
   flex: 1; background: transparent; border: none;
@@ -223,6 +229,12 @@ pre {
   backdrop-filter: blur(var(--blur));
   border-top: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
   flex-shrink: 0; position: relative;
+  transition: background-color 0.15s ease;
+}
+#input-outer.drag-over {
+  background: rgba(var(--vscode-button-background-rgb, 0,120,212), 0.18);
+  outline: 2px dashed var(--vscode-focusBorder);
+  outline-offset: -2px;
 }
 #suggestion-list {
   position: absolute; bottom: 100%; left: 14px; right: 14px;
@@ -336,6 +348,37 @@ textarea::-webkit-scrollbar { display: none; }
 }
 .pane-header svg { flex-shrink: 0; }
 .plan-progress { font-size: 10px; opacity: 0.6; font-weight: 600; }
+
+.icon-btn {
+  background: transparent; border: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
+  border-radius: var(--radius-sm); padding: 2px 8px; font-size: 9px; text-transform: none;
+  letter-spacing: normal; opacity: 0.8; cursor: pointer; color: var(--vscode-foreground);
+  transition: var(--transition);
+}
+.icon-btn:hover { opacity: 1; background: rgba(0,0,0,0.15); }
+
+#diagnostics-list { display: flex; flex-direction: column; gap: 6px; padding: 8px; overflow-y: auto; }
+.diagnostics-section-label {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
+  opacity: 0.5; margin: 8px 4px 2px;
+}
+.diagnostics-section-label:first-child { margin-top: 2px; }
+.diagnostic-item {
+  border-left: 3px solid var(--vscode-charts-red); border-radius: var(--radius-sm);
+  background: rgba(0,0,0,0.12); padding: 6px 10px;
+}
+.diagnostic-item.warning { border-left-color: #d29922; }
+.diagnostic-header {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 10px; font-weight: 700; margin-bottom: 3px;
+}
+.diagnostic-source { color: var(--vscode-textLink-foreground); }
+.diagnostic-severity { opacity: 0.6; text-transform: uppercase; font-size: 9px; }
+.diagnostic-message {
+  font-size: 11px; line-height: 1.4; opacity: 0.85; word-break: break-word;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+.diagnostic-result { opacity: 0.65; margin-top: 3px; white-space: pre-wrap; }
 
 #plan-list, #artifact-list { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; text-align: center; opacity: 0.4; font-size: 11px; padding: 30px; gap: 8px; }
@@ -530,16 +573,42 @@ textarea::-webkit-scrollbar { display: none; }
 }
 #architect-drafts.hidden { display: none; }
 .drafts-header { font-size: 11px; font-weight: 700; color: var(--accent); text-transform: uppercase; }
-#drafts-list { display: flex; flex-direction: column; gap: 4px; max-height: 120px; overflow-y: auto; }
-.draft-item { display: flex; justify-content: space-between; align-items: center; padding: 4px 6px; background: rgba(0,0,0,0.1); border-radius: 4px; font-size: 10px; }
-.draft-path { font-family: var(--vscode-editor-font-family, monospace); color: var(--vscode-textLink-foreground); }
-.draft-lines { opacity: 0.6; font-style: italic; }
+#drafts-list { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; }
+.draft-item-wrapper { display: flex; flex-direction: column; gap: 4px; }
+.draft-item { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 4px 6px; background: rgba(0,0,0,0.1); border-radius: 4px; font-size: 10px; }
+.draft-path { font-family: var(--vscode-editor-font-family, monospace); color: var(--vscode-textLink-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.draft-lines { opacity: 0.6; font-style: italic; flex-shrink: 0; }
+.draft-review-toggle {
+  background: transparent; color: var(--vscode-textLink-foreground); border: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
+  border-radius: var(--radius-sm); padding: 2px 6px; font-size: 9px; cursor: pointer; flex-shrink: 0; transition: var(--transition);
+}
+.draft-review-toggle:hover { background: rgba(0,0,0,0.15); }
+.hunks-container { display: flex; flex-direction: column; gap: 6px; padding: 4px 0 4px 8px; max-height: 200px; overflow-y: auto; }
+.hunks-container.hidden { display: none; }
+.hunk-item { border: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity)); border-radius: var(--radius-sm); overflow: hidden; }
+.hunk-toggle {
+  display: flex; align-items: center; gap: 6px; padding: 3px 6px; background: rgba(0,0,0,0.15);
+  font-family: var(--vscode-editor-font-family, monospace); font-size: 9px; opacity: 0.8; cursor: pointer;
+}
+.hunk-toggle input[type="checkbox"] { margin: 0; cursor: pointer; }
+.hunk-lines { font-family: var(--vscode-editor-font-family, monospace); font-size: 10px; line-height: 1.4; white-space: pre-wrap; word-break: break-all; }
+.hunk-line-add { background: rgba(var(--vscode-charts-green-rgb, 40,167,69), 0.15); color: var(--vscode-charts-green, inherit); padding: 0 6px; }
+.hunk-line-remove { background: rgba(var(--vscode-charts-red-rgb, 220,53,69), 0.15); color: var(--vscode-charts-red, inherit); padding: 0 6px; }
+.hunk-line-context { opacity: 0.55; padding: 0 6px; }
+.drafts-actions { display: flex; gap: 6px; margin-top: 4px; }
+.drafts-actions button { flex: 1; }
 #apply-drafts-btn {
   background: var(--accent); color: var(--vscode-button-foreground);
   border: none; border-radius: var(--radius-sm); padding: 6px; font-size: 11px; font-weight: 700;
-  cursor: pointer; transition: var(--transition); margin-top: 4px;
+  cursor: pointer; transition: var(--transition);
 }
 #apply-drafts-btn:hover { filter: brightness(1.2); box-shadow: 0 2px 8px var(--accent-glow); }
+#apply-hunks-btn.secondary {
+  background: transparent; color: var(--vscode-foreground); border: 1px solid var(--accent);
+  border-radius: var(--radius-sm); padding: 6px; font-size: 11px; font-weight: 700;
+  cursor: pointer; transition: var(--transition);
+}
+#apply-hunks-btn.secondary:hover { background: var(--accent-dim); }
 .skill-creation-form {
   padding: 12px;
   background: var(--vscode-editor-background);
