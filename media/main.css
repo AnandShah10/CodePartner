@@ -230,11 +230,38 @@ pre {
   border-top: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
   flex-shrink: 0; position: relative;
   transition: background-color 0.15s ease;
+  min-height: 110px; /* larger drop target so DnD is usable */
 }
 #input-outer.drag-over {
   background: rgba(var(--vscode-button-background-rgb, 0,120,212), 0.18);
   outline: 2px dashed var(--vscode-focusBorder);
   outline-offset: -2px;
+}
+/* Full-area overlay so drop zone is not covered by children */
+#drop-overlay {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: rgba(var(--vscode-focusBorder-rgb, 14, 99, 156), 0.18);
+  border: 2px dashed var(--vscode-focusBorder, #0e639c);
+  border-radius: var(--radius);
+  pointer-events: none;
+  align-items: center;
+  justify-content: center;
+}
+#drop-overlay.visible {
+  display: flex;
+}
+.drop-overlay-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: var(--vscode-focusBorder, #0e639c);
+  font-size: 13px;
+  font-weight: 600;
+  pointer-events: none;
 }
 #suggestion-list {
   position: absolute; bottom: 100%; left: 14px; right: 14px;
@@ -748,5 +775,197 @@ textarea::-webkit-scrollbar { display: none; }
 }
 
 .modal-close:hover {
+  opacity: 1;
+}
+
+/* ── Sidebar Terminal tab ── */
+#tab-terminal {
+  display: none;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+#tab-terminal.active {
+  display: flex;
+}
+.term-header-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+.terminal-log {
+  flex: 1;
+  overflow-y: auto;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 10px 12px;
+  background: var(--vscode-terminal-background, #1e1e1e);
+  color: var(--vscode-terminal-foreground, #cccccc);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.terminal-log .empty-state {
+  opacity: 0.55;
+  font-family: inherit;
+}
+.terminal-log .term-line.cmd {
+  color: var(--vscode-terminal-ansiGreen, #4ec9b0);
+}
+.terminal-log .term-line.out {
+  color: inherit;
+}
+.terminal-log .term-line.err {
+  color: var(--vscode-terminal-ansiRed, #f48771);
+}
+.terminal-input-row {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid rgba(128,128,128,0.25);
+  background: var(--vscode-sideBar-background);
+  flex-shrink: 0;
+}
+#terminal-input {
+  flex: 1;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+  outline: none;
+}
+#terminal-input:focus {
+  border-color: var(--vscode-focusBorder);
+}
+#terminal-send-btn {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: none;
+  border-radius: 4px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+#terminal-send-btn:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+/* ── Agent Debug panel ── */
+.agent-debug-session {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(128,128,128,0.2);
+  flex-shrink: 0;
+}
+.debug-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.debug-chip {
+  font-size: 10px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.debug-chip b {
+  opacity: 0.75;
+  font-weight: 600;
+  margin-right: 3px;
+}
+.debug-chip.mono {
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+.diagnostic-item.info {
+  border-left: 3px solid var(--vscode-charts-blue, #3794ff);
+}
+.diagnostic-item.warning {
+  border-left: 3px solid var(--vscode-editorWarning-foreground, #cca700);
+}
+.diagnostic-item.error {
+  border-left: 3px solid var(--vscode-errorForeground, #f48771);
+}
+#tab-diagnostics {
+  display: none;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+#tab-diagnostics.active {
+  display: flex;
+}
+#diagnostics-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+
+/* ── Antigravity-style file / slash tags ── */
+.file-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  vertical-align: baseline;
+  max-width: 220px;
+  padding: 1px 7px 1px 5px;
+  margin: 0 1px;
+  border-radius: 999px;
+  font-size: 0.85em;
+  font-family: var(--vscode-font-family);
+  line-height: 1.4;
+  background: color-mix(in srgb, var(--vscode-textLink-foreground) 14%, var(--vscode-editor-background));
+  color: var(--vscode-textLink-foreground);
+  border: 1px solid color-mix(in srgb, var(--vscode-textLink-foreground) 28%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-tag-icon {
+  font-size: 0.95em;
+  opacity: 0.9;
+  flex-shrink: 0;
+}
+.file-tag-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+.file-tag.slash-tag {
+  background: color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 16%, var(--vscode-editor-background));
+  color: var(--vscode-charts-purple, #b180d7);
+  border-color: color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 30%, transparent);
+}
+
+/* Prompt queue badge (messages waiting while a turn runs) */
+.prompt-queue-badge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 6px 0;
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 6px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+.prompt-queue-badge .queue-clear {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.75;
+  padding: 0 2px;
+}
+.prompt-queue-badge .queue-clear:hover {
   opacity: 1;
 }

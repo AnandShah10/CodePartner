@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.1.7-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.3.1-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.93.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -8,7 +8,7 @@
 
 **CodePartner AI** is a powerful **agentic** AI coding co-pilot that goes far beyond simple chat. Built with an "agent-first" philosophy, it autonomously plans, researches, edits code safely, runs commands, controls a browser, manages Git, and learns reusable **Skills** — all while following strict engineering best practices.
 
-It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **inline completions**, **MCP tools**, semantic search, multi-agent collaboration, and a beautiful glassmorphism UI with tabs for Plan, Timeline, Artifacts, and Skills.
+It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **inline completions**, **MCP tools**, semantic search, multi-agent collaboration, **local async agents**, **git plugin catalog**, **CI tools via gh**, prompt queue, reliable Stop, Antigravity-style `@file` tags, and a glassmorphism UI (Chat, Plan, Timeline, Artifacts, Skills, Terminal, Agent Debug).
 
 ---
 
@@ -31,6 +31,11 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 - **Git Integration**: Status, stage, AI-generated commit messages (with Co-author), branches, and GitHub PR creation
 - **Web & Knowledge**: DuckDuckGo search, document indexing (`index_docs` + `query_knowledge`)
 - **MCP Support**: Connect to external Model Context Protocol servers for custom tools
+- **Local async agents** (no cloud): `run_async_agent` / `list_async_agents` — background jobs in the extension host with progress notifications
+- **Git plugin catalog**: set `codepartner.pluginCatalogRepo`, run **CodePartner: Sync Plugin Catalog**; agents merge with `.codepartner/agents/*.md`
+- **CI/CD tools**: `list_ci_runs`, `trigger_ci_workflow`, `write_ci_workflow`, plus `create_pull_request` (uses your `gh` CLI — no CodePartner backend)
+- **Agent Debug panel**: mode, model, tokens, recent tools, system diagnostics
+- **Sidebar Terminal** + multi-file / workspace NES + code-reference scan
 - **Custom Agents**: Repo-local agents (`.codepartner/agents/*.md`) with YAML frontmatter + custom system prompts (see dedicated section)
 - **Artifacts & Skills**: Persistent global storage (`~/.codepartner`) of code, plans, markdown, logs, and screenshots
 
@@ -51,6 +56,18 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 - Feedback button for bugs/features
 
 ---
+
+
+## 📌 What's new in v2.3.1
+
+- **Reliable Stop** — aborts the LLM stream, kills in-flight shell/tests, and will not keep running tools after you cancel (turn-id invalidation).
+- **Prompt queue** — messages typed while a turn is running are queued (badge + clear) and can run after completion (like Copilot / Antigravity).
+- **Artifacts routing** — plans, walkthroughs, and similar non-code writes go to the **Artifacts** tab instead of the repo root (`README.md` / `CHANGELOG.md` still write to disk).
+- **Chat history cleanup** — opening an old chat no longer shows injected context blocks or busy loaders.
+- **File tags** — `@file` / `/slash` mentions render as compact pills.
+- **Agent Debug** — mode, model, tokens, recent tools, system log; Full log / Refresh / Clear.
+- **Local async agents** + **git plugin catalog** + **CI via `gh`** (no CodePartner backend).
+- **NES / Finish Changes** — multi-file + workspace rename patterns; optional `llmNextEditSuggestions` setting.
 
 ## 🚀 Quick Start
 
@@ -128,7 +145,20 @@ Skills and knowledge travel with you across all projects.
 
 ---
 
-## 🛠️ Custom Repo Agents (New in v2.1.6)
+## 🛠️ Custom Repo Agents & Plugin Catalog
+
+Workspace agents live in `.codepartner/agents/*.md` (YAML frontmatter + body). Optionally set **`codepartner.pluginCatalogRepo`** to a git URL and run **CodePartner: Sync Plugin Catalog** (or the `sync_plugin_catalog` tool) to pull shared agents from a public/private repo into extension storage — no marketplace backend.
+
+### Local async agents
+
+Use **`run_async_agent`** to start a background sub-agent (progress toast, cancellable). Results via **`list_async_agents`**. Jobs live only while VS Code is open.
+
+### CI via GitHub CLI
+
+Tools **`list_ci_runs`**, **`trigger_ci_workflow`**, **`write_ci_workflow`** call your installed `gh` CLI. **`create_pull_request`** remains for PR flow.
+
+## 🛠️ Custom Repo Agents (format)
+
 
 Define your own specialized agents **local to the current repository** by placing Markdown files in a `.codepartner/agents/` directory (create it if it doesn't exist — the extension will detect it automatically).
 
@@ -200,7 +230,7 @@ CodePartner excels in:
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.1.7** — adds **Terminal inline assist** (`codepartner.terminalInlineAssist` setting: offers CodePartner help on terminal command failures with configurable scope and explicit permission for "all-terminals"), plus prior v2.1.6 custom repo-scoped agents (`.codepartner/agents/*.md` YAML frontmatter), embeddings, Architect per-hunk review, worktree-isolated parallel agents, durable Timeline undo, approval policies, MCP, and all v2.1.x improvements. Terminal lint compliance and test runner hardening carried forward. See [CHANGELOG.md](CHANGELOG.md) for details.
+**Note**: Now at **v2.3.1** — reliable **Stop**, **prompt queue**, **Artifacts routing** for plans/walkthroughs, clean **chat history** load, Antigravity-style **file tags**, **Agent Debug**, local async agents, git plugin catalog, and CI via `gh`. Also includes terminal inline assist, custom agents (`.codepartner/agents/*.md`), embeddings, Architect per-hunk review, worktree-isolated parallel agents, Timeline undo, approval policies, and MCP. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ---
 

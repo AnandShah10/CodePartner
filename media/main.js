@@ -89,6 +89,10 @@
   let currentAssistantMessageId = null;
   let currentThoughtDiv = null;
   let isWaiting = false;
+  /** Prompts typed while a turn is running — sent after current turn completes (Copilot/Antigravity-style). */
+  let promptQueue = [];
+  /** Agent Debug snapshot — declared early so the message handler never hits TDZ. */
+  let lastAgentDebug = null;
   let attachedFiles = [];
   let currentMode = 'fast';
   let allTimelineEvents = [];
@@ -116,41 +120,86 @@
     chatHistory.scrollTop = chatHistory.scrollHeight;
   }
 
+  /** When true, the next setWaiting(false) will not auto-run the prompt queue (used after Stop). */
+  let suppressQueueFlushOnce = false;
+
   function setWaiting(waiting) {
     isWaiting = waiting;
     sendBtn.innerHTML = waiting ? ICONS.STOP : ICONS.SEND;
     sendBtn.classList.toggle('stop', waiting);
     if (!waiting) {
-      statusText.innerText = '';
+      if (!statusText.innerText || /thinking|refining|preparing|stopped/i.test(statusText.innerText)) {
+        statusText.innerText = promptQueue.length
+          ? `Queued: ${promptQueue.length} message(s) — press Send or wait for auto-run`
+          : '';
+      }
+      if (suppressQueueFlushOnce) {
+        suppressQueueFlushOnce = false;
+        renderQueueBadge();
+        return;
+      }
+      flushPromptQueue();
     }
+  }
+
+  function renderQueueBadge() {
+    let badge = document.getElementById('prompt-queue-badge');
+    if (promptQueue.length === 0) {
+      if (badge) {
+        badge.remove();
+      }
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'prompt-queue-badge';
+      badge.className = 'prompt-queue-badge';
+      const inputOuter = document.getElementById('input-outer');
+      if (inputOuter) {
+        inputOuter.insertBefore(badge, inputOuter.firstChild);
+      }
+    }
+    badge.innerHTML = `<span>Queued ${promptQueue.length}</span><button type="button" class="queue-clear" title="Clear queue">×</button>`;
+    badge.querySelector('.queue-clear').onclick = () => {
+      promptQueue = [];
+      renderQueueBadge();
+      if (!isWaiting) {
+        statusText.innerText = '';
+      }
+    };
+  }
+
+  function flushPromptQueue() {
+    if (isWaiting || promptQueue.length === 0) {
+      return;
+    }
+    const next = promptQueue.shift();
+    renderQueueBadge();
+    if (!next) {
+      return;
+    }
+    createMessage('user', next.text);
+    setWaiting(true);
+    currentAssistantMessageId = createMessage('assistant');
+    currentThoughtDiv = null;
+    vscode.postMessage({ type: 'prompt', value: next.text, attachments: next.attachments || [] });
   }
 
   function formatMentions(html) {
     if (!html) return html;
-    
-    let formatted = html.replace(/(^|\s|>|&nbsp;)@([a-zA-Z0-9_\-\.\/]+)/g, (match, prefix, path) => {
-      const parts = path.split('/');
-      let displayHtml = '';
-      
-      if (parts.length === 1) {
-        displayHtml = `@<b>${path}</b>`;
-      } else {
-        const basename = parts.pop();
-        if (basename === '') {
-          const lastDir = parts.pop();
-          const preDir = parts.length > 0 ? parts.join('/') + '/' : '';
-          displayHtml = `@${preDir}<b>${lastDir}/</b>`;
-        } else {
-          const dir = parts.length > 0 ? parts.join('/') + '/' : '';
-          displayHtml = `@${dir}<b>${basename}</b>`;
-        }
-      }
-      
-      return `${prefix}<span class="mention" style="color: var(--vscode-textLink-foreground); font-family: var(--vscode-editor-font-family); background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; font-size: 0.9em;">${displayHtml}</span>`;
+
+    // Antigravity-style file tags: compact pill with icon + basename
+    let formatted = html.replace(/(^|\s|>|&nbsp;)@([a-zA-Z0-9_\-\.\/]+)/g, (match, prefix, filePath) => {
+      const parts = filePath.split('/');
+      const basename = parts[parts.length - 1] || filePath;
+      const isFolder = filePath.endsWith('/') || (!basename.includes('.') && parts.length > 0);
+      const icon = isFolder ? '📁' : '📄';
+      const title = filePath;
+      return `${prefix}<span class="file-tag" title="${title.replace(/"/g, '&quot;')}"><span class="file-tag-icon">${icon}</span><span class="file-tag-name">${basename.replace(/\/$/, '')}</span></span>`;
     });
 
     formatted = formatted.replace(/(^|\s|>|&nbsp;)\/([a-zA-Z0-9_\-\.]+)/g, (match, prefix, skillName) => {
-      return `${prefix}<span class="mention" style="color: var(--vscode-charts-purple); font-family: var(--vscode-editor-font-family); background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; font-size: 0.9em;">/<b>${skillName}</b></span>`;
+      return `${prefix}<span class="file-tag slash-tag" title="/${skillName}"><span class="file-tag-icon">⚡</span><span class="file-tag-name">/${skillName}</span></span>`;
     });
 
     return formatted;
@@ -511,14 +560,32 @@
 
   function loadMessages(messages) {
     chatHistory.innerHTML = '';
-    messages.forEach(m => {
+    currentAssistantMessageId = null;
+    currentThoughtDiv = null;
+    statusText.innerText = '';
+    setWaiting(false);
+    promptQueue = [];
+    renderQueueBadge();
+
+    (messages || []).forEach(m => {
       if (m.role === 'system' || m.hiddenFromUI) {
         return;
       }
-      const content = createMessage(m.role, m.content);
+      let body = m.content;
+      if (typeof body === 'string') {
+        if (body.includes('--- Context ---') && body.includes('User Question:')) {
+          body = body.split('User Question:').pop().trim();
+        }
+        if (/^(Preparing context|Thinking|Refining|Stopped)\.\.\.?$/i.test(body.trim())) {
+          return;
+        }
+        if (!body.trim()) {
+          return;
+        }
+      }
+      const content = createMessage(m.role, body);
       processCodeBlocks(content, m.role === 'assistant');
     });
-    setWaiting(false);
     scrollBottom();
   }
 
@@ -576,6 +643,18 @@
   if (clearDiagnosticsBtn) {
     clearDiagnosticsBtn.onclick = () => {
       vscode.postMessage({ type: 'clearDiagnostics' });
+    };
+  }
+  const openDebugLogBtn = document.getElementById('open-debug-log-btn');
+  if (openDebugLogBtn) {
+    openDebugLogBtn.onclick = () => {
+      vscode.postMessage({ type: 'openDebugLog' });
+    };
+  }
+  const refreshDebugBtn = document.getElementById('refresh-debug-btn');
+  if (refreshDebugBtn) {
+    refreshDebugBtn.onclick = () => {
+      vscode.postMessage({ type: 'requestAgentDebug' });
     };
   }
 
@@ -991,25 +1070,47 @@
     });
   }
 
+  function ensureDropOverlay() {
+    if (!dropZone) return null;
+    let overlay = document.getElementById('drop-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'drop-overlay';
+      overlay.innerHTML = '<div class="drop-overlay-content"><span>Drop files to attach</span></div>';
+      dropZone.appendChild(overlay);
+    }
+    return overlay;
+  }
+
+  function showDropOverlay(show) {
+    const overlay = ensureDropOverlay();
+    if (overlay) overlay.classList.toggle('visible', show);
+    if (dropZone) dropZone.classList.toggle('drag-over', show);
+  }
+
   if (dropZone) {
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach((evt) => {
+      dropZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      });
+    });
     dropZone.addEventListener('dragenter', (e) => {
-      e.preventDefault();
       dragDepth++;
-      dropZone.classList.add('drag-over');
+      if (e.dataTransfer && (e.dataTransfer.types.includes('Files') || e.dataTransfer.types.includes('text/uri-list'))) {
+        showDropOverlay(true);
+      }
     });
     dropZone.addEventListener('dragover', (e) => {
-      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
     });
     dropZone.addEventListener('dragleave', () => {
       dragDepth = Math.max(0, dragDepth - 1);
-      if (dragDepth === 0) {
-        dropZone.classList.remove('drag-over');
-      }
+      if (dragDepth === 0) showDropOverlay(false);
     });
     dropZone.addEventListener('drop', async (e) => {
-      e.preventDefault();
       dragDepth = 0;
-      dropZone.classList.remove('drag-over');
+      showDropOverlay(false);
 
       const dt = e.dataTransfer;
       if (!dt) { return; }
@@ -1037,8 +1138,19 @@
   // Handle Send/Stop click
   sendBtn.addEventListener('click', () => {
     if (isWaiting) {
+      // Stop immediately in the UI; extension cancels tools/stream.
+      // Do not call setWaiting(false) here in a way that flushes the queue
+      // before the user sees "Stopped" — cancel posts `done`, which clears
+      // waiting; we suppress queue flush for pure stop via a flag.
+      suppressQueueFlushOnce = true;
       vscode.postMessage({ type: 'cancel' });
       setWaiting(false);
+      statusText.innerText = 'Stopped.';
+      if (currentAssistantMessageId && !currentAssistantMessageId.innerText.trim()) {
+        currentAssistantMessageId.innerHTML = '<em style="opacity:0.7">Stopped.</em>';
+      }
+      currentAssistantMessageId = null;
+      currentThoughtDiv = null;
     } else {
       sendPrompt();
     }
@@ -1046,7 +1158,23 @@
 
   function sendPrompt() {
     const text = promptInput.value.trim();
-    if (!text || isWaiting) {
+    if (!text) {
+      return;
+    }
+
+    // Queue follow-up while a turn is running (like Copilot / Antigravity)
+    if (isWaiting) {
+      promptQueue.push({
+        text,
+        attachments: attachedFiles.slice(),
+      });
+      promptInput.value = '';
+      promptInput.style.height = 'auto';
+      syncOverlay();
+      attachedFiles = [];
+      renderAttachmentChips();
+      renderQueueBadge();
+      statusText.innerText = `Queued ${promptQueue.length} — runs after current turn`;
       return;
     }
 
@@ -1264,6 +1392,15 @@
         renderDiagnosticsTab();
         break;
 
+      case 'agentDebug':
+        lastAgentDebug = msg.value || null;
+        if (lastAgentDebug && lastAgentDebug.diagnostics) {
+          systemDiagnostics = lastAgentDebug.diagnostics;
+        }
+        renderAgentDebugSession(lastAgentDebug);
+        renderDiagnosticsTab();
+        break;
+
       case 'suggestSkill':
         renderSkillSuggestion(msg.value);
         break;
@@ -1271,8 +1408,69 @@
       case 'architectDrafts':
         renderArchitectDrafts(msg.value);
         break;
+
+      case 'terminalOutput':
+        appendTerminalLog(msg.value || '', msg.kind || 'out');
+        break;
     }
   });
+
+  // ── Sidebar Terminal tab ──
+  const terminalLog = document.getElementById('terminal-log');
+  const terminalInput = document.getElementById('terminal-input');
+  const terminalSendBtn = document.getElementById('terminal-send-btn');
+  const termFocusBtn = document.getElementById('term-focus-btn');
+  const termClearBtn = document.getElementById('term-clear-btn');
+
+  function appendTerminalLog(text, kind) {
+    if (!terminalLog) {
+      return;
+    }
+    const empty = terminalLog.querySelector('.empty-state');
+    if (empty) {
+      empty.remove();
+    }
+    const line = document.createElement('div');
+    line.className = 'term-line ' + (kind || 'out');
+    line.textContent = text;
+    terminalLog.appendChild(line);
+    terminalLog.scrollTop = terminalLog.scrollHeight;
+  }
+
+  function sendTerminalFromSidebar() {
+    if (!terminalInput) {
+      return;
+    }
+    const text = terminalInput.value;
+    if (!text.trim()) {
+      return;
+    }
+    appendTerminalLog('$ ' + text, 'cmd');
+    vscode.postMessage({ type: 'sidebarTerminalRun', value: text });
+    terminalInput.value = '';
+  }
+
+  if (terminalSendBtn) {
+    terminalSendBtn.onclick = sendTerminalFromSidebar;
+  }
+  if (terminalInput) {
+    terminalInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        sendTerminalFromSidebar();
+      }
+    });
+  }
+  if (termFocusBtn) {
+    termFocusBtn.onclick = () => vscode.postMessage({ type: 'focusTerminal' });
+  }
+  if (termClearBtn) {
+    termClearBtn.onclick = () => {
+      if (terminalLog) {
+        terminalLog.innerHTML = '<div class="empty-state">Cleared.</div>';
+      }
+    };
+  }
 
   function escapeHtml(str) {
     return String(str)
@@ -1539,38 +1737,78 @@
     if (counter) counter.textContent = `${timelineList.querySelectorAll('.timeline-item').length} actions`;
   }
 
-  // ── Diagnostics tab: system warnings/errors (backend-pushed) + a
-  // client-side filter of failed timeline events (no separate backend
-  // data needed for that half — timeline events already carry `success`).
+  // ── Agent Debug panel: session snapshot + diagnostics + recent tools ──
+  function formatDebugTime(ts) {
+    if (!ts) return '';
+    try {
+      return new Date(ts).toLocaleTimeString();
+    } catch {
+      return '';
+    }
+  }
+
+  function renderAgentDebugSession(snap) {
+    const el = document.getElementById('agent-debug-session');
+    if (!el || !snap) return;
+    const total = (snap.tokensIn || 0) + (snap.tokensOut || 0);
+    el.innerHTML = `
+      <div class="debug-chips">
+        <span class="debug-chip"><b>Mode</b> ${escapeHtml(snap.mode || '—')}</span>
+        <span class="debug-chip"><b>Provider</b> ${escapeHtml(snap.provider || '—')}</span>
+        <span class="debug-chip"><b>Model</b> ${escapeHtml(snap.model || '—')}</span>
+        <span class="debug-chip"><b>Tokens</b> in ${Number(snap.tokensIn || 0).toLocaleString()} · out ${Number(snap.tokensOut || 0).toLocaleString()} · Σ ${total.toLocaleString()}</span>
+        <span class="debug-chip"><b>Plan</b> ${snap.planDone || 0}/${snap.planTasks || 0}</span>
+        <span class="debug-chip mono"><b>Chat</b> ${escapeHtml(String(snap.chatId || '').slice(0, 12) || '—')}</span>
+      </div>
+    `;
+  }
+
   function renderDiagnosticsTab() {
     const list = document.getElementById('diagnostics-list');
     if (!list) return;
 
+    const snap = lastAgentDebug;
+    const diags = (snap && snap.diagnostics) ? snap.diagnostics : systemDiagnostics;
+    const tools = (snap && snap.recentTools) ? snap.recentTools : [];
     const failures = allTimelineEvents.filter(e => e.success === false);
 
-    if (systemDiagnostics.length === 0 && failures.length === 0) {
-      list.innerHTML = '<div class="empty-state">No warnings or errors yet. Failed tool calls and system warnings will show up here.</div>';
+    if ((!diags || diags.length === 0) && tools.length === 0 && failures.length === 0) {
+      list.innerHTML = '<div class="empty-state">No agent activity yet. Tools, tokens, mode, and warnings will appear here as you work.</div>';
       return;
     }
 
     let html = '';
 
-    if (systemDiagnostics.length > 0) {
-      html += '<div class="diagnostics-section-label">System</div>';
-      html += systemDiagnostics.map(d => `
+    if (tools.length > 0) {
+      html += '<div class="diagnostics-section-label">Recent tools (newest first)</div>';
+      html += tools.slice(0, 20).map(e => `
+        <div class="diagnostic-item ${e.success ? 'info' : 'error'}">
+          <div class="diagnostic-header">
+            <span class="diagnostic-source">${escapeHtml(e.tool)} ${e.success ? '✓' : '✗'}</span>
+            <span class="diagnostic-severity">${e.duration || 0}ms · ${formatDebugTime(e.timestamp)}</span>
+          </div>
+          <div class="diagnostic-message">${escapeHtml(e.argsSummary || '')}</div>
+          <div class="diagnostic-message diagnostic-result">${escapeHtml(e.resultPreview || '')}</div>
+        </div>
+      `).join('');
+    }
+
+    if (diags && diags.length > 0) {
+      html += '<div class="diagnostics-section-label">System log</div>';
+      html += diags.map(d => `
         <div class="diagnostic-item ${d.severity}">
           <div class="diagnostic-header">
             <span class="diagnostic-source">${escapeHtml(d.source)}</span>
-            <span class="diagnostic-severity">${d.severity}</span>
+            <span class="diagnostic-severity">${d.severity}${d.timestamp ? ' · ' + formatDebugTime(d.timestamp) : ''}</span>
           </div>
           <div class="diagnostic-message">${escapeHtml(d.message)}</div>
         </div>
       `).join('');
     }
 
-    if (failures.length > 0) {
-      html += '<div class="diagnostics-section-label">Failed Tool Calls</div>';
-      html += failures.slice().reverse().map(e => `
+    if (failures.length > 0 && tools.length === 0) {
+      html += '<div class="diagnostics-section-label">Failed tool calls</div>';
+      html += failures.slice().reverse().slice(0, 15).map(e => `
         <div class="diagnostic-item error">
           <div class="diagnostic-header">
             <span class="diagnostic-source">${escapeHtml(e.tool)}</span>

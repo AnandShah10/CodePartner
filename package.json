@@ -3,7 +3,7 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.1.7",
+  "version": "2.3.1",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
@@ -60,6 +60,26 @@
       {
         "command": "codepartner.cancelActiveTask",
         "title": "CodePartner: Cancel Active Task"
+      },
+      {
+        "command": "codepartner.applyNextEdit",
+        "title": "CodePartner: Apply Next Edit Suggestion"
+      },
+      {
+        "command": "codepartner.finishChanges",
+        "title": "CodePartner: Finish Changes (apply all pending)"
+      },
+      {
+        "command": "codepartner.dismissNextEdits",
+        "title": "CodePartner: Dismiss Next Edit Suggestions"
+      },
+      {
+        "command": "codepartner.focusTerminal",
+        "title": "CodePartner: Focus Interactive Terminal"
+      },
+      {
+        "command": "codepartner.syncPluginCatalog",
+        "title": "CodePartner: Sync Plugin Catalog"
       }
     ],
     "keybindings": [
@@ -110,6 +130,24 @@
         "key": "ctrl+alt+right",
         "mac": "cmd+alt+right",
         "when": "inlineSuggestionVisible && !editorReadonly"
+      },
+      {
+        "command": "codepartner.applyNextEdit",
+        "key": "ctrl+alt+.",
+        "mac": "cmd+alt+.",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "codepartner.finishChanges",
+        "key": "ctrl+alt+enter",
+        "mac": "cmd+alt+enter",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "codepartner.focusTerminal",
+        "key": "ctrl+alt+`",
+        "mac": "cmd+alt+`",
+        "when": "editorTextFocus || terminalFocus"
       }
     ],
     "viewsContainers": {
@@ -259,6 +297,26 @@
           "minimum": 200,
           "maximum": 3000,
           "description": "Debounce delay (ms) before triggering inline completion requests."
+        },
+        "codepartner.llmNextEditSuggestions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in cost-capped LLM-assisted Next Edit Suggestions (in addition to local pattern detection). Uses chat provider tokens."
+        },
+        "codepartner.nextEditSuggestions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Next Edit Suggestions and Finish Changes (detect partial edits and offer to complete the same pattern elsewhere in the file)."
+        },
+        "codepartner.pluginCatalogRepo": {
+          "type": "string",
+          "default": "",
+          "description": "Git URL of a plugin/agent catalog repo (cloned into extension storage). Agents under agents/ or .codepartner/agents/ are listed with list_custom_agents after sync."
+        },
+        "codepartner.pluginCatalogBranch": {
+          "type": "string",
+          "default": "",
+          "description": "Optional branch for pluginCatalogRepo (default: remote default)."
         },
         "codepartner.addAICoAuthor": {
           "type": "boolean",

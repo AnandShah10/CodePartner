@@ -10,6 +10,7 @@ import { GitManager } from "./git";
 import { CodePartnerInlineCompletionProvider } from "./inlineCompletion";
 import { SemanticSearch } from "./semanticSearch";
 import { MCPManager } from "./mcp";
+import { NextEditManager } from "./nextEdit";
 import { applyEdit, NOT_FOUND } from "./editUtils";
 import { scanForSecrets, summarizeFindings } from "./secretScanner";
 import { ApprovalPolicy, GatedCategory, GATED_TOOLS, needsApprovalForPolicy, describeToolCall, commandPrefix, matchesApprovedPrefix } from "./approvals";
@@ -24,13 +25,18 @@ import { estimateTokens, truncateToTokenBudget } from "./tokenEstimate";
 import { findAutoTriggeredSkills } from "./skillAutoTrigger";
 import { filterCachedFiles, isCacheFresh, MentionCacheState } from "./mentionCache";
 import { isToolResultSuccess } from "./toolResultStatus";
+import { scanLicenseTexts, summarizeLicenseFindings } from "./licenseScanner";
+import { rankCodeReferences, formatCodeReferenceReport } from "./codeReference";
+import { AsyncAgentQueue } from "./asyncAgent";
+import { listCatalogAgents, syncPluginCatalog, syncPluginCatalogCommand } from "./pluginCatalog";
+import { listCiRuns, triggerWorkflow, ensureGithubWorkflow } from "./ciTools";
 import { extractUsageFromStreamEvent, formatTokenCount } from "./usageExtraction";
 import { getModelMetadata, formatContextWindow } from "./modelMetadata";
 import { createWorktree, removeWorktree, getBranchDiffStat, commitAllIfDirty, toBranchSafeSegment } from "./gitWorktree";
 import { stripAnsiCodes } from "./ansiStrip";
 import { isFailureWorthAssisting, shouldOfferAssist, buildAssistPrompt, AssistOfferSignature } from "./terminalAssist";
 import { CustomAgentDefinition, parseCustomAgentFile, resolveAgentTools, findUnknownAgentTools } from "./customAgents";
-import { DiagnosticEntry, addDiagnostic } from "./diagnostics";
+import { DiagnosticEntry, addDiagnostic, AgentDebugSnapshot } from "./diagnostics";
 
 import { API_KEY_SECRET_KEY } from "./secretKeys";
 
@@ -327,6 +333,7 @@ CRITICAL RULES:
 
 const PLANNING_SYSTEM_PROMPT = BASE_SYSTEM + `\n\n## PLANNING MODE WORKFLOW
 You MUST follow this exact multi-phase workflow. Each phase must complete before moving to the next.
+You are ALREADY in Planning Mode — the user selected it. Do NOT ask whether to plan; always produce the plan first.
 
 ### Phase 1: RESEARCH (Mandatory First Step)
 Before proposing ANY changes, you MUST thoroughly research:
@@ -336,34 +343,23 @@ Before proposing ANY changes, you MUST thoroughly research:
 - Use \`web_search\` if external documentation or APIs are involved
 - DO NOT make any code changes (no edit_file or create_file) during this phase
 
-### Phase 2: IMPLEMENTATION PLAN (Create Before Any Code Changes)
-After research, create a detailed plan using \`create_artifact\` with:
-- Title: Include "implementation_plan" in the title
-- Type: "markdown"
-- Content structure:
-  # [Goal Description]
-  Brief problem description and background context.
+### Phase 2: IMPLEMENTATION PLAN (REQUIRED — Create Before Any Code Changes)
+After research you MUST do BOTH of the following (in either order):
+1. \`create_artifact\` with title containing "implementation_plan", type "markdown", describing goal, proposed changes, and verification.
+2. \`create_plan\` with a non-empty ordered array of task description strings for the Plan panel (include @filename when a step targets a file).
 
-  ## Proposed Changes
-  ### [Component/Area Name]
-  #### [MODIFY] filename.ext - What will change and why
-  #### [NEW] new_filename.ext - Purpose of the new file
-  #### [DELETE] old_filename.ext - Why this file should be removed
-
-  ## Verification Plan
-  How to verify the changes work correctly.
-
-**CRITICAL: After creating the implementation plan, you MUST STOP and tell the user:**
-"I have created the implementation plan. Please review it in the Artifacts tab and reply with 'proceed' to execute."
-DO NOT execute any code changes until the user explicitly approves.
+**CRITICAL — ASK BEFORE EXECUTION:**
+After creating the plan artifact and the structured checklist, you MUST STOP immediately and reply with:
+"I have created the implementation plan. Please review it in the Plan / Artifacts tab and reply with 'proceed' to execute."
+DO NOT call edit_file, create_file, or any mutating tool until the user explicitly approves with words like: proceed, approved, go ahead, yes, execute, or implement.
 
 ### Phase 3: EXECUTION (Only After User Approval)
-Once the user says 'proceed', 'approved', 'go ahead', 'yes', or similar:
-- Call \`create_plan\` once with the ordered list of implementation steps from your plan, so progress is tracked in the Plan panel
-- Execute changes one by one, calling \`update_plan_task\` to mark each step done as you finish it
+Once the user says 'proceed', 'approved', 'go ahead', 'yes', 'execute', or similar:
+- Execute changes one by one
+- After finishing each step, call \`update_plan_task\` with that task's index and done=true so the Plan panel ticks the checkbox
 
 ### Phase 4: VERIFICATION & WALKTHROUGH
-- Run tests if applicable using \`run_tests\`
+- Run tests if applicable
 - Read modified files to verify correctness
 - Create a "walkthrough" artifact summarizing changes made, what was tested, and validation results`;
 
@@ -384,7 +380,7 @@ const TOOLS = [
   },
   {
     name: "run_in_terminal",
-    description: "Runs a command in a VISIBLE terminal panel the user can see and interact with, unlike run_command which runs hidden. Use this for dev servers, watch/build processes, interactive CLIs, or anything long-running or worth the user's attention. Set background=true for a command that doesn't exit on its own (e.g. a dev server) to start it and return immediately without waiting for it to finish. Output/exit-code capture depends on VS Code's shell integration being available for the user's shell — when it isn't, the command still runs visibly but output can't be captured automatically.",
+    description: "Runs a command in a VISIBLE terminal panel the user can see and interact with, unlike run_command which runs hidden. Use this for dev servers, watch/build processes, interactive CLIs, or anything long-running or worth the user's attention. Set background=true for a command that doesn't exit on its own (e.g. a dev server) to start it and return immediately without waiting for it to finish. Output/exit-code capture depends on VS Code's shell integration being available for the user's shell — when it isn't, the command still runs visibly but output can't be captured automatically. For typing into an already-running interactive process without starting a new command line, use send_terminal_input.",
     parameters: {
       type: "object",
       properties: {
@@ -392,6 +388,18 @@ const TOOLS = [
         background: { type: "boolean", description: "If true, start the command and return immediately without waiting for it to finish (for servers/watchers that run indefinitely). Default false." },
       },
       required: ["command"],
+    },
+  },
+  {
+    name: "send_terminal_input",
+    description: "Type text into the visible CodePartner terminal (interactive). Use for answering prompts (y/n), entering passwords when the user asked, or sending keys to a running process. Set press_enter=true (default) to submit a line; false to type without Enter.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Text to send to the terminal." },
+        press_enter: { type: "boolean", description: "If true (default), append Enter after the text." },
+      },
+      required: ["text"],
     },
   },
   {
@@ -586,6 +594,32 @@ const TOOLS = [
     },
   },
   {
+    name: "scan_licenses",
+    description: "Scan workspace source files for SPDX identifiers and common license headers (MIT, Apache-2.0, GPL, BSD, etc.). Use before distributing code or when checking license consistency.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative directory or file to scan. Defaults to workspace root." },
+        include_missing: { type: "boolean", description: "If true, also list files with no detectable license header." },
+        max_files: { type: "number", description: "Maximum number of files to scan (default 80)." },
+      },
+    },
+  },
+  {
+    name: "scan_code_references",
+    description: "Copilot-style attribution check: find workspace regions similar to a code snippet (shingle similarity). Reports path, lines, score, and license when known. Use before treating generated or pasted code as original.",
+    parameters: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "Code snippet to check for similar existing code." },
+        path: { type: "string", description: "Optional subdirectory to limit the scan." },
+        min_score: { type: "number", description: "Minimum similarity 0-1 (default 0.35)." },
+        max_files: { type: "number", description: "Max files to scan (default 100)." },
+      },
+      required: ["code"],
+    },
+  },
+  {
     name: "run_tests",
     description: "Run the project's test suite. Auto-detects the test runner (jest, vitest, mocha, pytest, etc.) or accepts a custom command. Use this to verify changes.",
     parameters: {
@@ -666,6 +700,66 @@ const TOOLS = [
         base: { type: "string", description: "Base branch (default: main)." },
       },
       required: ["title", "body"],
+    },
+  },
+  {
+    name: "run_async_agent",
+    description: "Start a LOCAL background agent job in the extension host (no cloud). Returns a job id immediately; work continues while the user keeps coding. Does not survive VS Code exit. Use list_async_agents to check status/results.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short label for the job." },
+        prompt: { type: "string", description: "Task instructions for the background agent." },
+        agent_type: {
+          type: "string",
+          description: "Built-in type: researcher | code_expert | tester | writer (default code_expert).",
+        },
+      },
+      required: ["prompt"],
+    },
+  },
+  {
+    name: "list_async_agents",
+    description: "List local background agent jobs and their status/results.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "sync_plugin_catalog",
+    description: "Clone or update the git-sourced plugin/agent catalog (codepartner.pluginCatalogRepo) into extension storage. Agents appear via list_custom_agents.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "list_ci_runs",
+    description: "List recent GitHub Actions workflow runs via the gh CLI (no CodePartner backend). Requires gh auth.",
+    parameters: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max runs (default 10)." },
+      },
+    },
+  },
+  {
+    name: "trigger_ci_workflow",
+    description: "Trigger a GitHub Actions workflow with gh workflow run. Requires gh auth.",
+    parameters: {
+      type: "object",
+      properties: {
+        workflow: { type: "string", description: "Workflow file or name (e.g. ci.yml)." },
+        ref: { type: "string", description: "Git ref (branch/tag). Optional." },
+      },
+      required: ["workflow"],
+    },
+  },
+  {
+    name: "write_ci_workflow",
+    description: "Create or overwrite a GitHub Actions workflow file under .github/workflows/. Pass empty content for a sensible Node CI default.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Filename e.g. ci.yml (or full path under .github/workflows/)." },
+        content: { type: "string", description: "YAML content. Optional default Node CI template if omitted." },
+      },
+      required: ["name"],
     },
   },
 ];
@@ -954,6 +1048,35 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
+  // ── Next Edit Suggestions + Finish Changes ──
+  const nextEditManager = new NextEditManager(output);
+  context.subscriptions.push(nextEditManager);
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.applyNextEdit", () =>
+      nextEditManager.applyNextEdit()
+    )
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.finishChanges", () =>
+      nextEditManager.applyAllPending()
+    )
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.dismissNextEdits", () =>
+      nextEditManager.dismissPending()
+    )
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.focusTerminal", () => {
+      provider.focusCodePartnerTerminal();
+    })
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codepartner.syncPluginCatalog", () =>
+      syncPluginCatalogCommand(context, output)
+    )
+  );
+
   // ── Commands ──
   context.subscriptions.push(
     vscode.commands.registerCommand("codepartner.focus", () => {
@@ -1095,6 +1218,8 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
   private semanticSearch: SemanticSearch;
   private mcpManager: MCPManager;
   private customInstructions: string = "";
+  /** Local background agents (extension-host only; no cloud). */
+  private asyncAgentQueue = new AsyncAgentQueue();
   /** Phase 4.1: cumulative real token usage for this session (from actual API usage data, not an estimate). */
   private sessionTokenUsage = { input: 0, output: 0 };
 
@@ -1112,6 +1237,12 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     this.gitManager = new GitManager();
     this.semanticSearch = new SemanticSearch(output);
     this.mcpManager = new MCPManager(output);
+    try {
+      const persist = path.join(context.globalStorageUri.fsPath, "async-agent-jobs.json");
+      this.asyncAgentQueue.setPersistPath(persist);
+    } catch {
+      /* storage path may be unavailable */
+    }
 
     if (root) {
       this.browserManager = new BrowserManager(root);
@@ -1123,6 +1254,7 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     // Initialize MCP servers
     this.mcpManager.loadConfigs().catch((e: any) => {
       this.output.appendLine(`[CodePartner] MCP init error: ${e.message}`);
+      this.logDiagnostic("error", "MCP", `Init failed: ${e.message}`);
     });
 
     // Build semantic search index in the background
@@ -1216,10 +1348,45 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
    * logging — most output.appendLine calls elsewhere are left as-is on
    * purpose.
    */
-  public logDiagnostic(severity: "warning" | "error", source: string, message: string): void {
-    this.output.appendLine(`[CodePartner] [${source}] ${message}`);
+  public logDiagnostic(
+    severity: "info" | "warning" | "error",
+    source: string,
+    message: string
+  ): void {
+    this.output.appendLine(`[CodePartner] [${severity}] [${source}] ${message}`);
     this.diagnostics = addDiagnostic(this.diagnostics, { severity, source, message });
-    this._view?.webview.postMessage({ type: "diagnostics", value: this.diagnostics });
+    this.pushAgentDebug();
+  }
+
+  /** Full Agent Debug panel snapshot (session + recent tools + diagnostics). */
+  public pushAgentDebug(): void {
+    if (!this._view) {
+      return;
+    }
+    const config = vscode.workspace.getConfiguration("codepartner");
+    const recent = this.timelineEvents.slice(-25).reverse().map((e) => ({
+      tool: String(e.tool || ""),
+      success: !!e.success,
+      duration: Number(e.duration || 0),
+      argsSummary: String(e.argsSummary || "").slice(0, 160),
+      resultPreview: String(e.resultPreview || "").slice(0, 200),
+      timestamp: Number(e.timestamp || 0),
+    }));
+    const planDone = this.currentPlan.filter((t) => t.done).length;
+    const snap: AgentDebugSnapshot = {
+      mode: this.executionMode,
+      model: this.selectedModelId || config.get<string>("model") || "",
+      provider: config.get<string>("provider") || "openai",
+      tokensIn: this.sessionTokenUsage.input,
+      tokensOut: this.sessionTokenUsage.output,
+      chatId: this.currentChatId || "",
+      planTasks: this.currentPlan.length,
+      planDone,
+      recentTools: recent,
+      diagnostics: this.diagnostics,
+    };
+    this._view.webview.postMessage({ type: "agentDebug", value: snap });
+    this._view.webview.postMessage({ type: "diagnostics", value: this.diagnostics });
   }
 
   /**
@@ -1248,11 +1415,13 @@ class CodePartnerSidebarProvider implements vscode.WebviewViewProvider {
     const total = this.sessionTokenUsage.input + this.sessionTokenUsage.output;
     if (total === 0) {
       this.tokenStatusBarItem.hide();
+      this.pushAgentDebug();
       return;
     }
     this.tokenStatusBarItem.text = `$(symbol-numeric) ${formatTokenCount(total)}`;
     this.tokenStatusBarItem.tooltip = `CodePartner session usage: ${this.sessionTokenUsage.input.toLocaleString()} input, ${this.sessionTokenUsage.output.toLocaleString()} output tokens (from provider-reported usage, this session only).`;
     this.tokenStatusBarItem.show();
+    this.pushAgentDebug();
   }
 
   /**
@@ -1465,26 +1634,45 @@ Provide a concise, high-quality result.`;
 
   /** Scans .codepartner/agents/*.md in the workspace root for custom agent definitions (see customAgents.ts). Returns an empty array if the folder doesn't exist or no workspace is open. */
   private async loadCustomAgents(): Promise<CustomAgentDefinition[]> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!root) {return [];}
-    const agentsDir = path.join(root, ".codepartner", "agents");
-    if (!fs.existsSync(agentsDir)) {return [];}
-
     const agents: CustomAgentDefinition[] = [];
-    try {
-      const files = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
-      for (const file of files) {
+    const seen = new Set<string>();
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+    if (root) {
+      const agentsDir = path.join(root, ".codepartner", "agents");
+      if (fs.existsSync(agentsDir)) {
         try {
-          const content = fs.readFileSync(path.join(agentsDir, file), "utf8");
-          const parsed = parseCustomAgentFile(path.basename(file, ".md"), content);
-          if (parsed) {agents.push(parsed);}
+          const files = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
+          for (const file of files) {
+            try {
+              const content = fs.readFileSync(path.join(agentsDir, file), "utf8");
+              const parsed = parseCustomAgentFile(path.basename(file, ".md"), content);
+              if (parsed && !seen.has(parsed.name.toLowerCase())) {
+                seen.add(parsed.name.toLowerCase());
+                agents.push(parsed);
+              }
+            } catch (e: any) {
+              this.output.appendLine(`[CodePartner] Failed to read custom agent file ${file}: ${e.message}`);
+            }
+          }
         } catch (e: any) {
-          this.output.appendLine(`[CodePartner] Failed to read custom agent file ${file}: ${e.message}`);
+          this.output.appendLine(`[CodePartner] Failed to list .codepartner/agents: ${e.message}`);
+        }
+      }
+    }
+
+    // Git-sourced catalog (globalStorage) — workspace agents take precedence
+    try {
+      for (const a of listCatalogAgents(this.context.globalStorageUri.fsPath)) {
+        if (!seen.has(a.name.toLowerCase())) {
+          seen.add(a.name.toLowerCase());
+          agents.push(a);
         }
       }
     } catch (e: any) {
-      this.output.appendLine(`[CodePartner] Failed to list .codepartner/agents: ${e.message}`);
+      this.output.appendLine(`[CodePartner] Catalog agents: ${e.message}`);
     }
+
     return agents;
   }
 
@@ -1492,11 +1680,59 @@ Provide a concise, high-quality result.`;
   private async listCustomAgentsTool(): Promise<string> {
     const agents = await this.loadCustomAgents();
     if (agents.length === 0) {
-      return "No custom agents defined. Add .md files to .codepartner/agents/ in the workspace root to define repo-specific agent personas.";
+      return "No custom agents defined. Add .md files to .codepartner/agents/ or set codepartner.pluginCatalogRepo and run sync_plugin_catalog.";
     }
     return agents
       .map((a) => `- ${a.name}: ${a.description}${a.tools.length > 0 ? ` (tools: ${a.tools.join(", ")})` : " (no tool access)"}`)
       .join("\n");
+  }
+
+  /**
+   * Local async agent: returns job id immediately; runs sub-agent in background.
+   */
+  private startAsyncAgent(title: string, prompt: string, agentType?: string): string {
+    const job = this.asyncAgentQueue.create(title || "Background agent", prompt);
+    const type = (agentType || "code_expert").trim();
+    this.asyncAgentQueue.markRunning(job.id);
+    this.logDiagnostic("info", "AsyncAgent", `Started ${job.id}: ${job.title}`);
+
+    void vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `CodePartner: ${job.title}`,
+        cancellable: true,
+      },
+      async (progress, token) => {
+        progress.report({ message: "Running…" });
+        try {
+          if (token.isCancellationRequested) {
+            this.asyncAgentQueue.markCancelled(job.id);
+            return;
+          }
+          const result = await this.agentManager.dispatch(type, prompt, this);
+          if (token.isCancellationRequested) {
+            this.asyncAgentQueue.markCancelled(job.id);
+            return;
+          }
+          this.asyncAgentQueue.markDone(job.id, String(result));
+          this.logDiagnostic("info", "AsyncAgent", `Done ${job.id}`);
+          vscode.window
+            .showInformationMessage(`Background agent finished: ${job.title}`, "Show result")
+            .then((pick) => {
+              if (pick === "Show result") {
+                const j = this.asyncAgentQueue.get(job.id);
+                this.output.appendLine(`[AsyncAgent ${job.id}]\n${j?.result || ""}`);
+                this.output.show(true);
+              }
+            });
+        } catch (e: any) {
+          this.asyncAgentQueue.markError(job.id, e.message || String(e));
+          this.logDiagnostic("error", "AsyncAgent", `${job.id}: ${e.message}`);
+        }
+      }
+    );
+
+    return `Started local async agent job **${job.id}** (${job.title}). It runs in the background in this VS Code session only. Use list_async_agents to check status.`;
   }
 
   /**
@@ -1644,16 +1880,13 @@ Provide a concise, high-quality result.`;
       if (this.timelineEvents.length > 0) {
         this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
       }
-      // Diagnostics are session-scoped (not persisted per-chat like the
-      // timeline), but still worth sending on every resolve so switching
-      // webview visibility doesn't lose what's accumulated this session.
-      if (this.diagnostics.length > 0) {
-        this._view?.webview.postMessage({ type: "diagnostics", value: this.diagnostics });
-      }
+      // Agent Debug snapshot (mode, tokens, recent tools, diagnostics)
+      this.pushAgentDebug();
 
       this.output.appendLine("[CodePartner] Webview view resolved successfully.");
     } catch (e: any) {
       this.output.appendLine(`[CodePartner] Error in resolveWebviewView: ${e.message}`);
+      this.logDiagnostic("error", "Webview", `Failed to resolve sidebar: ${e.message}`);
       vscode.window.showErrorMessage(`CodePartner Error: ${e.message}`);
     }
 
@@ -1728,6 +1961,8 @@ Provide a concise, high-quality result.`;
           }
           this.messageHistory[0] = { role: "system", content: promptToUse };
           this.output.appendLine(`[CodePartner] Mode changed to: ${this.executionMode}`);
+          this.logDiagnostic("info", "Mode", `Switched to ${this.executionMode}`);
+          this.pushAgentDebug();
           break;
         case "revertTurn":
           this.revertTurn(data.value);
@@ -1753,15 +1988,39 @@ Provide a concise, high-quality result.`;
         case "completeTask":
           if (this.currentPlan[data.value]) {
             this.currentPlan[data.value].done = true;
+            this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
             this.saveCurrentChat();
           }
+          break;
+        case "sidebarTerminalRun": {
+          const cmd = String(data.value || "").trim();
+          if (cmd) {
+            this._view?.webview.postMessage({ type: "terminalOutput", value: `$ ${cmd}`, kind: "cmd" });
+            void this.runInTerminal(cmd, false).then((result) => {
+              this._view?.webview.postMessage({
+                type: "terminalOutput",
+                value: String(result),
+                kind: String(result).toLowerCase().includes("error") ? "err" : "out",
+              });
+            });
+          }
+          break;
+        }
+        case "focusTerminal":
+          this.focusCodePartnerTerminal();
           break;
         case "listTimeline":
           this._view?.webview.postMessage({ type: "timeline", value: this.timelineEvents });
           break;
         case "clearDiagnostics":
           this.diagnostics = [];
-          this._view?.webview.postMessage({ type: "diagnostics", value: [] });
+          this.pushAgentDebug();
+          break;
+        case "requestAgentDebug":
+          this.pushAgentDebug();
+          break;
+        case "openDebugLog":
+          this.output.show(true);
           break;
         case "saveSkillFromSuggestion":
           if (this.skillManager) {
@@ -1878,6 +2137,11 @@ Provide a concise, high-quality result.`;
   }
 
   private async loadChat(id: string) {
+    // Opening history must not look "busy" — cancel any active turn first.
+    // silent+skipDone: do not post `done` (that would flush the prompt queue
+    // and could start a new turn while messages are still loading).
+    this.cancelActiveTask({ silent: true, skipDone: true });
+
     if (this.messageHistory.length > 1) {
       this.saveCurrentChat();
     }
@@ -1896,12 +2160,39 @@ Provide a concise, high-quality result.`;
       this.sessionTokenUsage = { input: 0, output: 0 };
       this.updateTokenStatusBar();
 
-      // Add hiddenFromUI flag to context-heavy messages for UI reloading
-      const uiHistory = this.messageHistory.map((m, idx) => ({
-        ...m,
-        hiddenFromUI: idx > 0 && (m.role === "tool" || m.role === "system")
-      }));
+      // Strip injected context blocks from UI; hide tool/system rows
+      const stripForUi = (content: any): any => {
+        if (typeof content !== "string") {
+          return content;
+        }
+        let text = content;
+        if (text.includes("--- Context ---") && text.includes("User Question:")) {
+          text = text.split("User Question:").pop()?.trim() || text;
+        }
+        // Drop pure status-style noise
+        if (/^(Preparing context|Thinking|Refining)\.\.\.?$/i.test(text.trim())) {
+          return "";
+        }
+        return text;
+      };
 
+      const uiHistory = this.messageHistory
+        .map((m, idx) => {
+          const role = m.role;
+          const hiddenFromUI =
+            idx === 0 ||
+            role === "tool" ||
+            role === "system" ||
+            (role === "assistant" && !m.content && m.tool_calls);
+          return {
+            ...m,
+            content: stripForUi(m.content),
+            hiddenFromUI,
+          };
+        })
+        .filter((m) => !m.hiddenFromUI && (m.content || m.role === "user"));
+
+      this._view?.webview.postMessage({ type: "status", value: "" });
       this._view?.webview.postMessage({ type: "loadMessages", value: uiHistory });
       this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
       this.currentArtifacts.forEach(a => this._view?.webview.postMessage({ type: "artifact", value: a }));
@@ -1935,17 +2226,66 @@ Provide a concise, high-quality result.`;
     }
   }
 
-  /** Stops the current turn's LLM stream and/or any in-flight shell command or test run. Also callable via the codepartner.cancelActiveTask keybinding, not just the webview's Stop button. */
-  public cancelActiveTask() {
+  /** Set when the user hits Stop — checked before every tool and loop iteration so commands don't keep running after cancel. */
+  private turnCancelled = false;
+  /**
+   * Monotonic turn id. Each handlePrompt captures a local id; cancel bumps the
+   * global so a *new* prompt cannot clear turnCancelled and let an older loop
+   * keep executing tools.
+   */
+  private activeTurnId = 0;
+
+  /**
+   * Stops the current turn's LLM stream and/or any in-flight shell command or test run.
+   * @param opts.silent — no UI noise (used when switching chats)
+   * @param opts.skipDone — abort without posting `done` (avoids flushing the prompt queue)
+   */
+  public cancelActiveTask(opts?: { silent?: boolean; skipDone?: boolean }) {
+    const silent = !!opts?.silent;
+    const skipDone = !!opts?.skipDone || silent;
+    const hadWork = !!(this.abortController || this.runningChildProcess);
+    this.turnCancelled = true;
+    this.activeTurnId++;
     if (this.abortController) {
-      this.abortController.abort();
+      try {
+        this.abortController.abort();
+      } catch {
+        /* ignore */
+      }
       this.abortController = undefined;
-      this.output.appendLine("[CodePartner] Cancelled by user.");
+      if (!silent) {
+        this.output.appendLine("[CodePartner] Cancelled by user.");
+      }
     }
     if (this.runningChildProcess) {
-      this.runningChildProcess.kill();
-      this.output.appendLine("[CodePartner] Killed in-flight command/test run.");
+      try {
+        this.runningChildProcess.kill("SIGTERM");
+        const child = this.runningChildProcess;
+        setTimeout(() => {
+          try {
+            if (child && !child.killed) {
+              child.kill("SIGKILL");
+            }
+          } catch {
+            /* ignore */
+          }
+        }, 800);
+      } catch {
+        /* ignore */
+      }
+      if (!silent) {
+        this.output.appendLine("[CodePartner] Killed in-flight command/test run.");
+      }
       this.runningChildProcess = undefined;
+    }
+    if (!silent) {
+      this._view?.webview.postMessage({ type: "status", value: hadWork ? "Stopped." : "" });
+      if (!skipDone) {
+        this._view?.webview.postMessage({ type: "done" });
+      }
+      if (hadWork) {
+        this.logDiagnostic("info", "Cancel", "User stopped the active turn");
+      }
     }
   }
 
@@ -2273,6 +2613,7 @@ Provide a concise, high-quality result.`;
         });
       } catch (e: any) {
         this.output.appendLine(`[CodePartner] Error reading file: ${e.message}`);
+        this.logDiagnostic("warning", "Attach", `Could not read file: ${e.message}`);
       }
     }
 
@@ -2311,6 +2652,7 @@ Provide a concise, high-quality result.`;
         vscode.window.showWarningMessage(`CodePartner: File not found: ${absolutePath}`);
       }
     } catch (e: any) {
+      this.logDiagnostic("warning", "Open File", e.message);
       vscode.window.showErrorMessage(`CodePartner: Cannot open file: ${e.message}`);
     }
   }
@@ -2735,6 +3077,24 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         this.newChat();
         break;
 
+      case "help":
+      case "?": {
+        const helpText =
+          "**CodePartner slash commands**\n\n" +
+          "| Command | Action |\n|---|---|\n" +
+          "| `/fix [note]` | Fix diagnostics in the active file |\n" +
+          "| `/explain [note]` | Explain current file or selection |\n" +
+          "| `/test [note]` | Generate unit tests for the current file |\n" +
+          "| `/compact` | Compact long chat context |\n" +
+          "| `/clear` | Start a new chat |\n" +
+          "| `/help` | Show this help |\n\n" +
+          "Also: **Plan / Fast / Architect** modes, `@file` / `@workspace` / `@web`, drag-and-drop attachments, " +
+          "Next Edit Suggestions (`Ctrl+Alt+.`) and Finish Changes (`Ctrl+Alt+Enter`).";
+        this._view?.webview.postMessage({ type: "partial", value: helpText });
+        this._view?.webview.postMessage({ type: "done" });
+        break;
+      }
+
       default:
         this.handlePrompt(commandStr); // Fallback to normal prompt
     }
@@ -2744,6 +3104,13 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     if (!this._view) {
       return;
     }
+
+    // Invalidate any previous in-flight loop, then start a fresh turn id.
+    this.activeTurnId++;
+    const myTurnId = this.activeTurnId;
+    this.turnCancelled = false;
+
+    const isStale = () => this.turnCancelled || myTurnId !== this.activeTurnId;
 
     // Fresh turn — clear anything tracked for the prompt-injection guard
     // from the previous turn so stale content can't suppress a real check.
@@ -2911,6 +3278,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
     while (iteration < maxIterations) {
       iteration++;
+      if (isStale()) {
+        this.output.appendLine("[CodePartner] Loop aborted — user cancelled or superseded.");
+        break;
+      }
       this.abortController = new AbortController();
       let fullResponse = "";
       let fullReasoning = "";
@@ -2944,6 +3315,9 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         });
         const parser = createParser({
           onEvent: (event) => {
+            if (isStale()) {
+              return;
+            }
             if (event.data === "[DONE]") {
               return;
             }
@@ -3024,6 +3398,9 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         this.updateTokenStatusBar();
 
         let shouldBreakLoop = false;
+        const hadPlanAtTurnStart =
+          this.currentPlan.length > 0 ||
+          this.currentArtifacts.some((a) => (a.title || "").toLowerCase().includes("plan"));
 
         if (toolCalls.length > 0) {
           toolCalls = toolCalls.filter(Boolean);
@@ -3037,6 +3414,13 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
             const toolStartTime = Date.now();
             let result;
             try {
+              if (isStale()) {
+                return {
+                  id: tc.id,
+                  name: tc.function.name,
+                  content: "Cancelled: user stopped the turn before this tool ran.",
+                };
+              }
               const parsed = repairJsonParse(tc.function.arguments);
               if (parsed === null) {
                 const errResult = `Error: Could not parse arguments for tool "${tc.function.name}" as JSON, even after attempting basic repair (unterminated string / unbalanced brackets / trailing comma). Raw arguments began with: ${String(tc.function.arguments).substring(0, 200)}\n\nRetry this tool call with strictly valid JSON arguments.`;
@@ -3048,7 +3432,23 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
                 this.output.appendLine(`[CodePartner] Repaired malformed JSON arguments for ${tc.function.name}.`);
               }
               const args = parsed.value;
+              if (isStale()) {
+                return {
+                  id: tc.id,
+                  name: tc.function.name,
+                  content: "Cancelled: user stopped the turn before this tool ran.",
+                };
+              }
               result = await this.executeTool(tc.function.name, args);
+              if (isStale()) {
+                return {
+                  id: tc.id,
+                  name: tc.function.name,
+                  content: typeof result === "string"
+                    ? `Cancelled after partial run: ${result.slice(0, 200)}`
+                    : "Cancelled: user stopped during tool execution.",
+                };
+              }
 
               if (tc.function.name === "edit_file" && !result.startsWith("Error")) {
                 this.modifiedFiles.add(args.path);
@@ -3077,17 +3477,70 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
               };
               this.timelineEvents.push(evt);
               this._view?.webview.postMessage({ type: "timelineEvent", value: evt });
+              if (!evt.success) {
+                this.logDiagnostic(
+                  "warning",
+                  "Tool",
+                  `${evt.tool} failed (${evt.duration}ms): ${String(evt.resultPreview || "").slice(0, 120)}`
+                );
+              } else {
+                this.pushAgentDebug();
+              }
 
-              // Check for planning mode stop
-              if (this.executionMode === "planning" && tc.function.name === "create_artifact") {
-                if (args.title?.toLowerCase().includes("implementation_plan")) {
+              // Ask-before-execution: stop only when first establishing a plan
+              // (not when the user has already approved and work is underway)
+              if (this.executionMode === "planning" && !hadPlanAtTurnStart) {
+                if (tc.function.name === "create_artifact") {
+                  const t = (args.title || "").toLowerCase();
+                  if (
+                    t.includes("implementation_plan") ||
+                    t.includes("implementation plan") ||
+                    t.includes("plan")
+                  ) {
+                    shouldBreakLoop = true;
+                  }
+                }
+                if (tc.function.name === "create_plan") {
                   shouldBreakLoop = true;
+                }
+              }
+
+              // Auto-tick plan tasks when a matching file is edited/created
+              if (
+                (tc.function.name === "edit_file" || tc.function.name === "create_file") &&
+                isToolResultSuccess(result) &&
+                args.path &&
+                this.currentPlan.length > 0
+              ) {
+                const fileBase = path.basename(String(args.path)).toLowerCase();
+                const filePathLower = String(args.path).toLowerCase();
+                let ticked = false;
+                for (let i = 0; i < this.currentPlan.length; i++) {
+                  const task = this.currentPlan[i];
+                  if (task.done) {
+                    continue;
+                  }
+                  const t = task.task.toLowerCase();
+                  if (
+                    t.includes(fileBase) ||
+                    t.includes(filePathLower) ||
+                    t.includes(`@${fileBase}`) ||
+                    t.includes(`@${filePathLower}`)
+                  ) {
+                    this.currentPlan[i].done = true;
+                    ticked = true;
+                  }
+                }
+                if (ticked) {
+                  this._view?.webview.postMessage({ type: "plan", value: this.currentPlan });
+                  this.saveCurrentChat();
                 }
               }
 
               return { id: tc.id, name: tc.function.name, content: typeof result === "string" ? result : JSON.stringify(result) };
             } catch (e: any) {
               const errResult = `Error executing tool: ${e.message}`;
+              this.logDiagnostic("error", "Tool", `${tc.function.name}: ${e.message}`);
               return { id: tc.id, name: tc.function.name, content: errResult };
             }
           });
@@ -3105,6 +3558,11 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
             });
           }
 
+          if (isStale()) {
+            this.output.appendLine("[CodePartner] Stopping after tools — user cancelled or superseded.");
+            break;
+          }
+
           // Update UI stats
           if (this.modifiedFiles.size > 0) {
             const stats = Array.from(this.modifiedFiles).map(f => ({
@@ -3115,7 +3573,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
           }
 
           if (shouldBreakLoop) {
-            const waitMsg = "I have created the implementation plan. Please review it in the Artifacts tab and reply with 'proceed' to execute.";
+            const waitMsg = "I have created the implementation plan. Please review it in the **Plan** / Artifacts tab and reply with **proceed** to execute.";
             this.messageHistory.push({ role: "assistant", content: waitMsg, turnId });
             this._view?.webview.postMessage({ type: "partial", value: waitMsg });
             this._view?.webview.postMessage({ type: "status", value: "Waiting for user approval..." });
@@ -3184,6 +3642,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
           // Fallback sequence: progressively disable features
           if (useTools) {
             this.output.appendLine(`[CodePartner] ${status} API Error: ${msg}. Retrying without tools as fallback...`);
+            this.logDiagnostic("warning", "API", `${status}: ${msg} — retrying without tools`);
             this._view?.webview.postMessage({ type: "status", value: "Retrying without tools..." });
             useTools = false;
             iteration--;
@@ -3235,6 +3694,7 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       this._view?.webview.postMessage({ type: "done", turnId });
     } catch (globalErr: any) {
       this.output.appendLine(`[CodePartner] Fatal Error in handlePrompt: ${globalErr.message || globalErr}`);
+      this.logDiagnostic("error", "Agent", `Fatal: ${globalErr.message || globalErr}`);
       this._view?.webview.postMessage({ type: "error", value: `❌ **Error:** ${globalErr.message || globalErr}` });
     }
   }
@@ -3251,6 +3711,11 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     if (this.executionMode === "planning") {
       const hasPlan = this.currentPlan.length > 0 || this.currentArtifacts.some(a => a.title.toLowerCase().includes("plan"));
       if (!hasPlan && (name === "edit_file" || name === "create_file")) {
+        this.logDiagnostic(
+          "warning",
+          "Planning",
+          `Blocked ${name} until implementation plan + create_plan exist`
+        );
         return `Error: You are in PLANNING MODE but have not created a plan yet. Create the implementation plan artifact (create_artifact, title including "implementation_plan") and the structured task checklist (create_plan) before making code changes.`;
       }
     }
@@ -3275,6 +3740,8 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         return this.runCommand(args.command, rootOverride);
       case "run_in_terminal":
         return this.runInTerminal(args.command, !!args.background, rootOverride);
+      case "send_terminal_input":
+        return this.sendTerminalInput(String(args.text ?? ""), args.press_enter !== false);
       case "list_dir":
         return this.listDir(args.path, rootOverride);
       case "read_file":
@@ -3293,6 +3760,43 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         return this.runCustomAgent(args.name, args.task, rootOverride);
       case "run_parallel_agents":
         return this.runParallelAgents(args.tasks);
+      case "run_async_agent":
+        return this.startAsyncAgent(args.title || "", args.prompt, args.agent_type);
+      case "list_async_agents":
+        return this.asyncAgentQueue.formatList();
+      case "sync_plugin_catalog": {
+        const config = vscode.workspace.getConfiguration("codepartner");
+        const repo = config.get<string>("pluginCatalogRepo") || "";
+        const branch = config.get<string>("pluginCatalogBranch") || "";
+        const msg = syncPluginCatalog(
+          this.context.globalStorageUri.fsPath,
+          repo,
+          branch || undefined
+        );
+        this.logDiagnostic(msg.includes("fail") || msg.startsWith("Error") ? "error" : "info", "PluginCatalog", msg);
+        return msg;
+      }
+      case "list_ci_runs": {
+        const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!root) {
+          return "No workspace open.";
+        }
+        return listCiRuns(root, args.limit);
+      }
+      case "trigger_ci_workflow": {
+        const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!root) {
+          return "No workspace open.";
+        }
+        return triggerWorkflow(root, args.workflow, args.ref);
+      }
+      case "write_ci_workflow": {
+        const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!root) {
+          return "No workspace open.";
+        }
+        return ensureGithubWorkflow(root, args.name, args.content || "");
+      }
       case "create_artifact":
         if (this.artifactRegistry) {
           const art = this.artifactRegistry.create(args.title, args.content, args.type);
@@ -3329,6 +3833,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         return `Found ${skills.length} skills. Sent to UI.`;
       case "grep_search":
         return this.grepSearch(args.pattern, args.path, args.include, rootOverride);
+      case "scan_licenses":
+        return this.scanLicenses(args.path, args.include_missing, args.max_files, rootOverride);
+      case "scan_code_references":
+        return this.scanCodeReferences(args.code, args.path, args.min_score, args.max_files, rootOverride);
       case "run_tests":
         return this.runTests(args.command, rootOverride);
       case "index_docs":
@@ -3594,6 +4102,35 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
+  /**
+   * Send text to the visible CodePartner terminal for interactive use
+   * (answer prompts, type into a running REPL/server CLI).
+   */
+  private sendTerminalInput(text: string, pressEnter: boolean): string {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!this.visibleTerminal || this.visibleTerminal.exitStatus !== undefined) {
+      if (!root) {
+        return "No workspace open and no CodePartner terminal is open. Use run_in_terminal first.";
+      }
+      this.visibleTerminal = vscode.window.createTerminal({ name: "CodePartner", cwd: root });
+    }
+    const terminal = this.visibleTerminal;
+    terminal.show(false);
+    terminal.sendText(text, pressEnter);
+    return `Sent to CodePartner terminal${pressEnter ? " (with Enter)" : " (no Enter)"}: ${JSON.stringify(text)}`;
+  }
+
+  /** Focus/reveal the CodePartner terminal panel. */
+  public focusCodePartnerTerminal(): void {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!this.visibleTerminal || this.visibleTerminal.exitStatus !== undefined) {
+      this.visibleTerminal = vscode.window.createTerminal({
+        name: "CodePartner",
+        cwd: root,
+      });
+    }
+    this.visibleTerminal.show(true);
+  }
 
   private listDir(relPath: string, rootOverride?: string): string {
     const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -3678,9 +4215,70 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
     }
   }
 
+  /**
+   * Non-code deliverables (plans, walkthroughs, design notes) belong in the
+   * Artifacts panel — not as random files in the repo root.
+   */
+  private shouldRouteToArtifact(relPath: string): boolean {
+    const base = path.basename(relPath).toLowerCase();
+    const dir = path.dirname(relPath).replace(/\\/g, "/").toLowerCase();
+    const ext = path.extname(base);
+    const nameHints =
+      /^(implementation[_-]?plan|plan|walkthrough|design|spec|architecture|readme|notes|changelog|todo|tasks)(\.|$)/i.test(
+        base
+      ) ||
+      base.includes("walkthrough") ||
+      base.includes("implementation_plan") ||
+      base.includes("implementation-plan");
+    const docExt = [".md", ".mdx", ".txt", ".rst"].includes(ext);
+    const inDocDir =
+      dir === "." ||
+      dir === "" ||
+      dir.startsWith("docs") ||
+      dir.startsWith("artifacts") ||
+      dir.includes(".codepartner");
+    // Never reroute source code or intentional project README/changelog
+    const codeExt = [
+      ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java",
+      ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php",
+      ".json", ".yml", ".yaml", ".toml", ".css", ".scss", ".html", ".vue", ".svelte",
+    ].includes(ext);
+    if (codeExt) {
+      return false;
+    }
+    if (base === "readme.md" || base === "changelog.md" || base === "license" || base === "license.md") {
+      return false;
+    }
+    // Only route clearly non-code agent deliverables (plans/walkthroughs), not every docs/*.md
+    return nameHints && (docExt || inDocDir);
+  }
+
   private async createFile(relPath: string, content: string, rootOverride?: string): Promise<string> {
     const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) { return "Error: No workspace folder open."; }
+
+    // Route plan/walkthrough/docs to Artifacts instead of polluting the workspace
+    if (!rootOverride && this.shouldRouteToArtifact(relPath) && this.artifactRegistry) {
+      const title =
+        path.basename(relPath, path.extname(relPath)).replace(/[_-]/g, " ") ||
+        "Document";
+      const type =
+        path.extname(relPath).toLowerCase() === ".md" ||
+        path.extname(relPath).toLowerCase() === ".mdx"
+          ? "markdown"
+          : "text";
+      const art = this.artifactRegistry.create(title, content, type);
+      this.currentArtifacts.push(art);
+      this._view?.webview.postMessage({ type: "artifact", value: art });
+      this.saveCurrentChat();
+      this.logDiagnostic(
+        "info",
+        "Artifacts",
+        `Routed non-code file "${relPath}" → artifact "${art.title}"`
+      );
+      return `Saved as artifact "${art.title}" (ID: ${art.id}) instead of writing ${relPath} to disk — open the Artifacts tab. Use create_artifact for plans/walkthroughs intentionally.`;
+    }
+
     const fullPath = path.join(root, relPath);
     try {
       const dir = path.dirname(fullPath);
@@ -3731,6 +4329,187 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       if (e.status === 1) { return "No matches found."; }
       return `Search error: ${e.message}`;
     }
+  }
+
+  /**
+   * Scan source files for SPDX / common license headers.
+   */
+  private scanLicenses(
+    relPath?: string,
+    includeMissing?: boolean,
+    maxFiles?: number,
+    rootOverride?: string
+  ): string {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return "No workspace open.";
+    }
+    const startDir = relPath ? path.join(root, relPath) : root;
+    if (!fs.existsSync(startDir)) {
+      return `Path not found: ${relPath || "."}`;
+    }
+    const limit = typeof maxFiles === "number" && maxFiles > 0 ? Math.min(maxFiles, 200) : 80;
+    const exts = new Set([
+      ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java",
+      ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php",
+      ".md", ".txt",
+    ]);
+    const skipDirs = new Set(["node_modules", ".git", "dist", "out", "build", ".next", "coverage"]);
+    const collected: { path: string; text: string }[] = [];
+
+    const walk = (dir: string) => {
+      if (collected.length >= limit) {
+        return;
+      }
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const ent of entries) {
+        if (collected.length >= limit) {
+          break;
+        }
+        if (ent.name.startsWith(".") && ent.name !== ".gitignore") {
+          if (ent.isDirectory()) {
+            continue;
+          }
+        }
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) {
+          if (skipDirs.has(ent.name)) {
+            continue;
+          }
+          walk(full);
+        } else if (ent.isFile()) {
+          const ext = path.extname(ent.name).toLowerCase();
+          const base = ent.name.toLowerCase();
+          const interesting =
+            exts.has(ext) ||
+            base === "license" ||
+            base === "licence" ||
+            base === "copying" ||
+            base.startsWith("license.");
+          if (!interesting) {
+            continue;
+          }
+          try {
+            const stat = fs.statSync(full);
+            if (stat.size > 512_000) {
+              continue;
+            }
+            const text = fs.readFileSync(full, "utf8");
+            collected.push({
+              path: path.relative(root, full).replace(/\\/g, "/"),
+              text,
+            });
+          } catch {
+            /* skip unreadable */
+          }
+        }
+      }
+    };
+
+    if (fs.statSync(startDir).isFile()) {
+      try {
+        collected.push({
+          path: path.relative(root, startDir).replace(/\\/g, "/"),
+          text: fs.readFileSync(startDir, "utf8"),
+        });
+      } catch (e: any) {
+        return `Read error: ${e.message}`;
+      }
+    } else {
+      walk(startDir);
+    }
+
+    const findings = scanLicenseTexts(collected, !!includeMissing);
+    return summarizeLicenseFindings(findings);
+  }
+
+  /**
+   * Copilot-style attribution: find similar code regions in the workspace.
+   */
+  private scanCodeReferences(
+    code: string,
+    relPath?: string,
+    minScore?: number,
+    maxFiles?: number,
+    rootOverride?: string
+  ): string {
+    const root = rootOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return "No workspace open.";
+    }
+    if (!code || String(code).trim().length < 8) {
+      return "Error: provide a longer code snippet to scan for references.";
+    }
+    const startDir = relPath ? path.join(root, relPath) : root;
+    if (!fs.existsSync(startDir)) {
+      return `Path not found: ${relPath || "."}`;
+    }
+    const limit = typeof maxFiles === "number" && maxFiles > 0 ? Math.min(maxFiles, 250) : 100;
+    const threshold = typeof minScore === "number" ? minScore : 0.35;
+    const exts = new Set([
+      ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".java",
+      ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php",
+    ]);
+    const skipDirs = new Set(["node_modules", ".git", "dist", "out", "build", ".next", "coverage"]);
+    const collected: { path: string; text: string }[] = [];
+
+    const walk = (dir: string) => {
+      if (collected.length >= limit) {
+        return;
+      }
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const ent of entries) {
+        if (collected.length >= limit) {
+          break;
+        }
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) {
+          if (skipDirs.has(ent.name) || ent.name.startsWith(".")) {
+            continue;
+          }
+          walk(full);
+        } else if (ent.isFile() && exts.has(path.extname(ent.name).toLowerCase())) {
+          try {
+            const stat = fs.statSync(full);
+            if (stat.size > 400_000) {
+              continue;
+            }
+            collected.push({
+              path: path.relative(root, full).replace(/\\/g, "/"),
+              text: fs.readFileSync(full, "utf8"),
+            });
+          } catch {
+            /* skip */
+          }
+        }
+      }
+    };
+
+    if (fs.statSync(startDir).isFile()) {
+      try {
+        collected.push({
+          path: path.relative(root, startDir).replace(/\\/g, "/"),
+          text: fs.readFileSync(startDir, "utf8"),
+        });
+      } catch (e: any) {
+        return `Read error: ${e.message}`;
+      }
+    } else {
+      walk(startDir);
+    }
+
+    const hits = rankCodeReferences(String(code), collected, threshold, 12);
+    return formatCodeReferenceReport(hits);
   }
 
   /**
@@ -4208,8 +4987,11 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       <button class="tab-btn" data-tab="skills" title="Skills">
         <svg viewBox="0 0 16 16"><path d="M11 2a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3h6z"/></svg>
       </button>
-      <button class="tab-btn" data-tab="diagnostics" title="Diagnostics">
+      <button class="tab-btn" data-tab="diagnostics" title="Agent Debug">
         <svg viewBox="0 0 16 16"><path d="M8 1a.75.75 0 0 1 .75.75v.5a5.5 5.5 0 0 1 4.702 4.702h.5a.75.75 0 0 1 0 1.5h-.5a5.5 5.5 0 0 1-4.702 4.702v.5a.75.75 0 0 1-1.5 0v-.5A5.5 5.5 0 0 1 2.548 8.452h-.5a.75.75 0 0 1 0-1.5h.5A5.5 5.5 0 0 1 7.25 2.25v-.5A.75.75 0 0 1 8 1zM8 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0 2a.75.75 0 0 1 .75.75v1.5h1.5a.75.75 0 0 1 0 1.5h-1.5v1.5a.75.75 0 0 1-1.5 0v-1.5h-1.5a.75.75 0 0 1 0-1.5h1.5v-1.5A.75.75 0 0 1 8 6z"/></svg>
+      </button>
+      <button class="tab-btn" data-tab="terminal" title="Terminal">
+        <svg viewBox="0 0 16 16"><path d="M0 2.75A.75.75 0 0 1 .75 2h14.5a.75.75 0 0 1 0 1.5H.75A.75.75 0 0 1 0 2.75zM0 13.25a.75.75 0 0 1 .75-.75h14.5a.75.75 0 0 1 0 1.5H.75a.75.75 0 0 1-.75-.75zM2.5 6.5l3 2-3 2V6.5zm4.5 3.25h5a.75.75 0 0 1 0 1.5h-5a.75.75 0 0 1 0-1.5z"/></svg>
       </button>
     </div>
 
@@ -4280,11 +5062,16 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
       <div id="tab-diagnostics" class="tab-content">
         <div class="pane-header">
-          <span>Diagnostics</span>
-          <button id="clear-diagnostics-btn" class="icon-btn" title="Clear system warnings (failed tool calls are part of the timeline and aren't cleared here)">Clear</button>
+          <span>Agent Debug</span>
+          <div class="term-header-actions">
+            <button id="open-debug-log-btn" class="icon-btn" title="Open full Output channel log">Full log</button>
+            <button id="refresh-debug-btn" class="icon-btn" title="Refresh snapshot">Refresh</button>
+            <button id="clear-diagnostics-btn" class="icon-btn" title="Clear system diagnostics">Clear</button>
+          </div>
         </div>
+        <div id="agent-debug-session" class="agent-debug-session"></div>
         <div id="diagnostics-list">
-          <div class="empty-state">No warnings or errors yet. Failed tool calls and system warnings will show up here.</div>
+          <div class="empty-state">No agent activity yet. Tools, tokens, mode, and warnings will appear here as you work.</div>
         </div>
       </div>
 
@@ -4301,6 +5088,23 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
       <div id="tab-timeline" class="tab-content">
         <div id="timeline-list">
           <div class="empty-state">No tool executions yet.</div>
+        </div>
+      </div>
+
+      <div id="tab-terminal" class="tab-content">
+        <div class="pane-header">
+          <span>Terminal</span>
+          <div class="term-header-actions">
+            <button id="term-focus-btn" class="icon-btn" title="Focus VS Code terminal panel">Focus panel</button>
+            <button id="term-clear-btn" class="icon-btn" title="Clear log">Clear</button>
+          </div>
+        </div>
+        <div id="terminal-log" class="terminal-log">
+          <div class="empty-state">Run commands here or via the agent (<code>run_in_terminal</code>). Output appears below; use the input to type interactively.</div>
+        </div>
+        <div class="terminal-input-row">
+          <input id="terminal-input" type="text" placeholder="Type a command or interactive input…" autocomplete="off" />
+          <button id="terminal-send-btn" title="Send (Enter)">Run</button>
         </div>
       </div>
     </div>

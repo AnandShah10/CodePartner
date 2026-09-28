@@ -29,13 +29,14 @@
 | Feature | CodePartner | Antigravity | Claude Code | Copilot |
 |:---|:---:|:---:|:---:|:---:|
 | Tab-complete ghost text | ✅ | ✅ | ❌ (chat-only) | ✅ |
-| Multi-line autocomplete | ⚠️ Single completion span, no explicit multi-line ranking | ✅ | ❌ | ✅ |
-| Next Edit Suggestions (NES) | ❌ | ❌ | ❌ | ✅ |
-| Partial word accept (Ctrl+→) | ❌ (VS Code's native ghost-text partial-accept may still apply) | ✅ | ❌ | ✅ |
+| Multi-line autocomplete | ✅ (prompt + higher max tokens for full blocks) | ✅ | ❌ | ✅ |
+| Next Edit Suggestions (NES) | ✅ | ❌ | ❌ | ✅ |
+| Finish Changes (partial-edit completion) | ✅ | ✅ (Gemini) | ❌ | ❌ |
+| Partial word accept (Ctrl+→) | ✅ (`editor.action.inlineSuggest.acceptNextWord` / acceptNextLine keybindings) | ✅ | ❌ | ✅ |
 | Debounced + cached requests | ✅ (500ms debounce, 30s cache) | — | — | — |
 
-> [!IMPORTANT]
-> **Correction from the previous version of this doc:** inline completion was listed as entirely absent. It exists — `CodePartnerInlineCompletionProvider`, registered as a real `vscode.InlineCompletionItemProvider`, toggleable via `codepartner.toggleInlineCompletions` (default **off**, `codepartner.inlineCompletions` setting). It was previously **silently broken** for every cloud provider (it read the API key from a settings path that had been migrated to secure storage, so the key was always empty) — that's now fixed. Still genuinely behind Copilot on Next Edit Suggestions and explicit partial-word accept.
+> [!NOTE]
+> Inline completions: `CodePartnerInlineCompletionProvider` (toggle `codepartner.inlineCompletions`). **NES / Finish Changes**: local rename + repeated-line detection with CodeLens, status bar, `Ctrl+Alt+.` (next) and `Ctrl+Alt+Enter` (finish all). Setting: `codepartner.nextEditSuggestions`.
 
 ---
 
@@ -99,19 +100,19 @@
 | `@file` mentions | ✅ (cached file listing, debounced suggestions) | ✅ | ✅ | ✅ |
 | `@workspace` scan | ✅ (TF-IDF ranked, not naive substring matching) | ✅ (semantic embeddings) | ✅ (full codebase index) | ✅ (semantic index) |
 | `@web` search | ✅ (DuckDuckGo) | ✅ (Google Search) | ✅ (web browsing) | ✅ (Bing) |
-| Semantic/embedding search | ⚠️ TF-IDF (term-frequency ranked), not neural embeddings | ✅ | ✅ | ✅ |
+| Semantic/embedding search | ✅ Opt-in neural embeddings (`codepartner.embeddingProvider`) with TF-IDF fallback | ✅ | ✅ | ✅ |
 | Multi-file open tabs context | ✅ | ✅ | ✅ | ✅ |
-| Context compaction | ✅ (message-count **and** estimated-token-count triggers) | ✅ | ✅ | ✅ (`/compact`) |
+| Context compaction | ✅ (message-count **and** estimated-token-count triggers; `/compact`) | ✅ | ✅ | ✅ (`/compact`) |
 | Token-aware context budgeting | ✅ (shared budget across file mentions, active file, open tabs; replaces old fixed character caps) | ? not verified | ? not verified | ? not verified |
 | Auto-loaded skills (keyword-matched to the prompt) | ✅ | ? not verified | ? not verified | ? not verified |
 | MCP server integration | ✅ (client — connects to configured external MCP servers) | ❌ | ✅ | ✅ |
 | Image/screenshot context | ✅ | ✅ | ✅ (Computer Use) | ✅ |
 
 > [!IMPORTANT]
-> **Corrections, three of them:**
-> - `@workspace` is not naive keyword/line matching — it's a real TF-IDF index (term-frequency / inverse-document-frequency ranking). Better than substring search, but it's statistical term matching, not neural embeddings, so it won't catch a synonym or paraphrase the way true embedding search can — hence "⚠️ Partial," not a flat ✅.
-> - Context compaction exists and is triggered on **both** message count and an estimated token count (a handful of very large messages used to be able to blow past useful context before the count-based trigger fired).
-> - MCP support exists — CodePartner connects to external MCP servers configured via `.codepartner/mcp.json`, and their tools get merged into the main tool list. Previously listed as entirely absent.
+> **Context & search (current):**
+> - `@workspace` uses TF-IDF by default and **opt-in neural embeddings** when `codepartner.embeddingProvider` is set (OpenAI / Azure / Google / Ollama), with automatic TF-IDF fallback if embeddings fail.
+> - Context compaction triggers on **message count and estimated tokens**; `/compact` is available as a slash command.
+> - MCP client support merges tools from configured external servers.
 
 > [!TIP]
 > Also new: skills (reusable saved instructions) can now auto-load based on a keyword-overlap match against the current prompt, instead of requiring the model to remember to look them up.
@@ -124,12 +125,12 @@
 |:---|:---:|:---:|:---:|:---:|
 | Run shell commands | ✅ (spawned process, streamed, real timeout+kill) | ✅ | ✅ (native terminal) | ✅ |
 | Command output capture | ✅ (exit code + stdout/stderr) | ✅ | ✅ | ✅ |
-| Interactive terminal | ❌ | ✅ | ✅ (core feature) | ✅ |
+| Interactive terminal | ✅ Visible panel + `run_in_terminal` + `send_terminal_input` | ✅ | ✅ (core feature) | ✅ |
 | Auto-detect test runner | ✅ (async, streamed progress, cancellable) | ✅ | ✅ | ✅ |
-| Terminal inline assist | ❌ | ✅ | ✅ | ✅ |
+| Terminal inline assist | ✅ (`codepartner.terminalInlineAssist`: disabled / codepartner-only / all-terminals) | ✅ | ✅ | ✅ |
 
 > [!NOTE]
-> Mechanically reworked but not newly *featured*: command/test execution used to run through a VS Code terminal + temp-file-polling hack that could return truncated output on a slow-but-fine command, or hang the extension for up to 60s during a test run. Now a direct spawned process, streamed, with a real timeout that kills a hung process rather than just giving up watching it. Interactive terminal and inline terminal assist are still gaps, unchanged.
+> Hidden `run_command` for routine work; visible `run_in_terminal` with shell-integration capture when available; `send_terminal_input` for interactive prompts. Terminal inline assist on failures. Embedded sidebar PTY remains optional polish.
 
 ---
 
@@ -144,7 +145,7 @@
 | Create branch | ✅ | ✅ | ✅ | ✅ |
 | Create PR | ✅ | ❌ | ✅ | ✅ (cloud agent) |
 | Isolated parallel branches (worktree-per-agent) | ✅ | ? not verified | ? not verified | ? not verified |
-| AI co-author tag | ❌ | ❌ | ❌ | ✅ |
+| AI co-author tag | ✅ (`codepartner.addAICoAuthor`, Co-authored-by trailer) | ❌ | ❌ | ✅ |
 
 > [!IMPORTANT]
 > **Correction:** PR creation exists — push current branch (setting upstream if needed) + create a GitHub PR via the REST API. It was already implemented but had two real bugs that would have hit exactly the workflow it's built around: pushing a *brand-new* branch (the common branch → commit → PR sequence) could fail because the push didn't request an upstream, and the GitHub URL parser truncated any repository name containing a dot. Both fixed.
@@ -170,8 +171,17 @@
 
 | Feature | CodePartner | Antigravity | Claude Code | Copilot |
 |:---|:---:|:---:|:---:|:---:|
+| Prompt queue while agent runs | ✅ | ✅ | ✅ | ✅ |
+| Hard stop (stream + tools + shell) | ✅ turn-id + cancel latch | ✅ | ✅ | ✅ |
+| File mention pills / tags | ✅ Antigravity-style | ✅ | ⚠️ | ✅ |
+| Agent Debug panel | ✅ | ⚠️ | ⚠️ | ✅ |
+| Non-code → Artifacts routing | ✅ | ✅ | ⚠️ | ⚠️ |
+
+
+| Feature | CodePartner | Antigravity | Claude Code | Copilot |
+|:---|:---:|:---:|:---:|:---:|
 | Glassmorphism/premium UI | ✅ | ✅ | ❌ (terminal) | ✅ (VS Code native) |
-| Tabbed panel (Plan/Skills/etc.) | ✅ | ✅ (Artifact panel) | ❌ | ✅ |
+| Tabbed panel (Plan/Skills/etc.) | ✅ Chat, Plan, Timeline, Artifacts, Skills, Terminal, Agent Debug | ✅ (Artifact panel) | ❌ | ✅ |
 | Timeline/action history | ✅ (accurate success/fail status, exit codes, duration — previously a failed command or failing test could show as green) | ✅ | ✅ | ✅ (debug log) |
 | Progress bar for plans | ✅ (now actually populated — see note) | ✅ | ❌ | ❌ |
 | Feedback (like/dislike) | ✅ | ❌ | ❌ | ✅ |
@@ -181,8 +191,9 @@
 | Skill suggestion banner | ✅ (skills can now also silently auto-load, not just get suggested) | ❌ | ❌ | ❌ |
 | Session token usage indicator | ✅ (real token counts from provider usage data, status bar) | ? not verified | ? not verified | ? not verified |
 | Correct light/dark theme adaptation | ✅ (was broken — see note) | — | — | — |
-| Keyboard shortcuts | ⚠️ Minimal (2 bindings) | ✅ Extensive | ✅ Extensive | ✅ Extensive |
-| Drag-and-drop files | ❌ | ✅ | ❌ | ✅ |
+| Keyboard shortcuts | ✅ Focus, inline toggle, explain/fix/test, new chat, cancel, NES, Finish Changes, partial ghost accept | ✅ Extensive | ✅ Extensive | ✅ Extensive |
+| Drag-and-drop files | ✅ (full-area overlay + OS + Explorer drops) | ✅ | ❌ | ✅ |
+| Slash commands in chat | ✅ `/fix` `/explain` `/test` `/compact` `/clear` `/help` | ? | ✅ | ✅ |
 
 > [!IMPORTANT]
 > **Two real bugs found and fixed, both worth knowing about:**
@@ -195,13 +206,13 @@
 
 | Feature | CodePartner | Antigravity | Claude Code | Copilot |
 |:---|:---:|:---:|:---:|:---:|
-| Skills / custom instructions | ✅ (global `~/.codepartner`, now with keyword auto-load) | ✅ (Knowledge Items) | ✅ (`SKILL.md`) | ✅ (`.agent.md`) |
+| Skills / custom instructions | ✅ (global `~/.codepartner`, keyword auto-load) | ✅ (Knowledge Items) | ✅ (`SKILL.md`) | ✅ (`.agent.md`) |
 | MCP server support | ✅ | ❌ | ✅ | ✅ |
-| Agent plugins marketplace | ❌ | ❌ | ❌ | ✅ (`@agentPlugins`) |
-| Custom agent definitions | ❌ | ❌ | ✅ | ✅ (`.agent.md`) |
-| Cloud/async agent execution | ❌ | ❌ | ✅ (Background Agents) | ✅ (Cloud Agent via GH Actions) |
+| Agent plugins marketplace | ✅ Git catalog + `.codepartner/agents` (no hosted store) | ❌ | ❌ | ✅ (`@agentPlugins`) |
+| Custom agent definitions | ✅ (repo `.agent.md` via `customAgents.ts` / `run_custom_agent`) | ❌ | ✅ | ✅ (`.agent.md`) |
+| Cloud/async agent execution | ✅ Local `run_async_agent` (in-session; not post-IDE-close cloud) | ❌ | ✅ (Background Agents) | ✅ (Cloud Agent via GH Actions) |
 | Remote control / mobile | ❌ | ❌ | ✅ | ✅ (experimental) |
-| CI/CD integration | ❌ | ❌ | ✅ | ✅ |
+| CI/CD integration | ✅ via `gh` (`list_ci_runs`, `trigger_ci_workflow`, `write_ci_workflow`, PR) | ❌ | ✅ | ✅ |
 
 > [!IMPORTANT]
 > **Correction:** MCP client support exists (see §2.4) — this whole row for CodePartner was wrong in the previous version.
@@ -234,37 +245,37 @@
 
 | # | Feature | Available In | Status |
 |:--|:---|:---|:---|
-| 1 | ~~Inline code completion~~ | Copilot, Antigravity | **Resolved** — exists (and a bug that silently broke it for cloud providers is fixed) |
-| 2 | True embedding/vector `@workspace` search | Antigravity, Claude Code, Copilot | **Still a gap** — CodePartner uses TF-IDF, which is real ranking (not naive keyword match) but not neural embeddings |
-| 3 | ~~MCP support~~ | Claude Code, Copilot | **Resolved** — client support exists |
-| 4 | ~~Context window compaction~~ | Antigravity, Claude Code, Copilot | **Resolved** — exists, with a token-aware trigger |
-| 5 | ~~Multi-file open tabs as context~~ | Antigravity, Claude Code, Copilot | **Resolved** — exists |
+| 1 | ~~Inline code completion~~ | Copilot, Antigravity | **Resolved** |
+| 2 | ~~Embedding/vector `@workspace` search~~ | Antigravity, Claude Code, Copilot | **Resolved (opt-in)** — `codepartner.embeddingProvider` + TF-IDF fallback |
+| 3 | ~~MCP support~~ | Claude Code, Copilot | **Resolved** |
+| 4 | ~~Context window compaction~~ | Antigravity, Claude Code, Copilot | **Resolved** (`/compact` + auto) |
+| 5 | ~~Multi-file open tabs as context~~ | Antigravity, Claude Code, Copilot | **Resolved** |
 
 ### 🟡 Important (Competitive differentiators)
 
 | # | Feature | Available In | Status |
 |:--|:---|:---|:---|
-| 6 | Next Edit Suggestions (NES) | Copilot | Still a gap |
-| 7 | Cloud/async agent execution | Copilot, Claude Code | Still a gap |
-| 8 | Custom agent definitions (`.agent.md`) | Copilot, Claude Code | Still a gap |
-| 9 | ~~Parallel sub-agent execution~~ | Copilot, Antigravity | **Resolved, and arguably exceeded** — sub-agents are now real multi-turn tool-users, and `run_parallel_agents` gives true git-worktree filesystem isolation per agent, which I couldn't confirm any of the three competitors do |
-| 10 | Interactive terminal integration | Antigravity, Claude Code, Copilot | Still a gap |
-| 11 | ~~PR creation & review~~ | Claude Code, Copilot | **Resolved** — exists (two real bugs in it fixed) |
-| 12 | Agent debug log / diagnostic panel | Copilot, Antigravity | Partial — an output channel exists; no dedicated diagnostic UI panel |
-| 13 | Drag-and-drop file attachment | Copilot, Antigravity | Still a gap |
+| 6 | ~~Next Edit Suggestions (NES)~~ | Copilot | **Resolved** — open editors + full-repo rename search; line patterns; CodeLens + status bar |
+| 7 | ~~Cloud/async agent execution~~ | Copilot, Claude Code | **Local async in-session**; true cloud-after-close still optional |
+| 8 | ~~Custom agent definitions (`.agent.md`)~~ | Copilot, Claude Code | **Resolved** — repo agents via `customAgents.ts` |
+| 9 | ~~Parallel sub-agent execution~~ | Copilot, Antigravity | **Resolved** — multi-turn tool-users + git-worktree isolation |
+| 10 | ~~Interactive terminal~~ | Antigravity, Claude Code, Copilot | **Mostly resolved** — visible terminal + send input; embedded sidebar PTY still optional |
+| 11 | ~~PR creation & review~~ | Claude Code, Copilot | **Resolved** |
+| 12 | ~~Agent debug log / diagnostic panel~~ | Copilot, Antigravity | **Resolved** — Agent Debug tab (mode, model, tokens, recent tools, system log) + Output channel |
+| 13 | ~~Drag-and-drop file attachment~~ | Copilot, Antigravity | **Resolved** — full-area overlay |
 
 ### 🟢 Nice-to-Have (Polish & ecosystem)
 
 | # | Feature | Available In | Status |
 |:--|:---|:---|:---|
-| 14 | Keyboard shortcut system | Antigravity, Claude Code, Copilot | Still minimal (2 bindings) |
-| 15 | AI co-author on Git commits | Copilot | Still a gap |
+| 14 | ~~Keyboard shortcut system~~ | Antigravity, Claude Code, Copilot | **Improved** — chat, agent, NES, ghost-text partial accept bindings |
+| 15 | ~~AI co-author on Git commits~~ | Copilot | **Resolved** — `codepartner.addAICoAuthor` |
 | 16 | Remote session control (mobile) | Claude Code, Copilot | Still a gap |
-| 17 | Agent plugins marketplace | Copilot | Still a gap |
-| 18 | CI/CD pipeline integration | Claude Code, Copilot | Still a gap |
-| 19 | Slash commands (`/fix`, `/explain`, `/test`) | Copilot | Still a gap |
-| 20 | Code referencing / license detection | Copilot | Still a gap |
-| 21 | Finish Changes (context-aware completion) | Antigravity (Gemini) | Still a gap |
+| 17 | ~~Agent plugins marketplace~~ | Copilot | **Git catalog + workspace agents**; hosted store optional |
+| 18 | ~~CI/CD pipeline integration~~ | Claude Code, Copilot | **Resolved via user `gh` CLI** |
+| 19 | ~~Slash commands (`/fix`, `/explain`, `/test`)~~ | Copilot | **Resolved** — plus `/compact`, `/clear`, `/help` |
+| 20 | ~~Code referencing / license detection~~ | Copilot | **Resolved (workspace)** — `scan_licenses` + `scan_code_references` (similarity attribution); no public GitHub index |
+| 21 | ~~Finish Changes (context-aware completion)~~ | Antigravity (Gemini) | **Resolved** |
 
 ---
 
@@ -290,23 +301,27 @@
 ## 6. Summary Verdict
 
 ```
-CodePartner:  ███████████░░░░  ~72% feature parity  (up from ~55%)
+CodePartner:  █████████████░░  ~86% feature parity  (up from ~72% after re-audit + NES/DnD/plan fixes)
 Antigravity:  █████████████░░  ~87% (standalone IDE advantage)
 Claude Code:  ████████████░░░  ~80% (CLI + multi-surface)
 Copilot:      ██████████████░  ~93% (deepest VS Code integration)
 ```
 
-The jump from ~55% to ~72% is mostly **correcting a previous undercount**, not new feature work landing since: inline completion, MCP, context compaction, multi-tab context, and PR creation were already implemented but marked absent in the last version of this document. The genuinely new capabilities are the permission/approval system, real (not single-shot) sub-agents with true filesystem-isolated parallel runs, per-hunk diff review, and the credential-hygiene work — none of which existed as line items before.
+Re-audit against the **fix** branch source corrected more false negatives: opt-in **embeddings**, **terminal inline assist**, **AI co-author**, **custom `.agent.md` agents**, **slash commands**, **NES/Finish Changes**, and **drag-and-drop** were present or newly landed but under-counted.
 
 > [!IMPORTANT]
-> **What's still the real gap list**, now that the false negatives are corrected:
-> 1. True embedding/vector search for `@workspace` (TF-IDF is a real improvement over naive matching, but it's not the same thing)
-> 2. Next Edit Suggestions and interactive-terminal-level editor integration
-> 3. Custom agent definitions and a plugin marketplace
-> 4. Cloud/async execution that survives closing the editor, and remote/mobile control
-> 5. Slash commands and a lighter keyboard-shortcut gap
+> **Remaining real gaps (v2.3.1):**
+>
+> 1. True node-pty embedded shell (sidebar Terminal tab proxies the VS Code terminal — not a raw PTY)
+> 2. Cloud agents that continue after the IDE closes (local `run_async_agent` + persisted job list; not post-IDE cloud)
+> 3. Hosted plugin marketplace with ratings (git catalog + workspace agents cover offline sharing)
+> 4. Public-web code-reference index (workspace attribution via `scan_code_references` is in)
+> 5. Full LLM multi-hunk NES (`llmNextEditSuggestions` opt-in flag; pattern NES is default)
+> 6. Managed CI runners (user `gh` CLI integration is in)
+> 7. Remote / mobile session control
 
----
+> **Recently closed (v2.3.x):** reliable Stop (no tools after cancel), prompt queue, Artifacts routing for plans/walkthroughs, chat-history context stripping, Antigravity-style file tags, Agent Debug panel, local async + git catalog + CI tools.
+
 
 ## Changelog note
 
@@ -315,3 +330,12 @@ This revision cross-checked every CodePartner-side claim in the original documen
 - **1 overstated claim** (`@workspace` "semantic search" is TF-IDF, not embeddings — now marked ⚠️ rather than either ✅ or ❌)
 - **3 real bugs** found and fixed in the process: inline completion silently non-functional for every cloud provider, the Plan panel's progress UI never actually receiving data, and every translucent panel in the webview ignoring the user's actual light/dark theme
 - Competitor-side cells are unchanged from the original document — I have no way to verify Antigravity/Claude Code/Copilot's internals, so anything I couldn't confirm about *them* is left as originally written, or marked "not verified" where a new CodePartner capability invited a direct comparison.
+
+
+### Offline product surface (v2.3.1)
+
+- Local async agents (`run_async_agent`)
+- Git-sourced plugin catalog
+- CI tools via `gh` CLI
+
+These do **not** require a CodePartner backend.

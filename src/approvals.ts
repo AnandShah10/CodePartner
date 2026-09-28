@@ -30,6 +30,8 @@ export const GATED_TOOLS: Record<string, GatedCategory> = {
   create_git_branch: "git-write",
   create_pull_request: "git-write",
   run_parallel_agents: "git-write",
+  write_ci_workflow: "file-write",
+  trigger_ci_workflow: "shell",
 };
 
 /**
