@@ -122,6 +122,8 @@
 
   /** When true, the next setWaiting(false) will not auto-run the prompt queue (used after Stop). */
   let suppressQueueFlushOnce = false;
+  /** After the first auto-run from the queue, further items require confirm. */
+  let queueNeedsConfirm = false;
 
   function setWaiting(waiting) {
     isWaiting = waiting;
@@ -130,7 +132,7 @@
     if (!waiting) {
       if (!statusText.innerText || /thinking|refining|preparing|stopped/i.test(statusText.innerText)) {
         statusText.innerText = promptQueue.length
-          ? `Queued: ${promptQueue.length} message(s) — press Send or wait for auto-run`
+          ? `Queue: ${promptQueue.length} waiting`
           : '';
       }
       if (suppressQueueFlushOnce) {
@@ -138,7 +140,17 @@
         renderQueueBadge();
         return;
       }
-      flushPromptQueue();
+      if (promptQueue.length === 0) {
+        queueNeedsConfirm = false;
+        return;
+      }
+      // First queued message after a turn runs automatically; later ones ask
+      if (!queueNeedsConfirm) {
+        queueNeedsConfirm = true;
+        flushPromptQueue();
+      } else {
+        offerNextQueuedConfirm();
+      }
     }
   }
 
@@ -147,6 +159,10 @@
     if (promptQueue.length === 0) {
       if (badge) {
         badge.remove();
+      }
+      const bar = document.getElementById('queue-confirm-bar');
+      if (bar) {
+        bar.remove();
       }
       return;
     }
@@ -159,50 +175,211 @@
         inputOuter.insertBefore(badge, inputOuter.firstChild);
       }
     }
-    badge.innerHTML = `<span>Queued ${promptQueue.length}</span><button type="button" class="queue-clear" title="Clear queue">×</button>`;
+    const lines = promptQueue
+      .map((item, i) => {
+        const preview = truncateQueuePreview(item.text, i === 0 ? 160 : 80);
+        const label = i === 0 ? 'Next' : `#${i + 1}`;
+        return `<div class="queue-item"><span class="queue-item-label">${label}</span><span class="queue-item-text" title="${escapeHtml(item.text)}">${escapeHtml(preview)}</span></div>`;
+      })
+      .join('');
+    badge.innerHTML =
+      `<div class="queue-badge-header"><span>Queue (${promptQueue.length})</span>` +
+      `<button type="button" class="queue-clear" title="Clear queue">×</button></div>` +
+      `<div class="queue-items">${lines}</div>`;
     badge.querySelector('.queue-clear').onclick = () => {
       promptQueue = [];
+      queueNeedsConfirm = false;
       renderQueueBadge();
+      const bar = document.getElementById('queue-confirm-bar');
+      if (bar) {
+        bar.remove();
+      }
       if (!isWaiting) {
         statusText.innerText = '';
       }
     };
   }
 
+  /** Special @ tokens that are context scopes, not files — never render as file tags. */
+  function isFileOrFolderMention(path) {
+    const p = String(path || '').replace(/\/+$/, '').toLowerCase();
+    if (!p) {
+      return false;
+    }
+    if (p === 'workspace' || p === 'web' || p === 'codebase' || p === 'project') {
+      return false;
+    }
+    return true;
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function truncateQueuePreview(text, max) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    if (t.length <= max) {
+      return t;
+    }
+    return t.slice(0, max - 1) + '…';
+  }
+
+  function runQueuedItem(item) {
+    if (!item || isWaiting) {
+      return;
+    }
+    createMessage('user', item.text);
+    setWaiting(true);
+    currentAssistantMessageId = createMessage('assistant');
+    currentThoughtDiv = null;
+    vscode.postMessage({
+      type: 'prompt',
+      value: item.text,
+      attachments: item.attachments || [],
+    });
+  }
+
   function flushPromptQueue() {
     if (isWaiting || promptQueue.length === 0) {
       return;
     }
+    // First queued item runs automatically; further items need confirm
     const next = promptQueue.shift();
     renderQueueBadge();
     if (!next) {
       return;
     }
-    createMessage('user', next.text);
-    setWaiting(true);
-    currentAssistantMessageId = createMessage('assistant');
-    currentThoughtDiv = null;
-    vscode.postMessage({ type: 'prompt', value: next.text, attachments: next.attachments || [] });
+    if (promptQueue.length === 0) {
+      runQueuedItem(next);
+      return;
+    }
+    // More remain after this one — still run first without extra confirm
+    runQueuedItem(next);
+  }
+
+  /**
+   * After a turn completes, if more than one was originally conceptually
+   * "stacked", ask before running each subsequent item.
+   */
+  function offerNextQueuedConfirm() {
+    if (isWaiting || promptQueue.length === 0) {
+      return;
+    }
+    const next = promptQueue[0];
+    const preview = truncateQueuePreview(next.text, 120);
+    const remaining = promptQueue.length;
+    let bar = document.getElementById('queue-confirm-bar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'queue-confirm-bar';
+      bar.className = 'queue-confirm-bar';
+      const inputOuter = document.getElementById('input-outer');
+      if (inputOuter) {
+        inputOuter.insertBefore(bar, inputOuter.firstChild);
+      }
+    }
+    bar.innerHTML =
+      `<div class="queue-confirm-text"><strong>Send next queued?</strong> ` +
+      `<span class="queue-confirm-preview">“${escapeHtml(preview)}”</span>` +
+      (remaining > 1 ? ` <span class="queue-confirm-more">(+${remaining - 1} more)</span>` : '') +
+      `</div>` +
+      `<div class="queue-confirm-actions">` +
+      `<button type="button" class="queue-confirm-yes">Send</button>` +
+      `<button type="button" class="queue-confirm-skip">Skip</button>` +
+      `<button type="button" class="queue-confirm-clear">Clear all</button>` +
+      `</div>`;
+    bar.querySelector('.queue-confirm-yes').onclick = () => {
+      bar.remove();
+      const item = promptQueue.shift();
+      renderQueueBadge();
+      runQueuedItem(item);
+    };
+    bar.querySelector('.queue-confirm-skip').onclick = () => {
+      promptQueue.shift();
+      renderQueueBadge();
+      if (promptQueue.length === 0) {
+        bar.remove();
+      } else {
+        offerNextQueuedConfirm();
+      }
+    };
+    bar.querySelector('.queue-confirm-clear').onclick = () => {
+      promptQueue = [];
+      queueNeedsConfirm = false;
+      renderQueueBadge();
+      bar.remove();
+      statusText.innerText = '';
+    };
+  }
+
+  /** True only for paths that look like real files/folders (avoid tagging @word). */
+  function looksLikeFilePath(filePath) {
+    if (!isFileOrFolderMention(filePath)) {
+      return false;
+    }
+    const p = String(filePath).replace(/\\/g, '/');
+    if (p.includes('/')) {
+      return true;
+    }
+    // basename with extension, e.g. main.ts, README.md
+    if (/\.[a-zA-Z0-9]{1,8}$/.test(p)) {
+      return true;
+    }
+    return false;
   }
 
   function formatMentions(html) {
     if (!html) return html;
 
-    // Antigravity-style file tags: compact pill with icon + basename
-    let formatted = html.replace(/(^|\s|>|&nbsp;)@([a-zA-Z0-9_\-\.\/]+)/g, (match, prefix, filePath) => {
-      const parts = filePath.split('/');
-      const basename = parts[parts.length - 1] || filePath;
-      const isFolder = filePath.endsWith('/') || (!basename.includes('.') && parts.length > 0);
-      const icon = isFolder ? '📁' : '📄';
-      const title = filePath;
-      return `${prefix}<span class="file-tag" title="${title.replace(/"/g, '&quot;')}"><span class="file-tag-icon">${icon}</span><span class="file-tag-name">${basename.replace(/\/$/, '')}</span></span>`;
-    });
+    // Do not tag inside code/pre blocks (markdown output)
+    const parts = String(html).split(/(<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>)/gi);
+    for (let i = 0; i < parts.length; i++) {
+      if (/^<(pre|code)/i.test(parts[i])) {
+        continue;
+      }
+      parts[i] = parts[i].replace(/(^|[^a-zA-Z0-9_])@([a-zA-Z0-9_\-\.\/\\]+)/g, (match, prefix, filePath) => {
+        if (!looksLikeFilePath(filePath)) {
+          return match;
+        }
+        const normalized = filePath.replace(/\\/g, '/');
+        const partsPath = normalized.split('/');
+        const basename = partsPath[partsPath.length - 1] || normalized;
+        const isFolder = normalized.endsWith('/');
+        const icon = isFolder ? '📁' : '📄';
+        const safePath = normalized.replace(/"/g, '&quot;');
+        const safeName = basename.replace(/\/$/, '').replace(/</g, '&lt;');
+        return `${prefix}<span class="file-tag file-tag-clickable" data-path="${safePath}" title="Open ${safePath}" role="button" tabindex="0"><span class="file-tag-icon">${icon}</span><span class="file-tag-name">${safeName}</span></span>`;
+      });
+    }
+    return parts.join('');
+  }
 
-    formatted = formatted.replace(/(^|\s|>|&nbsp;)\/([a-zA-Z0-9_\-\.]+)/g, (match, prefix, skillName) => {
-      return `${prefix}<span class="file-tag slash-tag" title="/${skillName}"><span class="file-tag-icon">⚡</span><span class="file-tag-name">/${skillName}</span></span>`;
-    });
+  function openMentionPath(pathAttr) {
+    if (!pathAttr || !isFileOrFolderMention(pathAttr)) {
+      return;
+    }
+    const p = pathAttr.replace(/\\/g, '/');
+    // Absolute paths → openAbsoluteFile; otherwise relative workspace path
+    if (p.match(/^[a-zA-Z]:\//) || p.startsWith('/')) {
+      vscode.postMessage({ type: 'openAbsoluteFile', value: p });
+    } else {
+      vscode.postMessage({ type: 'openFile', value: p });
+    }
+  }
 
-    return formatted;
+  // Click file tags in chat history (and future dynamic content)
+  if (chatHistory) {
+    chatHistory.addEventListener('click', (e) => {
+      const tag = e.target.closest && e.target.closest('.file-tag-clickable');
+      if (tag) {
+        e.preventDefault();
+        openMentionPath(tag.getAttribute('data-path'));
+      }
+    });
   }
 
   function createMessage(role, content = '') {
@@ -263,25 +440,29 @@
 
     const feedbackRow = document.createElement('div');
     feedbackRow.className = 'feedback-row';
-    feedbackRow.style.display = 'flex';
-    feedbackRow.style.flexDirection = 'column';
-    feedbackRow.style.gap = '4px';
-    feedbackRow.style.marginTop = '8px';
+
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'feedback-toggle';
+    toggle.title = 'Rate this response';
+    toggle.textContent = 'Feedback ▸';
+    toggle.setAttribute('aria-expanded', 'false');
+
+    const panel = document.createElement('div');
+    panel.className = 'feedback-panel collapsed';
 
     const buttons = document.createElement('div');
-    buttons.style.display = 'flex';
-    buttons.style.gap = '8px';
-    buttons.style.opacity = '0.6';
+    buttons.className = 'feedback-buttons';
 
     const feedbackInputContainer = document.createElement('div');
-    feedbackInputContainer.className = 'hidden';
-    feedbackInputContainer.style.marginTop = '4px';
+    feedbackInputContainer.className = 'feedback-input-wrap hidden';
 
     const likeBtn = document.createElement('button');
     likeBtn.className = 'icon-btn';
     likeBtn.title = 'Helpful';
     likeBtn.innerHTML = ICONS.LIKE;
-    likeBtn.onclick = () => {
+    likeBtn.onclick = (e) => {
+      e.stopPropagation();
       vscode.postMessage({ type: 'feedback', value: 'positive', content: content });
       feedbackRow.remove();
     };
@@ -290,10 +471,10 @@
     dislikeBtn.className = 'icon-btn';
     dislikeBtn.title = 'Not helpful';
     dislikeBtn.innerHTML = ICONS.DISLIKE;
-    dislikeBtn.onclick = () => {
+    dislikeBtn.onclick = (e) => {
+      e.stopPropagation();
       dislikeBtn.style.color = 'var(--vscode-charts-red)';
       dislikeBtn.style.opacity = '1';
-      likeBtn.style.color = 'inherit';
       likeBtn.style.opacity = '0.6';
       feedbackInputContainer.classList.remove('hidden');
       feedbackInput.focus();
@@ -301,22 +482,36 @@
 
     const feedbackInput = document.createElement('input');
     feedbackInput.placeholder = 'What was wrong? (optional)';
-    feedbackInput.className = 'skill-form-input';
-    feedbackInput.style.height = '24px';
-    feedbackInput.style.fontSize = '10px';
+    feedbackInput.className = 'skill-form-input feedback-detail-input';
     feedbackInput.onkeydown = (e) => {
       if (e.key === 'Enter') {
         vscode.postMessage({ type: 'feedback', value: 'negative', detail: feedbackInput.value, content: content });
-        feedbackInputContainer.innerHTML = '<span style="font-size:10px; opacity:0.6;">Thanks for the feedback!</span>';
+        feedbackInputContainer.innerHTML = '<span class="feedback-thanks">Thanks for the feedback!</span>';
         setTimeout(() => feedbackRow.remove(), 2000);
+      }
+    };
+
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      const collapsed = panel.classList.contains('collapsed');
+      if (collapsed) {
+        panel.classList.remove('collapsed');
+        toggle.setAttribute('aria-expanded', 'true');
+        toggle.textContent = 'Feedback ▾';
+      } else {
+        panel.classList.add('collapsed');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.textContent = 'Feedback ▸';
       }
     };
 
     feedbackInputContainer.appendChild(feedbackInput);
     buttons.append(likeBtn, dislikeBtn);
-    feedbackRow.append(buttons, feedbackInputContainer);
-    container.parentElement.appendChild(feedbackRow);
-    scrollBottom();
+    panel.append(buttons, feedbackInputContainer);
+    feedbackRow.append(toggle, panel);
+    // Append inside the message card so layout doesn't overflow the sidebar
+    const host = container.closest('.message') || container.parentElement || container;
+    host.appendChild(feedbackRow);
   }
 
   function createThoughtBlock(container) {
@@ -659,6 +854,47 @@
   }
 
   // UI Event Listeners
+  // Navbar overflow menu (narrow sidebars collapse History / Feedback / New chat into ⋯)
+  (function wireHeaderMoreMenu() {
+    const moreBtn = document.getElementById('header-more-btn');
+    const moreMenu = document.getElementById('header-more-menu');
+    if (!moreBtn || !moreMenu) {
+      return;
+    }
+    const closeMenu = () => {
+      moreMenu.classList.add('hidden');
+      moreBtn.setAttribute('aria-expanded', 'false');
+    };
+    moreBtn.onclick = (e) => {
+      e.stopPropagation();
+      const open = moreMenu.classList.toggle('hidden') === false;
+      moreBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    moreMenu.addEventListener('click', (e) => {
+      const item = e.target.closest('.header-more-item');
+      if (!item) {
+        return;
+      }
+      const action = item.getAttribute('data-action');
+      closeMenu();
+      if (action === 'history' && historyBtn) {
+        historyBtn.click();
+      } else if (action === 'feedback') {
+        const fb = document.getElementById('feedback-btn');
+        if (fb) {
+          fb.click();
+        }
+      } else if (action === 'new-chat' && newChatBtn) {
+        newChatBtn.click();
+      }
+    });
+    document.addEventListener('click', (e) => {
+      if (!moreMenu.classList.contains('hidden') && !moreMenu.contains(e.target) && e.target !== moreBtn) {
+        closeMenu();
+      }
+    });
+  })();
+
   historyBtn.onclick = () => {
     vscode.postMessage({ type: 'listChats' });
     historyPanel.classList.remove('hidden');
@@ -896,32 +1132,116 @@
 
   function formatMentionsForOverlay(text) {
     if (!text) return '';
+    // Visual highlight only — clicks go to the mention-chips bar (textarea sits on top of overlay)
     const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    let formatted = escaped.replace(/(^|\s)@([a-zA-Z0-9_\-\.\/]+)/g, (match, prefix, path) => {
-      const parts = path.split('/');
-      let displayHtml = '';
-      if (parts.length === 1) {
-        displayHtml = `@<b>${path}</b>`;
-      } else {
-        const basename = parts.pop();
-        if (basename === '') {
-          const lastDir = parts.pop();
-          const preDir = parts.length > 0 ? parts.join('/') + '/' : '';
-          displayHtml = `@${preDir}<b>${lastDir}/</b>`;
-        } else {
-          const dir = parts.length > 0 ? parts.join('/') + '/' : '';
-          displayHtml = `@${dir}<b>${basename}</b>`;
-        }
+    let formatted = escaped.replace(/(^|\s)@([a-zA-Z0-9_\-\.\/\\]+)/g, (match, prefix, filePath) => {
+      if (!looksLikeFilePath(filePath)) {
+        return match;
       }
-      return `${prefix}<span style="color: var(--vscode-textLink-foreground); font-weight: 600; background: rgba(var(--vscode-textLink-foreground-rgb, 0,120,212), 0.15); padding: 0 4px; border-radius: 3px;">${displayHtml}</span>`;
+      const normalized = filePath.replace(/\\/g, '/');
+      const parts = normalized.split('/');
+      const basename = parts[parts.length - 1] || normalized;
+      const isFolder = normalized.endsWith('/');
+      const icon = isFolder ? '📁' : '📄';
+      const safeName = basename.replace(/\/$/, '');
+      return `${prefix}<span class="file-tag"><span class="file-tag-icon">${icon}</span><span class="file-tag-name">${safeName}</span></span>`;
     });
-
-    formatted = formatted.replace(/(^|\s)\/([a-zA-Z0-9_\-\.]+)/g, (match, prefix, skillName) => {
-      return `${prefix}<span style="color: var(--vscode-charts-purple); font-weight: 600; background: rgba(var(--vscode-charts-purple-rgb, 128,0,128), 0.15); padding: 0 4px; border-radius: 3px;">/<b>${skillName}</b></span>`;
-    });
-    
     if (formatted.endsWith('\n')) formatted += '<br>';
     return formatted;
+  }
+
+  function extractFileMentions(text) {
+    const found = [];
+    const re = /(^|[\s])@([a-zA-Z0-9_\-\.\/\\]+)/g;
+    let m;
+    while ((m = re.exec(String(text || ''))) !== null) {
+      if (looksLikeFilePath(m[2])) {
+        const n = m[2].replace(/\\/g, '/');
+        if (!found.includes(n)) {
+          found.push(n);
+        }
+      }
+    }
+    return found;
+  }
+
+  /** Remove @path from the prompt input (first match). */
+  function removeMentionFromInput(filePath) {
+    if (!promptInput || !filePath) {
+      return;
+    }
+    const escaped = filePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp('(^|[\\s])@' + escaped + '(?=[\\s]|$)');
+    let next = promptInput.value.replace(re, (full, pre) => pre || '');
+    // Also try with backslashes
+    if (next === promptInput.value && filePath.includes('/')) {
+      const alt = filePath.replace(/\//g, '\\\\');
+      const re2 = new RegExp('(^|[\\s])@' + alt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?=[\\s]|$)');
+      next = promptInput.value.replace(re2, (full, pre) => pre || '');
+    }
+    next = next.replace(/[ \t]{2,}/g, ' ').replace(/^\s+/, '');
+    promptInput.value = next;
+    promptInput.focus();
+    syncOverlay();
+    renderMentionChips();
+  }
+
+  /**
+   * Interactive mention chips ABOVE the textarea (textarea covers the overlay,
+   * so overlay tags cannot receive clicks — this is the Copilot-style bar).
+   */
+  function renderMentionChips() {
+    const inputOuter = document.getElementById('input-outer');
+    const inputContainer = document.getElementById('input-container');
+    if (!inputOuter || !inputContainer || !promptInput) {
+      return;
+    }
+    let bar = document.getElementById('mention-chips');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'mention-chips';
+      bar.className = 'mention-chips';
+      inputOuter.insertBefore(bar, inputContainer);
+      bar.addEventListener('click', (e) => {
+        const removeBtn = e.target.closest('.file-tag-remove');
+        if (removeBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          const path = removeBtn.getAttribute('data-path') || removeBtn.closest('.file-tag')?.getAttribute('data-path');
+          removeMentionFromInput(path);
+          return;
+        }
+        const tag = e.target.closest('.file-tag-clickable');
+        if (tag) {
+          e.preventDefault();
+          openMentionPath(tag.getAttribute('data-path'));
+        }
+      });
+    }
+    const mentions = extractFileMentions(promptInput.value);
+    if (mentions.length === 0) {
+      bar.classList.add('hidden');
+      bar.innerHTML = '';
+      return;
+    }
+    bar.classList.remove('hidden');
+    bar.innerHTML = mentions
+      .map((filePath) => {
+        const parts = filePath.split('/');
+        const basename = parts[parts.length - 1] || filePath;
+        const isFolder = filePath.endsWith('/');
+        const icon = isFolder ? '📁' : '📄';
+        const safePath = filePath.replace(/"/g, '&quot;');
+        const safeName = basename.replace(/\/$/, '');
+        return (
+          `<span class="file-tag file-tag-clickable file-tag-removable" data-path="${safePath}" title="${safePath}">` +
+          `<span class="file-tag-icon">${icon}</span>` +
+          `<span class="file-tag-name">${safeName}</span>` +
+          `<button type="button" class="file-tag-remove" data-path="${safePath}" title="Remove mention" aria-label="Remove">×</button>` +
+          `</span>`
+        );
+      })
+      .join('');
   }
 
   function syncOverlay() {
@@ -929,6 +1249,7 @@
     promptOverlay.innerHTML = formatMentionsForOverlay(promptInput.value || '');
     promptOverlay.style.height = promptInput.style.height || '44px';
     promptOverlay.scrollTop = promptInput.scrollTop;
+    renderMentionChips();
   }
 
   // Phase 3.7: debounce @/-mention suggestion requests instead of firing
@@ -1070,16 +1391,38 @@
     });
   }
 
+  let dropShiftHeld = false;
+
   function ensureDropOverlay() {
     if (!dropZone) return null;
     let overlay = document.getElementById('drop-overlay');
     if (!overlay) {
       overlay = document.createElement('div');
       overlay.id = 'drop-overlay';
-      overlay.innerHTML = '<div class="drop-overlay-content"><span>Drop files to attach</span></div>';
+      overlay.innerHTML =
+        '<div class="drop-overlay-content">' +
+        '<span class="drop-title">Drop files to attach</span>' +
+        '<span class="drop-hint">Hold <kbd>Shift</kbd> while dragging, then release to drop</span>' +
+        '</div>';
       dropZone.appendChild(overlay);
     }
     return overlay;
+  }
+
+  function updateDropOverlayMessage(shiftHeld) {
+    const overlay = ensureDropOverlay();
+    if (!overlay) return;
+    const title = overlay.querySelector('.drop-title');
+    const hint = overlay.querySelector('.drop-hint');
+    if (shiftHeld) {
+      if (title) title.textContent = 'Release to attach';
+      if (hint) hint.innerHTML = 'Shift held — drop files now';
+      overlay.classList.add('drop-ready');
+    } else {
+      if (title) title.textContent = 'Hold Shift to enable drop';
+      if (hint) hint.innerHTML = 'VS Code requires <kbd>Shift</kbd> for drops into the chat';
+      overlay.classList.remove('drop-ready');
+    }
   }
 
   function showDropOverlay(show) {
@@ -1087,6 +1430,17 @@
     if (overlay) overlay.classList.toggle('visible', show);
     if (dropZone) dropZone.classList.toggle('drag-over', show);
   }
+
+  // Static tip under the input so users discover Shift without dragging first
+  (function ensureDropHintChip() {
+    const inputOuter = document.getElementById('input-outer');
+    if (!inputOuter || document.getElementById('drop-hint-chip')) return;
+    const chip = document.createElement('div');
+    chip.id = 'drop-hint-chip';
+    chip.className = 'drop-hint-chip';
+    chip.innerHTML = 'Tip: hold <kbd>Shift</kbd> and drop files here to attach';
+    inputOuter.appendChild(chip);
+  })();
 
   if (dropZone) {
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach((evt) => {
@@ -1098,11 +1452,17 @@
     dropZone.addEventListener('dragenter', (e) => {
       dragDepth++;
       if (e.dataTransfer && (e.dataTransfer.types.includes('Files') || e.dataTransfer.types.includes('text/uri-list'))) {
+        dropShiftHeld = !!e.shiftKey;
         showDropOverlay(true);
+        updateDropOverlayMessage(dropShiftHeld);
       }
     });
     dropZone.addEventListener('dragover', (e) => {
-      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      dropShiftHeld = !!e.shiftKey;
+      updateDropOverlayMessage(dropShiftHeld);
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = dropShiftHeld ? 'copy' : 'none';
+      }
     });
     dropZone.addEventListener('dragleave', () => {
       dragDepth = Math.max(0, dragDepth - 1);
@@ -1111,9 +1471,16 @@
     dropZone.addEventListener('drop', async (e) => {
       dragDepth = 0;
       showDropOverlay(false);
+      const shiftOk = !!(e.shiftKey || dropShiftHeld);
+      dropShiftHeld = false;
 
       const dt = e.dataTransfer;
       if (!dt) { return; }
+
+      if (!shiftOk) {
+        statusText.innerText = 'Hold Shift while dropping to attach files';
+        return;
+      }
 
       if (dt.files && dt.files.length > 0) {
         const results = await Promise.all(Array.from(dt.files).map(readFileAsAttachment));
@@ -1121,6 +1488,7 @@
         if (valid.length > 0) {
           attachedFiles.push(...valid);
           renderAttachmentChips();
+          statusText.innerText = `Attached ${valid.length} file(s)`;
         }
         return;
       }
@@ -1134,6 +1502,8 @@
       }
     });
   }
+
+  // Mention interactions live on #mention-chips (textarea covers #prompt-overlay)
 
   // Handle Send/Stop click
   sendBtn.addEventListener('click', () => {
@@ -1174,7 +1544,11 @@
       attachedFiles = [];
       renderAttachmentChips();
       renderQueueBadge();
-      statusText.innerText = `Queued ${promptQueue.length} — runs after current turn`;
+      const preview = truncateQueuePreview(text, 80);
+      statusText.innerText =
+        promptQueue.length === 1
+          ? `Queued: “${preview}”`
+          : `Queued ${promptQueue.length}: “${truncateQueuePreview(promptQueue[0].text, 60)}” +${promptQueue.length - 1} more`;
       return;
     }
 
@@ -1470,14 +1844,6 @@
         terminalLog.innerHTML = '<div class="empty-state">Cleared.</div>';
       }
     };
-  }
-
-  function escapeHtml(str) {
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
   }
 
   function renderArchitectDrafts(drafts) {

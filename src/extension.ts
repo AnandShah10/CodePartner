@@ -4935,8 +4935,10 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
 
   private getHtmlForWebview() {
     const webview = this._view!.webview;
-    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "main.js"));
-    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "main.css"));
+    // Cache-bust so media/main.js|css updates apply after F5 without stale webview cache
+    const bust = `v=${Date.now()}`;
+    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "main.js")).with({ query: bust });
+    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", "main.css")).with({ query: bust });
 
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -4959,15 +4961,25 @@ ${messagesToSummarize.map(m => `${m.role.toUpperCase()}: ${typeof m.content === 
         </select>
       </div>
       <div id="header-actions">
-        <button id="history-btn" class="icon-btn" title="Saved Chats">
+        <button id="history-btn" class="icon-btn header-action-btn" title="Saved Chats" aria-label="Saved Chats">
           <svg viewBox="0 0 16 16"><path d="M14.5 13.5V12a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v1.5a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5zM2 3V2a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1h1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3h1zm11 0V2H3v1h10zM2 12h12V4H2v8z"/></svg>
         </button>
-        <button id="feedback-btn" class="icon-btn" title="Send Feedback / Report Bug">
+        <button id="feedback-btn" class="icon-btn header-action-btn" title="Send Feedback / Report Bug" aria-label="Feedback">
           <svg viewBox="0 0 16 16"><path d="M1 2a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H5l-3 3V2z"/></svg>
         </button>
-        <button id="new-chat-btn" class="icon-btn" title="New Chat">
+        <button id="new-chat-btn" class="icon-btn header-action-btn" title="New Chat" aria-label="New Chat">
           <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm3 8H9v2H7V9H5V7h2V5h2v2h2v2z"/></svg>
         </button>
+        <div class="header-more-wrap">
+          <button id="header-more-btn" class="icon-btn" title="More" aria-label="More actions" aria-expanded="false" aria-haspopup="true">
+            <svg viewBox="0 0 16 16"><path d="M3 8a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>
+          </button>
+          <div id="header-more-menu" class="header-more-menu hidden" role="menu">
+            <button type="button" class="header-more-item" data-action="history" role="menuitem">Saved chats</button>
+            <button type="button" class="header-more-item" data-action="feedback" role="menuitem">Feedback</button>
+            <button type="button" class="header-more-item" data-action="new-chat" role="menuitem">New chat</button>
+          </div>
+        </div>
       </div>
     </div>
 
