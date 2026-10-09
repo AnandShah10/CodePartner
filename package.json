@@ -3,7 +3,7 @@
   "displayName": "CodePartner AI",
   "description": "A powerful agentic AI co-pilot with inline completions, planning, skills, browser control, and MCP support.",
   "publisher": "AnandShah",
-  "version": "2.3.1",
+  "version": "2.8.1",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
@@ -80,6 +80,18 @@
       {
         "command": "codepartner.syncPluginCatalog",
         "title": "CodePartner: Sync Plugin Catalog"
+      },
+      {
+        "command": "codepartner.acceptPatchSet",
+        "title": "CodePartner: Accept Patch Set (keep agent changes)"
+      },
+      {
+        "command": "codepartner.rejectPatchSet",
+        "title": "CodePartner: Reject Patch Set (rollback all files)"
+      },
+      {
+        "command": "codepartner.reviewPatchSet",
+        "title": "CodePartner: Review Patch Set (3-way merge)"
       }
     ],
     "keybindings": [
@@ -194,7 +206,12 @@
           "type": "string",
           "default": "",
           "description": "Deprecated: no longer used. API keys are stored securely via the \"CodePartner: Set API Key\" command instead of settings.json. Any value found here is migrated automatically and then cleared.",
-          "deprecationMessage": "Deprecated — use the \"CodePartner: Set API Key\" command. Keys are no longer read from or stored in settings."
+          "deprecationMessage": "Deprecated \u2014 use the \"CodePartner: Set API Key\" command. Keys are no longer read from or stored in settings."
+        },
+        "codepartner.completionModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional faster/cheaper model for inline completions only. Empty = use codepartner.model (same as chat/agent)."
         },
         "codepartner.model": {
           "type": "string",
@@ -261,7 +278,11 @@
         },
         "codepartner.terminalInlineAssist": {
           "type": "string",
-          "enum": ["disabled", "codepartner-only", "all-terminals"],
+          "enum": [
+            "disabled",
+            "codepartner-only",
+            "all-terminals"
+          ],
           "enumDescriptions": [
             "No terminal monitoring — the default.",
             "Offer help only when a command fails in CodePartner's own visible terminal (started via run_in_terminal).",
@@ -293,7 +314,7 @@
         },
         "codepartner.inlineCompletionDebounce": {
           "type": "number",
-          "default": 500,
+          "default": 200,
           "minimum": 200,
           "maximum": 3000,
           "description": "Debounce delay (ms) before triggering inline completion requests."
@@ -354,6 +375,52 @@
               "command"
             ]
           }
+        },
+        "codepartner.sandboxMode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "soft",
+            "strict"
+          ],
+          "default": "soft",
+          "description": "Local agent sandbox: off (none), soft (command safety + filtered env), strict (also block network/install shell patterns; use bubblewrap on Linux when installed)."
+        },
+        "codepartner.autoVerify": {
+          "type": "string",
+          "enum": [
+            "off",
+            "focused",
+            "full"
+          ],
+          "default": "focused",
+          "description": "After an agent turn that edits files, automatically run tests: off, focused (related test files), or full suite. Does not require the model to call run_tests."
+        },
+        "codepartner.autoVerifyMaxAttempts": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 3,
+          "description": "How many times auto-verify will re-run the same test command on failure (no model in the loop)."
+        },
+        "codepartner.reviewPacks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "security",
+              "react",
+              "node",
+              "quality"
+            ]
+          },
+          "default": [
+            "security",
+            "quality",
+            "react",
+            "node"
+          ],
+          "description": "Static review policy packs applied after agent edit_file/create_file."
         }
       }
     }
@@ -370,7 +437,9 @@
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "lint:fix": "eslint src --fix",
+    "fix": "npm run lint:fix && npm run check-types"
   },
   "devDependencies": {
     "@types/markdown-it": "^14.1.2",

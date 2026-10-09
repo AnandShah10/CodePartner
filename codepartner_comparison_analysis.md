@@ -1,5 +1,7 @@
 # CodePartner vs. Competitors (Antigravity, Claude Code, GitHub Copilot)
 
+> **Update (2026-09-28, v2.4.0+):** Roadmap execution on `fix` addressed several audit items: capability-based approvals (MCP + terminal input), path containment, secret redaction, tool scheduler, patch-aware timeline revert, symbol/import context + ranker (incl. recent git), test-failure parsing, multi-root preferred folder, Chat|Plan|Activity IA, `completionModel` routing, and queued async resume. Remaining gaps vs commercial agents: execution sandbox, durable remote agents, specialized completion models, full computer-use, enterprise governance.
+
 **Updated against the current codebase** (following a security/reliability/feature pass — see changelog note at the end). Competitor columns are **unchanged from the original document** — this update only re-verified CodePartner's own claims against its source, and corrects several that were wrong. Where I couldn't verify a competitor claim, I left it as-is rather than guess.
 
 ---

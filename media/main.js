@@ -419,8 +419,14 @@
         text = text.split('User Question:').pop().trim();
       }
       contentDiv.innerHTML = formatMentions(md.render(text));
+    } else if (role === 'assistant' && !content) {
+      // Separate slots: thinking block (optional) + answer body
+      const answer = document.createElement('div');
+      answer.className = 'message-answer';
+      answer.innerHTML = '<div class="spinner"></div>';
+      contentDiv.appendChild(answer);
     } else {
-      contentDiv.innerHTML = content || (role === 'assistant' ? '<div class="spinner"></div>' : '');
+      contentDiv.innerHTML = content || '';
     }
 
     messageDiv.appendChild(header);
@@ -517,10 +523,11 @@
   function createThoughtBlock(container) {
     const thoughtContainer = document.createElement('div');
     thoughtContainer.className = 'thought-container';
+    thoughtContainer.dataset.thinking = '1';
 
     const header = document.createElement('div');
     header.className = 'thought-header';
-    header.innerHTML = `${ICONS.THOUGHT} <span>Thinking...</span> <span class="collapse-icon">▼</span>`;
+    header.innerHTML = `${ICONS.THOUGHT} <span class="thought-label">Thinking</span> <span class="collapse-icon">▼</span>`;
     header.onclick = () => {
       header.classList.toggle('collapsed');
       content.classList.toggle('collapsed');
@@ -531,8 +538,28 @@
 
     thoughtContainer.appendChild(header);
     thoughtContainer.appendChild(content);
-    container.appendChild(thoughtContainer);
+    // Keep thinking above the answer body
+    const answer = container.querySelector('.message-answer');
+    if (answer) {
+      container.insertBefore(thoughtContainer, answer);
+    } else {
+      container.insertBefore(thoughtContainer, container.firstChild);
+    }
     return content;
+  }
+
+  function markThoughtComplete(container) {
+    if (!container) return;
+    const label = container.querySelector('.thought-label');
+    if (label) label.textContent = 'Thought';
+    const tc = container.closest ? container.closest('.thought-container') : null;
+    const root = container.classList?.contains('thought-content')
+      ? container.parentElement
+      : container.querySelector?.('.thought-container');
+    const header = (root || container).querySelector?.('.thought-header');
+    if (header && !header.classList.contains('collapsed')) {
+      // leave expanded so user can read; label already says Thought
+    }
   }
 
   function renderModifiedFiles(files, container) {
@@ -984,14 +1011,39 @@
     promptInput.selectionStart = promptInput.selectionEnd = pos + tag.length;
   }
 
-  // --- Tab Management ---
-  tabBtns.forEach(btn => {
+  // --- Tab Management (Chat | Plan | Activity) ---
+  function showMainTab(targetTab) {
+    tabBtns.forEach((b) => b.classList.toggle('active', b.getAttribute('data-tab') === targetTab));
+    tabContents.forEach((c) => c.classList.toggle('active', c.id === `tab-${targetTab}`));
+  }
+  tabBtns.forEach((btn) => {
     btn.onclick = () => {
       const targetTab = btn.getAttribute('data-tab');
-      tabBtns.forEach(b => b.classList.toggle('active', b === btn));
-      tabContents.forEach(c => c.classList.toggle('active', c.id === `tab-${targetTab}`));
+      showMainTab(targetTab);
     };
   });
+
+  // Activity sub-navigation (Timeline / Artifacts / Terminal / Skills / Debug)
+  function showActivityPanel(name) {
+    document.querySelectorAll('.activity-sub-btn').forEach((b) => {
+      b.classList.toggle('active', b.getAttribute('data-activity') === name);
+    });
+    document.querySelectorAll('.activity-panel').forEach((p) => {
+      p.classList.toggle('active', p.id === `tab-${name}`);
+    });
+  }
+  document.querySelectorAll('.activity-sub-btn').forEach((btn) => {
+    btn.onclick = () => {
+      showMainTab('activity');
+      showActivityPanel(btn.getAttribute('data-activity'));
+    };
+  });
+
+  /** Open Activity → specific panel (used when plan/timeline/artifacts update). */
+  window.openActivityPanel = function openActivityPanel(name) {
+    showMainTab('activity');
+    showActivityPanel(name || 'timeline');
+  };
 
   function renderPlan(tasks) {
     if (!planList) return;
@@ -1638,6 +1690,28 @@
   // Main Message Listener
   window.addEventListener('message', ({ data: msg }) => {
     switch (msg.type) {
+      case 'autoVerifyReport': {
+        const text = (msg.value && msg.value.content) || msg.value || '';
+        if (typeof appendAssistantMessage === 'function') {
+          appendAssistantMessage(text);
+        } else if (typeof addMessageToUI === 'function') {
+          addMessageToUI('assistant', text);
+        } else {
+          // Fallback: show in status + diagnostics-like bubble
+          const chat = document.getElementById('chat-container') || document.getElementById('messages');
+          if (chat) {
+            const div = document.createElement('div');
+            div.className = 'message assistant';
+            div.innerHTML = '<div class="message-content"></div>';
+            const body = div.querySelector('.message-content');
+            if (body) body.textContent = typeof text === 'string' ? text : JSON.stringify(text);
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight;
+          }
+        }
+        break;
+      }
+
       case 'status':
         statusText.innerText = msg.value;
         break;
@@ -1648,14 +1722,22 @@
             currentThoughtDiv = createThoughtBlock(currentAssistantMessageId);
           }
           currentThoughtDiv.innerHTML = msg.value;
+          const label = currentAssistantMessageId.querySelector('.thought-label');
+          if (label) label.textContent = 'Thinking';
           scrollBottom();
         }
         break;
 
       case 'partial':
         if (currentAssistantMessageId) {
-          currentAssistantMessageId.innerHTML = formatMentions(msg.value);
-          processCodeBlocks(currentAssistantMessageId, true);
+          let answer = currentAssistantMessageId.querySelector('.message-answer');
+          if (!answer) {
+            answer = document.createElement('div');
+            answer.className = 'message-answer';
+            currentAssistantMessageId.appendChild(answer);
+          }
+          answer.innerHTML = formatMentions(msg.value);
+          processCodeBlocks(answer, true);
           scrollBottom();
         }
         break;
@@ -1678,6 +1760,10 @@
         break;
 
       case 'done':
+        if (currentThoughtDiv) {
+          markThoughtComplete(currentThoughtDiv);
+        }
+
         setWaiting(false);
         if (currentAssistantMessageId) {
           processCodeBlocks(currentAssistantMessageId, true);
@@ -1747,6 +1833,10 @@
           checkbox.classList.add('done');
           item.style.opacity = '0.7';
         }
+        break;
+
+      case 'patchSet':
+        renderPatchSetBanner(msg.value);
         break;
 
       case 'timeline':
@@ -2037,6 +2127,42 @@
     browser_control: '🌐', create_skill: '🧠', use_skill: '🎯', list_skills: '📋',
     grep_search: '🔎', run_tests: '🧪', index_docs: '📖', query_knowledge: '💡'
   };
+
+  function renderPatchSetBanner(ps) {
+    let el = document.getElementById('patch-set-banner');
+    if (!el) {
+      const host = document.getElementById('timeline-list')?.parentElement || document.body;
+      el = document.createElement('div');
+      el.id = 'patch-set-banner';
+      el.className = 'patch-set-banner';
+      host.insertBefore(el, host.firstChild);
+    }
+    if (!ps || !ps.files || !ps.files.length) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+      return;
+    }
+    el.style.display = 'block';
+    const files = ps.files.map((f) =>
+      `<li><code>${escapeHtml(f.path)}</code>${f.created ? ' <span class="badge">new</span>' : ''} (${f.regionCount || 0} hunks)</li>`
+    ).join('');
+    el.innerHTML = `
+      <div class="patch-set-title">Pending patch set · ${ps.files.length} file(s)</div>
+      <ul class="patch-set-files">${files}</ul>
+      <div class="patch-set-actions">
+        <button type="button" class="btn-accept-patch" data-act="accept">Accept all</button>
+        <button type="button" class="btn-reject-patch" data-act="reject">Reject all</button>
+        <button type="button" class="btn-review-patch" data-act="review">Review merges</button>
+      </div>`;
+    el.querySelectorAll('button[data-act]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const act = btn.getAttribute('data-act');
+        if (act === 'accept') vscode.postMessage({ type: 'acceptPatchSet' });
+        if (act === 'reject') vscode.postMessage({ type: 'rejectPatchSet' });
+        if (act === 'review') vscode.postMessage({ type: 'reviewPatchSet' });
+      });
+    });
+  }
 
   function renderTimeline(events) {
     if (!timelineList) return;

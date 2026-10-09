@@ -98,6 +98,11 @@ export class AsyncAgentQueue {
     this.saveToDisk();
   }
 
+  /** Jobs still queued after reload — caller can restart them. */
+  listQueued(): AsyncJob[] {
+    return this.list().filter((j) => j.status === "queued");
+  }
+
   formatList(): string {
     const all = this.list();
     if (all.length === 0) {
@@ -142,8 +147,9 @@ export class AsyncAgentQueue {
         return;
       }
       for (const j of raw) {
-        // Jobs left "running" when VS Code quit are not still running
-        if (j.status === "running" || j.status === "queued") {
+        // Jobs left "running" when VS Code quit are not still running.
+        // Queued jobs can be resumed after reload (Phase 5 local durability).
+        if (j.status === "running") {
           j.status = "cancelled";
           j.error = j.error || "Interrupted when the editor closed.";
           j.finishedAt = j.finishedAt || Date.now();

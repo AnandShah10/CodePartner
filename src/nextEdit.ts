@@ -212,7 +212,18 @@ export class NextEditManager implements vscode.Disposable {
         const rename = this.detectLocalRename(document, change, preText);
         if (rename.length) {
           suggestions.push(...rename);
+          // Also suggest PascalCase / camelCase pair if applicable
+          suggestions.push(...this.detectCaseVariantRename(document, change, preText));
           continue;
+        }
+        const importPath = this.detectImportPathChange(document, change, preText);
+        if (importPath.length) {
+          suggestions.push(...importPath);
+          continue;
+        }
+        const stringLit = this.detectStringLiteralRepeat(document, change, preText);
+        if (stringLit.length) {
+          suggestions.push(...stringLit);
         }
         const structural = this.detectStructuralRepeat(document, change, preText);
         if (structural.length) {
@@ -401,6 +412,157 @@ export class NextEditManager implements vscode.Disposable {
       });
     }
     return results;
+  }
+
+  /**
+   * If user renamed foo → bar, also suggest Foo → Bar when those appear.
+   */
+  private detectCaseVariantRename(
+    document: vscode.TextDocument,
+    change: vscode.TextDocumentContentChangeEvent,
+    preText: string
+  ): PendingEdit[] {
+    const newWord = change.text.trim();
+    const startOffset = change.rangeOffset;
+    const oldWord = preText
+      .slice(startOffset, startOffset + (change.rangeLength || 0))
+      .trim();
+    if (!oldWord || !newWord || !/^[\w$]+$/.test(oldWord) || !/^[\w$]+$/.test(newWord)) {
+      return [];
+    }
+    const variants: Array<[string, string]> = [];
+    const pascal = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+    const camel = (s: string) => s.charAt(0).toLowerCase() + s.slice(1);
+    if (oldWord[0] !== oldWord[0].toUpperCase()) {
+      variants.push([pascal(oldWord), pascal(newWord)]);
+    } else {
+      variants.push([camel(oldWord), camel(newWord)]);
+    }
+    // SCREAMING_SNAKE for constants if both are camel-ish
+    const toSnake = (s: string) =>
+      s.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toUpperCase();
+    if (oldWord.length > 2 && newWord.length > 2) {
+      variants.push([toSnake(oldWord), toSnake(newWord)]);
+    }
+    const results: PendingEdit[] = [];
+    for (const [o, n] of variants) {
+      if (o === oldWord || o === n || o.length < 2) {
+        continue;
+      }
+      for (const doc of this.documentsToScan(document)) {
+        results.push(...this.findRenameSites(doc, o, n));
+      }
+    }
+    return results.slice(0, 20);
+  }
+
+  /**
+   * User changed a string/import path segment; suggest same path update elsewhere.
+   */
+  private detectImportPathChange(
+    document: vscode.TextDocument,
+    change: vscode.TextDocumentContentChangeEvent,
+    preText: string
+  ): PendingEdit[] {
+    if (!change.text || change.rangeLength < 2) {
+      return [];
+    }
+    const startOffset = change.rangeOffset;
+    const oldSeg = preText.slice(startOffset, startOffset + change.rangeLength);
+    const newSeg = change.text;
+    // Only path-like relative segments
+    if (!/^[\w./\\-]+$/.test(oldSeg) || !/^[\w./\\-]+$/.test(newSeg)) {
+      return [];
+    }
+    if (oldSeg.length < 3 || oldSeg === newSeg) {
+      return [];
+    }
+    // Must look like part of an import path (contains / or starts with .)
+    if (!oldSeg.includes("/") && !oldSeg.startsWith(".")) {
+      return [];
+    }
+    const results: PendingEdit[] = [];
+    for (const doc of this.documentsToScan(document)) {
+      const text = doc.getText();
+      let idx = 0;
+      while ((idx = text.indexOf(oldSeg, idx)) !== -1) {
+        // skip the original change site in primary doc
+        if (
+          doc.uri.toString() === document.uri.toString() &&
+          idx === startOffset
+        ) {
+          idx += oldSeg.length;
+          continue;
+        }
+        const start = doc.positionAt(idx);
+        const end = doc.positionAt(idx + oldSeg.length);
+        results.push({
+          uri: doc.uri,
+          range: new vscode.Range(start, end),
+          newText: newSeg,
+          oldText: oldSeg,
+          reason: `Update path "${oldSeg}" → "${newSeg}"`,
+        });
+        idx += oldSeg.length;
+        if (results.length >= 25) {
+          break;
+        }
+      }
+    }
+    return results.slice(0, 25);
+  }
+
+  /**
+   * User changed a quoted string that appears multiple times — suggest same replace.
+   */
+  private detectStringLiteralRepeat(
+    document: vscode.TextDocument,
+    change: vscode.TextDocumentContentChangeEvent,
+    preText: string
+  ): PendingEdit[] {
+    const startOffset = change.rangeOffset;
+    const oldLit = preText.slice(startOffset, startOffset + (change.rangeLength || 0));
+    const newLit = change.text;
+    if (
+      oldLit.length < 4 ||
+      oldLit.length > 80 ||
+      oldLit === newLit ||
+      oldLit.includes("\n")
+    ) {
+      return [];
+    }
+    // Must be a full quoted string including quotes
+    if (!/^(['"`]).*\1$/.test(oldLit) || !/^(['"`]).*\1$/.test(newLit)) {
+      return [];
+    }
+    const results: PendingEdit[] = [];
+    for (const doc of this.documentsToScan(document)) {
+      const text = doc.getText();
+      let idx = 0;
+      while ((idx = text.indexOf(oldLit, idx)) !== -1) {
+        if (
+          doc.uri.toString() === document.uri.toString() &&
+          idx === startOffset
+        ) {
+          idx += oldLit.length;
+          continue;
+        }
+        const start = doc.positionAt(idx);
+        const end = doc.positionAt(idx + oldLit.length);
+        results.push({
+          uri: doc.uri,
+          range: new vscode.Range(start, end),
+          newText: newLit,
+          oldText: oldLit,
+          reason: `Replace string ${oldLit} → ${newLit}`,
+        });
+        idx += oldLit.length;
+        if (results.length >= 20) {
+          break;
+        }
+      }
+    }
+    return results.slice(0, 20);
   }
 
   /**

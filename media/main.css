@@ -190,11 +190,16 @@ html, body {
   border-left: 3px solid var(--accent); border-bottom-left-radius: 3px; width: 100%;
 }
 
+/* Answer body (kept separate from thought) */
+.message-answer { min-height: 0; }
+.message-answer .spinner { margin: 6px 0; }
+
 /* ── Thought Blocks ── */
 .thought-container {
   margin: 10px 0; border-left: 3px solid var(--accent);
   background: var(--accent-dim); border-radius: 4px; overflow: hidden;
 }
+.thought-label { font-weight: 700; }
 .thought-header {
   padding: 5px 10px; font-size: 10px; font-weight: 700; text-transform: uppercase;
   letter-spacing: 0.5px; opacity: 0.6;
@@ -1296,4 +1301,108 @@ textarea::-webkit-scrollbar { display: none; }
 /* Keep overlay highlights non-interactive (textarea is on top) */
 #prompt-overlay .file-tag {
   pointer-events: none;
+}
+
+
+/* ── Activity IA (Chat | Plan | Activity) ── */
+.tab-btn .tab-label {
+  font-size: 10px;
+  margin-left: 4px;
+  opacity: 0.85;
+}
+@media (max-width: 280px) {
+  .tab-btn .tab-label { display: none; }
+}
+#activity-subnav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 8px 10px 4px;
+  border-bottom: 1px solid rgba(var(--vscode-panel-border-rgb, 128,128,128), var(--border-opacity));
+  flex-shrink: 0;
+}
+.activity-sub-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--vscode-foreground);
+  opacity: 0.55;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.activity-sub-btn:hover { opacity: 0.9; background: var(--accent-dim); }
+.activity-sub-btn.active {
+  opacity: 1;
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+#activity-panels {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.activity-panel {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  flex-direction: column;
+}
+.activity-panel.active {
+  display: flex;
+}
+#tab-activity.tab-content.active {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+
+/* Multi-file patch set review */
+.patch-set-banner {
+  margin: 8px 10px 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--vscode-focusBorder, #007acc);
+  background: color-mix(in srgb, var(--vscode-editorWidget-background, #252526) 90%, var(--vscode-focusBorder, #007acc) 10%);
+}
+.patch-set-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.patch-set-files {
+  margin: 0 0 8px 16px;
+  padding: 0;
+  font-size: 11px;
+  max-height: 120px;
+  overflow: auto;
+}
+.patch-set-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.patch-set-actions button {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  cursor: pointer;
+}
+.btn-accept-patch {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+}
+.btn-reject-patch {
+  background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
+  color: var(--vscode-button-foreground, #fff);
+}
+.btn-review-patch {
+  background: var(--vscode-button-secondaryBackground, #3a3d41);
+  color: var(--vscode-button-secondaryForeground, #fff);
 }

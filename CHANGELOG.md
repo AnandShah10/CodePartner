@@ -4,6 +4,162 @@ All notable changes to the **CodePartner AI** VS Code extension will be document
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.8.1] - 2026-10-09
+### Separate thinking UI
+- Assistant messages keep **Thinking** in its own collapsible block above the answer (partial updates no longer wipe it)
+- Stream parsing: OpenAI/DeepSeek `reasoning_content` / `reasoning`, Anthropic `thinking_delta`, Gemini `parts[].thought`
+- Header label switches from **Thinking** → **Thought** when the turn completes
+
+## [2.8.0] - 2026-10-09
+### Auto-verify, richer NES, review packs
+- **`autoVerify`**: after agent file edits, automatically run **focused** related tests (or full suite) without the model calling `run_tests`
+- Settings: `codepartner.autoVerify` (off|focused|full), `autoVerifyMaxAttempts`
+- **NES / Finish Changes**: case-variant rename (foo/Foo/FOO_BAR), import/path segment updates, repeated string-literal replace
+- **Review policy packs**: security, react, node, quality (path-aware rules expanded)
+
+## [2.7.0] - 2026-10-09
+### Computer-use browser
+- Local Chrome **observe → act → observe** loop (no cloud)
+- New actions: **observe**, hover, select, scroll, press, evaluate, close
+- `observe` returns interactive elements with CSS selectors + body text
+- navigate/click/type auto-return a fresh observation
+- screenshot saves artifact and includes a short observation
+- Tool schema + system prompt updated for computer-use workflow
+
+## [2.6.0] - 2026-10-09
+### Multi-file transactional PatchSet + 3-way merge
+- **`PatchTransaction`**: accumulates all `edit_file` / `create_file` in a turn; original pre content preserved across chained edits
+- End of turn → **Accept all / Reject all / Review merges** (notification + Activity banner)
+- **Reject** rolls back every file in the set (delete if agent-created)
+- **Review** runs **3-way merge** (base=pre, ours=disk, theirs=agent); writes conflict markers; opens diffs for clean agent files
+- Commands: `codepartner.acceptPatchSet`, `rejectPatchSet`, `reviewPatchSet`
+- Modules: `patchSet.ts`, `merge3.ts`
+
+## [2.5.0] - 2026-10-09
+### Local sandbox
+- Setting **`codepartner.sandboxMode`**: `off` | `soft` (default) | `strict`
+- **soft**: command safety + filtered process env (strips KEY/TOKEN/SECRET/…) for `run_command` / tests
+- **strict**: also **blocks** network/install shell patterns (`curl`, `wget`, `npm install`, `git clone`, …) unless yolo; on Linux uses **bubblewrap** when `bwrap` is installed
+- Visible terminal still subject to allow/block policy (bubblewrap wrap applied to the sent command string)
+
+## [2.4.12] - 2026-10-09
+### Symbols / patches
+- **DocumentSymbol enrichment** via VS Code language extensions (TS/JS when available)
+- **`patchSet.ts`** — structured file patches; timeline stores `patchRegions` for edits
+
+## [2.4.11] - 2026-09-28
+### Prompt-injection / multi-root
+- **Browser tool results** tracked as untrusted content
+- BrowserManager root refreshed when workspace folders change
+
+## [2.4.10] - 2026-09-28
+### Prompt-injection
+- **MCP tool results** tracked as untrusted content (forces approval when args echo MCP output)
+
+## [2.4.9] - 2026-09-28
+### Write safety
+- **Per-path write locks** (`fileWriteLock.ts`) around edit_file / create_file
+- Architect hunk apply uses **path containment**
+
+## [2.4.8] - 2026-09-28
+### Context freshness
+- Symbol index **incremental update** on save (TS/JS/Vue/Svelte), debounced 400ms
+- `SymbolIndex.updateFile` for multi-root paths
+
+## [2.4.7] - 2026-09-28
+### Verification loop depth
+- Failed `run_tests` returns **[REVERIFY REQUIRED]** with exact command to re-run + related files
+- Passed tests mark **[VERIFIED]**
+- **`re_run_last_tests`** tool reuses the last test command
+- Rebuild symbol/semantic indexes on **workspace folder** changes
+
+## [2.4.6] - 2026-09-28
+### Partial-feature depth
+- **Symbol index multi-root** — indexes all workspace folders (paths prefixed by folder name)
+- Richer symbol patterns (methods, export default, let/var)
+- **Test guidance** suggests focused re-run when a single test file is detected
+- More **review** rules (new Function, document.write, TLS rejectUnauthorized)
+- Patch revert: undo pure agent **insertions** when still present
+
+## [2.4.5] - 2026-09-28
+### Approvals / UX
+- High-risk shell patterns (**warn** level) always force an approval prompt (except yolo), bypassing full-auto / session allow-list
+- Progress status: "Working: tools…" when scheduling; per-tool status (Reading/Editing/Running tests/…)
+
+## [2.4.4] - 2026-09-28
+### Local command safety
+- `commandSafety.ts` — block catastrophic patterns (`rm -rf /`, mkfs, pipe-to-shell, fork bomb); warn on `rm -rf`, force-push, reset --hard
+- Wired into `run_command` / `run_in_terminal` (blocks even under yolo for absolute dangers)
+
+## [2.4.3] - 2026-09-28
+### Structure
+- Extracted **ArtifactRegistry**, **SkillManager**, **diff providers** to own modules
+- System prompt rule: verification loop after substantive edits
+
+## [2.4.2] - 2026-09-28
+### Structure / local review
+- Extracted **BrowserManager** → `browserManager.ts`, **TOOLS** → `tools.ts`
+- **Lightweight code review hints** after edit/create (`codeReviewHints.ts`) — eval/XSS/secrets/TODO signals for the agent (no backend)
+
+## [2.4.1] - 2026-09-28
+### Structure / context
+- Extracted **system prompts** to `systemPrompts.ts` (thin `extension.ts` split)
+- **Git-recent boost** in context ranker (`boostByRecentGit` via `git log`)
+- Comparison analysis note for roadmap progress
+
+## [2.4.0] - 2026-09-28
+### Context ranking
+- `contextRanker.ts` — symbol-path boost + pack-to-budget for `@workspace` results
+- README brought in line with roadmap work through 2.3.9
+
+## [2.3.9] - 2026-09-28
+### Model routing / durable local agents
+- Setting `codepartner.completionModel` — optional faster model for inline completions (`modelRouter.ts`)
+- Queued async agents **resume after reload** (running jobs still marked interrupted)
+
+## [2.3.8] - 2026-09-28
+### Multi-root
+- `workspaceRoot.ts` — prefer folder of active editor over always folder[0]
+- File/shell tools and context use preferred root
+- Multi-root workspace summary injected into agent context
+
+## [2.3.7] - 2026-09-28
+### UX
+- Sidebar simplified to **Chat | Plan | Activity**
+- Activity sub-nav: Timeline · Artifacts · Terminal · Skills · Debug
+- Tab labels on wider panels; hide labels when very narrow
+
+## [2.3.6] - 2026-09-28
+### Context / Verification
+- Symbol context: **import-graph expansion** + definition snippet
+- **Test failure parser** (`testFailureParse.ts`) — structured hints + guidance after failed `run_tests`
+- Inline completion default debounce **200ms** (was 500)
+
+## [2.3.5] - 2026-09-28
+### Context (Roadmap Phase 2)
+- **Symbol index** (`symbolIndex.ts`): lightweight TS/JS definition extraction
+- Injects symbol hits into `@workspace` search and general prompts
+- Unit tests for extraction
+
+## [2.3.4] - 2026-09-28
+### Runtime
+- **Patch-aware Timeline revert** (`patchRevert.ts`): undoes agent regions without wiping later user edits when possible; stores `postContent` on timeline events
+- Safer create-file revert (won't delete user-modified files)
+- Path containment on revert paths
+
+## [2.3.3] - 2026-09-28
+### Security / Runtime
+- Path containment extended to grep, license scan, code-reference scan, openFile
+- **Tool scheduler** (`toolScheduler.ts`): serializes same-path writes and shell tools; parallel only when safe
+- Scheduler unit tests
+
+## [2.3.2] - 2026-09-28
+### Security (Roadmap Phase 0)
+- Capability-oriented tool gating: `send_terminal_input`, MCP tools (`external`), `browser_control`, `stage_git_changes`
+- Workspace path containment (`pathSafety.ts`) on list/read/edit/create
+- Secret **redaction** before model context (`redactSecretsInText`) in addition to warnings
+- `docs/ROADMAP.md` committed
+
 ## [2.3.1] - 2026-09-28
 ### Fixed
 - **Stop button**: sets a cancel latch, aborts the stream, kills shell/tests (SIGTERM then SIGKILL), skips remaining tools — no more commands after Stop.
