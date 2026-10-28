@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import axios from "axios";
 import { API_KEY_SECRET_KEY } from "./secretKeys";
 import { buildProviderRequest, extractNonStreamedText } from "./aiProviderAdapter";
+import { resolveModelId } from "./modelRouter";
 
 /**
  * InlineCompletionProvider for CodePartner.
@@ -45,7 +46,7 @@ export class CodePartnerInlineCompletionProvider implements vscode.InlineComplet
     }
 
     // Debounce: wait for the configured delay
-    const debounceMs = config.get<number>("inlineCompletionDebounce", 500);
+    const debounceMs = config.get<number>("inlineCompletionDebounce", 200);
     const requestId = ++this.lastRequestId;
 
     await new Promise<void>((resolve) => {
@@ -87,7 +88,8 @@ export class CodePartnerInlineCompletionProvider implements vscode.InlineComplet
     const config = vscode.workspace.getConfiguration("codepartner");
     const providerType = config.get<string>("provider") || "openai";
     const apiEndpoint = config.get<string>("apiEndpoint")?.trim() || "";
-    const modelId = config.get<string>("model")?.trim() || "";
+    // Phase 3 model router: optional dedicated completion model
+    const modelId = resolveModelId("completion");
     const azureApiVersion = config.get<string>("azureApiVersion") || "2024-02-15-preview";
 
     // Build context: lines before and after cursor

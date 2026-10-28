@@ -79,7 +79,8 @@ export class SemanticSearch {
       return;
     }
 
-    this.output.appendLine("[SemanticSearch] Building workspace index...");
+    const folderCount = vscode.workspace.workspaceFolders?.length || 0;
+    this.output.appendLine(`[SemanticSearch] Building workspace index (${folderCount} folder(s))...`);
     const startTime = Date.now();
 
     const files = await vscode.workspace.findFiles(

@@ -16,9 +16,16 @@
 export interface ModelMetadata {
   /** Context window size, in tokens. */
   contextWindow: number;
+  /** Model may stream a separate thinking/reasoning channel. */
+  supportsReasoning?: boolean;
 }
 
 const MODEL_PATTERNS: Array<{ pattern: RegExp; metadata: ModelMetadata }> = [
+  { pattern: /o3|o1-pro|o1(?!\w)/i, metadata: { contextWindow: 200000, supportsReasoning: true } },
+  { pattern: /gpt-5/i, metadata: { contextWindow: 200000, supportsReasoning: true } },
+  { pattern: /deepseek-r1|deepseek-reasoner/i, metadata: { contextWindow: 128000, supportsReasoning: true } },
+  { pattern: /claude-3-7|claude-4|claude-opus-4|claude-sonnet-4/i, metadata: { contextWindow: 200000, supportsReasoning: true } },
+  { pattern: /gemini-2\.5|gemini-2\.0-flash-thinking/i, metadata: { contextWindow: 1000000, supportsReasoning: true } },
   { pattern: /gpt-4o/i, metadata: { contextWindow: 128000 } },
   { pattern: /gpt-4-turbo/i, metadata: { contextWindow: 128000 } },
   { pattern: /gpt-4-32k/i, metadata: { contextWindow: 32768 } },

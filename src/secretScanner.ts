@@ -3,10 +3,9 @@
  * a credential before it gets pasted into a prompt sent to a third-party
  * LLM API (or, in the feedback-report path, into a public GitHub issue).
  *
- * This is deliberately a WARN, not a strip: false positives on a regex
- * scan are common, and silently deleting text the user didn't ask us to
- * touch is its own kind of surprising failure. Callers should surface the
- * warning and let the user decide, not block or auto-redact.
+ * Phase 0 roadmap: callers should prefer `redactSecretsInText` for model
+ * context (warn + replace matches) rather than warn-only. False positives
+ * are possible; redaction prefers safety over perfect fidelity.
  */
 
 export interface SecretFinding {
@@ -68,6 +67,26 @@ function redact(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length <= 8) {return "****";}
   return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
+}
+
+/**
+ * Returns text with secret-like substrings replaced by placeholders, plus
+ * the findings list. Use this before sending file/terminal content to a model.
+ */
+export function redactSecretsInText(text: string): { text: string; findings: SecretFinding[] } {
+  if (!text) {
+    return { text: text || "", findings: [] };
+  }
+  const findings = scanForSecrets(text);
+  if (findings.length === 0) {
+    return { text, findings };
+  }
+  let out = text;
+  for (const { label, regex } of PATTERNS) {
+    regex.lastIndex = 0;
+    out = out.replace(regex, (raw) => `[REDACTED:${label}:${redact(raw)}]`);
+  }
+  return { text: out, findings };
 }
 
 /**

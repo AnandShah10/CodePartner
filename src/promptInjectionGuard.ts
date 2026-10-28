@@ -2,7 +2,7 @@
  * Basic prompt-injection mitigation (Phase 1.5).
  *
  * Tracks content that entered the conversation from untrusted sources —
- * web search results, indexed docs, @file-mentioned files — during the
+ * web search results, indexed docs, @file-mentioned files, MCP tool results — during the
  * current turn, and flags tool calls whose arguments closely echo that
  * content. A flagged call is forced through the approval prompt even
  * under a policy that would otherwise auto-approve it: untrusted content

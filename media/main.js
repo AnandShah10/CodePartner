@@ -89,6 +89,10 @@
   let currentAssistantMessageId = null;
   let currentThoughtDiv = null;
   let isWaiting = false;
+  /** Prompts typed while a turn is running — sent after current turn completes (Copilot/Antigravity-style). */
+  let promptQueue = [];
+  /** Agent Debug snapshot — declared early so the message handler never hits TDZ. */
+  let lastAgentDebug = null;
   let attachedFiles = [];
   let currentMode = 'fast';
   let allTimelineEvents = [];
@@ -116,44 +120,266 @@
     chatHistory.scrollTop = chatHistory.scrollHeight;
   }
 
+  /** When true, the next setWaiting(false) will not auto-run the prompt queue (used after Stop). */
+  let suppressQueueFlushOnce = false;
+  /** After the first auto-run from the queue, further items require confirm. */
+  let queueNeedsConfirm = false;
+
   function setWaiting(waiting) {
     isWaiting = waiting;
     sendBtn.innerHTML = waiting ? ICONS.STOP : ICONS.SEND;
     sendBtn.classList.toggle('stop', waiting);
     if (!waiting) {
-      statusText.innerText = '';
+      if (!statusText.innerText || /thinking|refining|preparing|stopped/i.test(statusText.innerText)) {
+        statusText.innerText = promptQueue.length
+          ? `Queue: ${promptQueue.length} waiting`
+          : '';
+      }
+      if (suppressQueueFlushOnce) {
+        suppressQueueFlushOnce = false;
+        renderQueueBadge();
+        return;
+      }
+      if (promptQueue.length === 0) {
+        queueNeedsConfirm = false;
+        return;
+      }
+      // First queued message after a turn runs automatically; later ones ask
+      if (!queueNeedsConfirm) {
+        queueNeedsConfirm = true;
+        flushPromptQueue();
+      } else {
+        offerNextQueuedConfirm();
+      }
     }
+  }
+
+  function renderQueueBadge() {
+    let badge = document.getElementById('prompt-queue-badge');
+    if (promptQueue.length === 0) {
+      if (badge) {
+        badge.remove();
+      }
+      const bar = document.getElementById('queue-confirm-bar');
+      if (bar) {
+        bar.remove();
+      }
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'prompt-queue-badge';
+      badge.className = 'prompt-queue-badge';
+      const inputOuter = document.getElementById('input-outer');
+      if (inputOuter) {
+        inputOuter.insertBefore(badge, inputOuter.firstChild);
+      }
+    }
+    const lines = promptQueue
+      .map((item, i) => {
+        const preview = truncateQueuePreview(item.text, i === 0 ? 160 : 80);
+        const label = i === 0 ? 'Next' : `#${i + 1}`;
+        return `<div class="queue-item"><span class="queue-item-label">${label}</span><span class="queue-item-text" title="${escapeHtml(item.text)}">${escapeHtml(preview)}</span></div>`;
+      })
+      .join('');
+    badge.innerHTML =
+      `<div class="queue-badge-header"><span>Queue (${promptQueue.length})</span>` +
+      `<button type="button" class="queue-clear" title="Clear queue">×</button></div>` +
+      `<div class="queue-items">${lines}</div>`;
+    badge.querySelector('.queue-clear').onclick = () => {
+      promptQueue = [];
+      queueNeedsConfirm = false;
+      renderQueueBadge();
+      const bar = document.getElementById('queue-confirm-bar');
+      if (bar) {
+        bar.remove();
+      }
+      if (!isWaiting) {
+        statusText.innerText = '';
+      }
+    };
+  }
+
+  /** Special @ tokens that are context scopes, not files — never render as file tags. */
+  function isFileOrFolderMention(path) {
+    const p = String(path || '').replace(/\/+$/, '').toLowerCase();
+    if (!p) {
+      return false;
+    }
+    if (p === 'workspace' || p === 'web' || p === 'codebase' || p === 'project') {
+      return false;
+    }
+    return true;
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function truncateQueuePreview(text, max) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    if (t.length <= max) {
+      return t;
+    }
+    return t.slice(0, max - 1) + '…';
+  }
+
+  function runQueuedItem(item) {
+    if (!item || isWaiting) {
+      return;
+    }
+    createMessage('user', item.text);
+    setWaiting(true);
+    currentAssistantMessageId = createMessage('assistant');
+    currentThoughtDiv = null;
+    vscode.postMessage({
+      type: 'prompt',
+      value: item.text,
+      attachments: item.attachments || [],
+    });
+  }
+
+  function flushPromptQueue() {
+    if (isWaiting || promptQueue.length === 0) {
+      return;
+    }
+    // First queued item runs automatically; further items need confirm
+    const next = promptQueue.shift();
+    renderQueueBadge();
+    if (!next) {
+      return;
+    }
+    if (promptQueue.length === 0) {
+      runQueuedItem(next);
+      return;
+    }
+    // More remain after this one — still run first without extra confirm
+    runQueuedItem(next);
+  }
+
+  /**
+   * After a turn completes, if more than one was originally conceptually
+   * "stacked", ask before running each subsequent item.
+   */
+  function offerNextQueuedConfirm() {
+    if (isWaiting || promptQueue.length === 0) {
+      return;
+    }
+    const next = promptQueue[0];
+    const preview = truncateQueuePreview(next.text, 120);
+    const remaining = promptQueue.length;
+    let bar = document.getElementById('queue-confirm-bar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'queue-confirm-bar';
+      bar.className = 'queue-confirm-bar';
+      const inputOuter = document.getElementById('input-outer');
+      if (inputOuter) {
+        inputOuter.insertBefore(bar, inputOuter.firstChild);
+      }
+    }
+    bar.innerHTML =
+      `<div class="queue-confirm-text"><strong>Send next queued?</strong> ` +
+      `<span class="queue-confirm-preview">“${escapeHtml(preview)}”</span>` +
+      (remaining > 1 ? ` <span class="queue-confirm-more">(+${remaining - 1} more)</span>` : '') +
+      `</div>` +
+      `<div class="queue-confirm-actions">` +
+      `<button type="button" class="queue-confirm-yes">Send</button>` +
+      `<button type="button" class="queue-confirm-skip">Skip</button>` +
+      `<button type="button" class="queue-confirm-clear">Clear all</button>` +
+      `</div>`;
+    bar.querySelector('.queue-confirm-yes').onclick = () => {
+      bar.remove();
+      const item = promptQueue.shift();
+      renderQueueBadge();
+      runQueuedItem(item);
+    };
+    bar.querySelector('.queue-confirm-skip').onclick = () => {
+      promptQueue.shift();
+      renderQueueBadge();
+      if (promptQueue.length === 0) {
+        bar.remove();
+      } else {
+        offerNextQueuedConfirm();
+      }
+    };
+    bar.querySelector('.queue-confirm-clear').onclick = () => {
+      promptQueue = [];
+      queueNeedsConfirm = false;
+      renderQueueBadge();
+      bar.remove();
+      statusText.innerText = '';
+    };
+  }
+
+  /** True only for paths that look like real files/folders (avoid tagging @word). */
+  function looksLikeFilePath(filePath) {
+    if (!isFileOrFolderMention(filePath)) {
+      return false;
+    }
+    const p = String(filePath).replace(/\\/g, '/');
+    if (p.includes('/')) {
+      return true;
+    }
+    // basename with extension, e.g. main.ts, README.md
+    if (/\.[a-zA-Z0-9]{1,8}$/.test(p)) {
+      return true;
+    }
+    return false;
   }
 
   function formatMentions(html) {
     if (!html) return html;
-    
-    let formatted = html.replace(/(^|\s|>|&nbsp;)@([a-zA-Z0-9_\-\.\/]+)/g, (match, prefix, path) => {
-      const parts = path.split('/');
-      let displayHtml = '';
-      
-      if (parts.length === 1) {
-        displayHtml = `@<b>${path}</b>`;
-      } else {
-        const basename = parts.pop();
-        if (basename === '') {
-          const lastDir = parts.pop();
-          const preDir = parts.length > 0 ? parts.join('/') + '/' : '';
-          displayHtml = `@${preDir}<b>${lastDir}/</b>`;
-        } else {
-          const dir = parts.length > 0 ? parts.join('/') + '/' : '';
-          displayHtml = `@${dir}<b>${basename}</b>`;
-        }
+
+    // Do not tag inside code/pre blocks (markdown output)
+    const parts = String(html).split(/(<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>)/gi);
+    for (let i = 0; i < parts.length; i++) {
+      if (/^<(pre|code)/i.test(parts[i])) {
+        continue;
       }
-      
-      return `${prefix}<span class="mention" style="color: var(--vscode-textLink-foreground); font-family: var(--vscode-editor-font-family); background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; font-size: 0.9em;">${displayHtml}</span>`;
-    });
+      parts[i] = parts[i].replace(/(^|[^a-zA-Z0-9_])@([a-zA-Z0-9_\-\.\/\\]+)/g, (match, prefix, filePath) => {
+        if (!looksLikeFilePath(filePath)) {
+          return match;
+        }
+        const normalized = filePath.replace(/\\/g, '/');
+        const partsPath = normalized.split('/');
+        const basename = partsPath[partsPath.length - 1] || normalized;
+        const isFolder = normalized.endsWith('/');
+        const icon = isFolder ? '📁' : '📄';
+        const safePath = normalized.replace(/"/g, '&quot;');
+        const safeName = basename.replace(/\/$/, '').replace(/</g, '&lt;');
+        return `${prefix}<span class="file-tag file-tag-clickable" data-path="${safePath}" title="Open ${safePath}" role="button" tabindex="0"><span class="file-tag-icon">${icon}</span><span class="file-tag-name">${safeName}</span></span>`;
+      });
+    }
+    return parts.join('');
+  }
 
-    formatted = formatted.replace(/(^|\s|>|&nbsp;)\/([a-zA-Z0-9_\-\.]+)/g, (match, prefix, skillName) => {
-      return `${prefix}<span class="mention" style="color: var(--vscode-charts-purple); font-family: var(--vscode-editor-font-family); background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; font-size: 0.9em;">/<b>${skillName}</b></span>`;
-    });
+  function openMentionPath(pathAttr) {
+    if (!pathAttr || !isFileOrFolderMention(pathAttr)) {
+      return;
+    }
+    const p = pathAttr.replace(/\\/g, '/');
+    // Absolute paths → openAbsoluteFile; otherwise relative workspace path
+    if (p.match(/^[a-zA-Z]:\//) || p.startsWith('/')) {
+      vscode.postMessage({ type: 'openAbsoluteFile', value: p });
+    } else {
+      vscode.postMessage({ type: 'openFile', value: p });
+    }
+  }
 
-    return formatted;
+  // Click file tags in chat history (and future dynamic content)
+  if (chatHistory) {
+    chatHistory.addEventListener('click', (e) => {
+      const tag = e.target.closest && e.target.closest('.file-tag-clickable');
+      if (tag) {
+        e.preventDefault();
+        openMentionPath(tag.getAttribute('data-path'));
+      }
+    });
   }
 
   function createMessage(role, content = '') {
@@ -193,8 +419,14 @@
         text = text.split('User Question:').pop().trim();
       }
       contentDiv.innerHTML = formatMentions(md.render(text));
+    } else if (role === 'assistant' && !content) {
+      // Separate slots: thinking block (optional) + answer body
+      const answer = document.createElement('div');
+      answer.className = 'message-answer';
+      answer.innerHTML = '<div class="spinner"></div>';
+      contentDiv.appendChild(answer);
     } else {
-      contentDiv.innerHTML = content || (role === 'assistant' ? '<div class="spinner"></div>' : '');
+      contentDiv.innerHTML = content || '';
     }
 
     messageDiv.appendChild(header);
@@ -214,25 +446,29 @@
 
     const feedbackRow = document.createElement('div');
     feedbackRow.className = 'feedback-row';
-    feedbackRow.style.display = 'flex';
-    feedbackRow.style.flexDirection = 'column';
-    feedbackRow.style.gap = '4px';
-    feedbackRow.style.marginTop = '8px';
+
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'feedback-toggle';
+    toggle.title = 'Rate this response';
+    toggle.textContent = 'Feedback ▸';
+    toggle.setAttribute('aria-expanded', 'false');
+
+    const panel = document.createElement('div');
+    panel.className = 'feedback-panel collapsed';
 
     const buttons = document.createElement('div');
-    buttons.style.display = 'flex';
-    buttons.style.gap = '8px';
-    buttons.style.opacity = '0.6';
+    buttons.className = 'feedback-buttons';
 
     const feedbackInputContainer = document.createElement('div');
-    feedbackInputContainer.className = 'hidden';
-    feedbackInputContainer.style.marginTop = '4px';
+    feedbackInputContainer.className = 'feedback-input-wrap hidden';
 
     const likeBtn = document.createElement('button');
     likeBtn.className = 'icon-btn';
     likeBtn.title = 'Helpful';
     likeBtn.innerHTML = ICONS.LIKE;
-    likeBtn.onclick = () => {
+    likeBtn.onclick = (e) => {
+      e.stopPropagation();
       vscode.postMessage({ type: 'feedback', value: 'positive', content: content });
       feedbackRow.remove();
     };
@@ -241,10 +477,10 @@
     dislikeBtn.className = 'icon-btn';
     dislikeBtn.title = 'Not helpful';
     dislikeBtn.innerHTML = ICONS.DISLIKE;
-    dislikeBtn.onclick = () => {
+    dislikeBtn.onclick = (e) => {
+      e.stopPropagation();
       dislikeBtn.style.color = 'var(--vscode-charts-red)';
       dislikeBtn.style.opacity = '1';
-      likeBtn.style.color = 'inherit';
       likeBtn.style.opacity = '0.6';
       feedbackInputContainer.classList.remove('hidden');
       feedbackInput.focus();
@@ -252,31 +488,46 @@
 
     const feedbackInput = document.createElement('input');
     feedbackInput.placeholder = 'What was wrong? (optional)';
-    feedbackInput.className = 'skill-form-input';
-    feedbackInput.style.height = '24px';
-    feedbackInput.style.fontSize = '10px';
+    feedbackInput.className = 'skill-form-input feedback-detail-input';
     feedbackInput.onkeydown = (e) => {
       if (e.key === 'Enter') {
         vscode.postMessage({ type: 'feedback', value: 'negative', detail: feedbackInput.value, content: content });
-        feedbackInputContainer.innerHTML = '<span style="font-size:10px; opacity:0.6;">Thanks for the feedback!</span>';
+        feedbackInputContainer.innerHTML = '<span class="feedback-thanks">Thanks for the feedback!</span>';
         setTimeout(() => feedbackRow.remove(), 2000);
+      }
+    };
+
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      const collapsed = panel.classList.contains('collapsed');
+      if (collapsed) {
+        panel.classList.remove('collapsed');
+        toggle.setAttribute('aria-expanded', 'true');
+        toggle.textContent = 'Feedback ▾';
+      } else {
+        panel.classList.add('collapsed');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.textContent = 'Feedback ▸';
       }
     };
 
     feedbackInputContainer.appendChild(feedbackInput);
     buttons.append(likeBtn, dislikeBtn);
-    feedbackRow.append(buttons, feedbackInputContainer);
-    container.parentElement.appendChild(feedbackRow);
-    scrollBottom();
+    panel.append(buttons, feedbackInputContainer);
+    feedbackRow.append(toggle, panel);
+    // Append inside the message card so layout doesn't overflow the sidebar
+    const host = container.closest('.message') || container.parentElement || container;
+    host.appendChild(feedbackRow);
   }
 
   function createThoughtBlock(container) {
     const thoughtContainer = document.createElement('div');
     thoughtContainer.className = 'thought-container';
+    thoughtContainer.dataset.thinking = '1';
 
     const header = document.createElement('div');
     header.className = 'thought-header';
-    header.innerHTML = `${ICONS.THOUGHT} <span>Thinking...</span> <span class="collapse-icon">▼</span>`;
+    header.innerHTML = `${ICONS.THOUGHT} <span class="thought-label">Thinking</span> <span class="collapse-icon">▼</span>`;
     header.onclick = () => {
       header.classList.toggle('collapsed');
       content.classList.toggle('collapsed');
@@ -287,8 +538,28 @@
 
     thoughtContainer.appendChild(header);
     thoughtContainer.appendChild(content);
-    container.appendChild(thoughtContainer);
+    // Keep thinking above the answer body
+    const answer = container.querySelector('.message-answer');
+    if (answer) {
+      container.insertBefore(thoughtContainer, answer);
+    } else {
+      container.insertBefore(thoughtContainer, container.firstChild);
+    }
     return content;
+  }
+
+  function markThoughtComplete(container) {
+    if (!container) return;
+    const label = container.querySelector('.thought-label');
+    if (label) label.textContent = 'Thought';
+    const tc = container.closest ? container.closest('.thought-container') : null;
+    const root = container.classList?.contains('thought-content')
+      ? container.parentElement
+      : container.querySelector?.('.thought-container');
+    const header = (root || container).querySelector?.('.thought-header');
+    if (header && !header.classList.contains('collapsed')) {
+      // leave expanded so user can read; label already says Thought
+    }
   }
 
   function renderModifiedFiles(files, container) {
@@ -511,14 +782,32 @@
 
   function loadMessages(messages) {
     chatHistory.innerHTML = '';
-    messages.forEach(m => {
+    currentAssistantMessageId = null;
+    currentThoughtDiv = null;
+    statusText.innerText = '';
+    setWaiting(false);
+    promptQueue = [];
+    renderQueueBadge();
+
+    (messages || []).forEach(m => {
       if (m.role === 'system' || m.hiddenFromUI) {
         return;
       }
-      const content = createMessage(m.role, m.content);
+      let body = m.content;
+      if (typeof body === 'string') {
+        if (body.includes('--- Context ---') && body.includes('User Question:')) {
+          body = body.split('User Question:').pop().trim();
+        }
+        if (/^(Preparing context|Thinking|Refining|Stopped)\.\.\.?$/i.test(body.trim())) {
+          return;
+        }
+        if (!body.trim()) {
+          return;
+        }
+      }
+      const content = createMessage(m.role, body);
       processCodeBlocks(content, m.role === 'assistant');
     });
-    setWaiting(false);
     scrollBottom();
   }
 
@@ -578,8 +867,61 @@
       vscode.postMessage({ type: 'clearDiagnostics' });
     };
   }
+  const openDebugLogBtn = document.getElementById('open-debug-log-btn');
+  if (openDebugLogBtn) {
+    openDebugLogBtn.onclick = () => {
+      vscode.postMessage({ type: 'openDebugLog' });
+    };
+  }
+  const refreshDebugBtn = document.getElementById('refresh-debug-btn');
+  if (refreshDebugBtn) {
+    refreshDebugBtn.onclick = () => {
+      vscode.postMessage({ type: 'requestAgentDebug' });
+    };
+  }
 
   // UI Event Listeners
+  // Navbar overflow menu (narrow sidebars collapse History / Feedback / New chat into ⋯)
+  (function wireHeaderMoreMenu() {
+    const moreBtn = document.getElementById('header-more-btn');
+    const moreMenu = document.getElementById('header-more-menu');
+    if (!moreBtn || !moreMenu) {
+      return;
+    }
+    const closeMenu = () => {
+      moreMenu.classList.add('hidden');
+      moreBtn.setAttribute('aria-expanded', 'false');
+    };
+    moreBtn.onclick = (e) => {
+      e.stopPropagation();
+      const open = moreMenu.classList.toggle('hidden') === false;
+      moreBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    moreMenu.addEventListener('click', (e) => {
+      const item = e.target.closest('.header-more-item');
+      if (!item) {
+        return;
+      }
+      const action = item.getAttribute('data-action');
+      closeMenu();
+      if (action === 'history' && historyBtn) {
+        historyBtn.click();
+      } else if (action === 'feedback') {
+        const fb = document.getElementById('feedback-btn');
+        if (fb) {
+          fb.click();
+        }
+      } else if (action === 'new-chat' && newChatBtn) {
+        newChatBtn.click();
+      }
+    });
+    document.addEventListener('click', (e) => {
+      if (!moreMenu.classList.contains('hidden') && !moreMenu.contains(e.target) && e.target !== moreBtn) {
+        closeMenu();
+      }
+    });
+  })();
+
   historyBtn.onclick = () => {
     vscode.postMessage({ type: 'listChats' });
     historyPanel.classList.remove('hidden');
@@ -669,14 +1011,39 @@
     promptInput.selectionStart = promptInput.selectionEnd = pos + tag.length;
   }
 
-  // --- Tab Management ---
-  tabBtns.forEach(btn => {
+  // --- Tab Management (Chat | Plan | Activity) ---
+  function showMainTab(targetTab) {
+    tabBtns.forEach((b) => b.classList.toggle('active', b.getAttribute('data-tab') === targetTab));
+    tabContents.forEach((c) => c.classList.toggle('active', c.id === `tab-${targetTab}`));
+  }
+  tabBtns.forEach((btn) => {
     btn.onclick = () => {
       const targetTab = btn.getAttribute('data-tab');
-      tabBtns.forEach(b => b.classList.toggle('active', b === btn));
-      tabContents.forEach(c => c.classList.toggle('active', c.id === `tab-${targetTab}`));
+      showMainTab(targetTab);
     };
   });
+
+  // Activity sub-navigation (Timeline / Artifacts / Terminal / Skills / Debug)
+  function showActivityPanel(name) {
+    document.querySelectorAll('.activity-sub-btn').forEach((b) => {
+      b.classList.toggle('active', b.getAttribute('data-activity') === name);
+    });
+    document.querySelectorAll('.activity-panel').forEach((p) => {
+      p.classList.toggle('active', p.id === `tab-${name}`);
+    });
+  }
+  document.querySelectorAll('.activity-sub-btn').forEach((btn) => {
+    btn.onclick = () => {
+      showMainTab('activity');
+      showActivityPanel(btn.getAttribute('data-activity'));
+    };
+  });
+
+  /** Open Activity → specific panel (used when plan/timeline/artifacts update). */
+  window.openActivityPanel = function openActivityPanel(name) {
+    showMainTab('activity');
+    showActivityPanel(name || 'timeline');
+  };
 
   function renderPlan(tasks) {
     if (!planList) return;
@@ -817,32 +1184,116 @@
 
   function formatMentionsForOverlay(text) {
     if (!text) return '';
+    // Visual highlight only — clicks go to the mention-chips bar (textarea sits on top of overlay)
     const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    let formatted = escaped.replace(/(^|\s)@([a-zA-Z0-9_\-\.\/]+)/g, (match, prefix, path) => {
-      const parts = path.split('/');
-      let displayHtml = '';
-      if (parts.length === 1) {
-        displayHtml = `@<b>${path}</b>`;
-      } else {
-        const basename = parts.pop();
-        if (basename === '') {
-          const lastDir = parts.pop();
-          const preDir = parts.length > 0 ? parts.join('/') + '/' : '';
-          displayHtml = `@${preDir}<b>${lastDir}/</b>`;
-        } else {
-          const dir = parts.length > 0 ? parts.join('/') + '/' : '';
-          displayHtml = `@${dir}<b>${basename}</b>`;
-        }
+    let formatted = escaped.replace(/(^|\s)@([a-zA-Z0-9_\-\.\/\\]+)/g, (match, prefix, filePath) => {
+      if (!looksLikeFilePath(filePath)) {
+        return match;
       }
-      return `${prefix}<span style="color: var(--vscode-textLink-foreground); font-weight: 600; background: rgba(var(--vscode-textLink-foreground-rgb, 0,120,212), 0.15); padding: 0 4px; border-radius: 3px;">${displayHtml}</span>`;
+      const normalized = filePath.replace(/\\/g, '/');
+      const parts = normalized.split('/');
+      const basename = parts[parts.length - 1] || normalized;
+      const isFolder = normalized.endsWith('/');
+      const icon = isFolder ? '📁' : '📄';
+      const safeName = basename.replace(/\/$/, '');
+      return `${prefix}<span class="file-tag"><span class="file-tag-icon">${icon}</span><span class="file-tag-name">${safeName}</span></span>`;
     });
-
-    formatted = formatted.replace(/(^|\s)\/([a-zA-Z0-9_\-\.]+)/g, (match, prefix, skillName) => {
-      return `${prefix}<span style="color: var(--vscode-charts-purple); font-weight: 600; background: rgba(var(--vscode-charts-purple-rgb, 128,0,128), 0.15); padding: 0 4px; border-radius: 3px;">/<b>${skillName}</b></span>`;
-    });
-    
     if (formatted.endsWith('\n')) formatted += '<br>';
     return formatted;
+  }
+
+  function extractFileMentions(text) {
+    const found = [];
+    const re = /(^|[\s])@([a-zA-Z0-9_\-\.\/\\]+)/g;
+    let m;
+    while ((m = re.exec(String(text || ''))) !== null) {
+      if (looksLikeFilePath(m[2])) {
+        const n = m[2].replace(/\\/g, '/');
+        if (!found.includes(n)) {
+          found.push(n);
+        }
+      }
+    }
+    return found;
+  }
+
+  /** Remove @path from the prompt input (first match). */
+  function removeMentionFromInput(filePath) {
+    if (!promptInput || !filePath) {
+      return;
+    }
+    const escaped = filePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp('(^|[\\s])@' + escaped + '(?=[\\s]|$)');
+    let next = promptInput.value.replace(re, (full, pre) => pre || '');
+    // Also try with backslashes
+    if (next === promptInput.value && filePath.includes('/')) {
+      const alt = filePath.replace(/\//g, '\\\\');
+      const re2 = new RegExp('(^|[\\s])@' + alt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?=[\\s]|$)');
+      next = promptInput.value.replace(re2, (full, pre) => pre || '');
+    }
+    next = next.replace(/[ \t]{2,}/g, ' ').replace(/^\s+/, '');
+    promptInput.value = next;
+    promptInput.focus();
+    syncOverlay();
+    renderMentionChips();
+  }
+
+  /**
+   * Interactive mention chips ABOVE the textarea (textarea covers the overlay,
+   * so overlay tags cannot receive clicks — this is the Copilot-style bar).
+   */
+  function renderMentionChips() {
+    const inputOuter = document.getElementById('input-outer');
+    const inputContainer = document.getElementById('input-container');
+    if (!inputOuter || !inputContainer || !promptInput) {
+      return;
+    }
+    let bar = document.getElementById('mention-chips');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'mention-chips';
+      bar.className = 'mention-chips';
+      inputOuter.insertBefore(bar, inputContainer);
+      bar.addEventListener('click', (e) => {
+        const removeBtn = e.target.closest('.file-tag-remove');
+        if (removeBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          const path = removeBtn.getAttribute('data-path') || removeBtn.closest('.file-tag')?.getAttribute('data-path');
+          removeMentionFromInput(path);
+          return;
+        }
+        const tag = e.target.closest('.file-tag-clickable');
+        if (tag) {
+          e.preventDefault();
+          openMentionPath(tag.getAttribute('data-path'));
+        }
+      });
+    }
+    const mentions = extractFileMentions(promptInput.value);
+    if (mentions.length === 0) {
+      bar.classList.add('hidden');
+      bar.innerHTML = '';
+      return;
+    }
+    bar.classList.remove('hidden');
+    bar.innerHTML = mentions
+      .map((filePath) => {
+        const parts = filePath.split('/');
+        const basename = parts[parts.length - 1] || filePath;
+        const isFolder = filePath.endsWith('/');
+        const icon = isFolder ? '📁' : '📄';
+        const safePath = filePath.replace(/"/g, '&quot;');
+        const safeName = basename.replace(/\/$/, '');
+        return (
+          `<span class="file-tag file-tag-clickable file-tag-removable" data-path="${safePath}" title="${safePath}">` +
+          `<span class="file-tag-icon">${icon}</span>` +
+          `<span class="file-tag-name">${safeName}</span>` +
+          `<button type="button" class="file-tag-remove" data-path="${safePath}" title="Remove mention" aria-label="Remove">×</button>` +
+          `</span>`
+        );
+      })
+      .join('');
   }
 
   function syncOverlay() {
@@ -850,6 +1301,7 @@
     promptOverlay.innerHTML = formatMentionsForOverlay(promptInput.value || '');
     promptOverlay.style.height = promptInput.style.height || '44px';
     promptOverlay.scrollTop = promptInput.scrollTop;
+    renderMentionChips();
   }
 
   // Phase 3.7: debounce @/-mention suggestion requests instead of firing
@@ -991,28 +1443,96 @@
     });
   }
 
+  let dropShiftHeld = false;
+
+  function ensureDropOverlay() {
+    if (!dropZone) return null;
+    let overlay = document.getElementById('drop-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'drop-overlay';
+      overlay.innerHTML =
+        '<div class="drop-overlay-content">' +
+        '<span class="drop-title">Drop files to attach</span>' +
+        '<span class="drop-hint">Hold <kbd>Shift</kbd> while dragging, then release to drop</span>' +
+        '</div>';
+      dropZone.appendChild(overlay);
+    }
+    return overlay;
+  }
+
+  function updateDropOverlayMessage(shiftHeld) {
+    const overlay = ensureDropOverlay();
+    if (!overlay) return;
+    const title = overlay.querySelector('.drop-title');
+    const hint = overlay.querySelector('.drop-hint');
+    if (shiftHeld) {
+      if (title) title.textContent = 'Release to attach';
+      if (hint) hint.innerHTML = 'Shift held — drop files now';
+      overlay.classList.add('drop-ready');
+    } else {
+      if (title) title.textContent = 'Hold Shift to enable drop';
+      if (hint) hint.innerHTML = 'VS Code requires <kbd>Shift</kbd> for drops into the chat';
+      overlay.classList.remove('drop-ready');
+    }
+  }
+
+  function showDropOverlay(show) {
+    const overlay = ensureDropOverlay();
+    if (overlay) overlay.classList.toggle('visible', show);
+    if (dropZone) dropZone.classList.toggle('drag-over', show);
+  }
+
+  // Static tip under the input so users discover Shift without dragging first
+  (function ensureDropHintChip() {
+    const inputOuter = document.getElementById('input-outer');
+    if (!inputOuter || document.getElementById('drop-hint-chip')) return;
+    const chip = document.createElement('div');
+    chip.id = 'drop-hint-chip';
+    chip.className = 'drop-hint-chip';
+    chip.innerHTML = 'Tip: hold <kbd>Shift</kbd> and drop files here to attach';
+    inputOuter.appendChild(chip);
+  })();
+
   if (dropZone) {
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach((evt) => {
+      dropZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      });
+    });
     dropZone.addEventListener('dragenter', (e) => {
-      e.preventDefault();
       dragDepth++;
-      dropZone.classList.add('drag-over');
+      if (e.dataTransfer && (e.dataTransfer.types.includes('Files') || e.dataTransfer.types.includes('text/uri-list'))) {
+        dropShiftHeld = !!e.shiftKey;
+        showDropOverlay(true);
+        updateDropOverlayMessage(dropShiftHeld);
+      }
     });
     dropZone.addEventListener('dragover', (e) => {
-      e.preventDefault();
+      dropShiftHeld = !!e.shiftKey;
+      updateDropOverlayMessage(dropShiftHeld);
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = dropShiftHeld ? 'copy' : 'none';
+      }
     });
     dropZone.addEventListener('dragleave', () => {
       dragDepth = Math.max(0, dragDepth - 1);
-      if (dragDepth === 0) {
-        dropZone.classList.remove('drag-over');
-      }
+      if (dragDepth === 0) showDropOverlay(false);
     });
     dropZone.addEventListener('drop', async (e) => {
-      e.preventDefault();
       dragDepth = 0;
-      dropZone.classList.remove('drag-over');
+      showDropOverlay(false);
+      const shiftOk = !!(e.shiftKey || dropShiftHeld);
+      dropShiftHeld = false;
 
       const dt = e.dataTransfer;
       if (!dt) { return; }
+
+      if (!shiftOk) {
+        statusText.innerText = 'Hold Shift while dropping to attach files';
+        return;
+      }
 
       if (dt.files && dt.files.length > 0) {
         const results = await Promise.all(Array.from(dt.files).map(readFileAsAttachment));
@@ -1020,6 +1540,7 @@
         if (valid.length > 0) {
           attachedFiles.push(...valid);
           renderAttachmentChips();
+          statusText.innerText = `Attached ${valid.length} file(s)`;
         }
         return;
       }
@@ -1034,11 +1555,24 @@
     });
   }
 
+  // Mention interactions live on #mention-chips (textarea covers #prompt-overlay)
+
   // Handle Send/Stop click
   sendBtn.addEventListener('click', () => {
     if (isWaiting) {
+      // Stop immediately in the UI; extension cancels tools/stream.
+      // Do not call setWaiting(false) here in a way that flushes the queue
+      // before the user sees "Stopped" — cancel posts `done`, which clears
+      // waiting; we suppress queue flush for pure stop via a flag.
+      suppressQueueFlushOnce = true;
       vscode.postMessage({ type: 'cancel' });
       setWaiting(false);
+      statusText.innerText = 'Stopped.';
+      if (currentAssistantMessageId && !currentAssistantMessageId.innerText.trim()) {
+        currentAssistantMessageId.innerHTML = '<em style="opacity:0.7">Stopped.</em>';
+      }
+      currentAssistantMessageId = null;
+      currentThoughtDiv = null;
     } else {
       sendPrompt();
     }
@@ -1046,7 +1580,27 @@
 
   function sendPrompt() {
     const text = promptInput.value.trim();
-    if (!text || isWaiting) {
+    if (!text) {
+      return;
+    }
+
+    // Queue follow-up while a turn is running (like Copilot / Antigravity)
+    if (isWaiting) {
+      promptQueue.push({
+        text,
+        attachments: attachedFiles.slice(),
+      });
+      promptInput.value = '';
+      promptInput.style.height = 'auto';
+      syncOverlay();
+      attachedFiles = [];
+      renderAttachmentChips();
+      renderQueueBadge();
+      const preview = truncateQueuePreview(text, 80);
+      statusText.innerText =
+        promptQueue.length === 1
+          ? `Queued: “${preview}”`
+          : `Queued ${promptQueue.length}: “${truncateQueuePreview(promptQueue[0].text, 60)}” +${promptQueue.length - 1} more`;
       return;
     }
 
@@ -1136,6 +1690,28 @@
   // Main Message Listener
   window.addEventListener('message', ({ data: msg }) => {
     switch (msg.type) {
+      case 'autoVerifyReport': {
+        const text = (msg.value && msg.value.content) || msg.value || '';
+        if (typeof appendAssistantMessage === 'function') {
+          appendAssistantMessage(text);
+        } else if (typeof addMessageToUI === 'function') {
+          addMessageToUI('assistant', text);
+        } else {
+          // Fallback: show in status + diagnostics-like bubble
+          const chat = document.getElementById('chat-container') || document.getElementById('messages');
+          if (chat) {
+            const div = document.createElement('div');
+            div.className = 'message assistant';
+            div.innerHTML = '<div class="message-content"></div>';
+            const body = div.querySelector('.message-content');
+            if (body) body.textContent = typeof text === 'string' ? text : JSON.stringify(text);
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight;
+          }
+        }
+        break;
+      }
+
       case 'status':
         statusText.innerText = msg.value;
         break;
@@ -1146,14 +1722,22 @@
             currentThoughtDiv = createThoughtBlock(currentAssistantMessageId);
           }
           currentThoughtDiv.innerHTML = msg.value;
+          const label = currentAssistantMessageId.querySelector('.thought-label');
+          if (label) label.textContent = 'Thinking';
           scrollBottom();
         }
         break;
 
       case 'partial':
         if (currentAssistantMessageId) {
-          currentAssistantMessageId.innerHTML = formatMentions(msg.value);
-          processCodeBlocks(currentAssistantMessageId, true);
+          let answer = currentAssistantMessageId.querySelector('.message-answer');
+          if (!answer) {
+            answer = document.createElement('div');
+            answer.className = 'message-answer';
+            currentAssistantMessageId.appendChild(answer);
+          }
+          answer.innerHTML = formatMentions(msg.value);
+          processCodeBlocks(answer, true);
           scrollBottom();
         }
         break;
@@ -1176,6 +1760,10 @@
         break;
 
       case 'done':
+        if (currentThoughtDiv) {
+          markThoughtComplete(currentThoughtDiv);
+        }
+
         setWaiting(false);
         if (currentAssistantMessageId) {
           processCodeBlocks(currentAssistantMessageId, true);
@@ -1247,6 +1835,10 @@
         }
         break;
 
+      case 'patchSet':
+        renderPatchSetBanner(msg.value);
+        break;
+
       case 'timeline':
         allTimelineEvents = msg.value || [];
         renderTimeline(msg.value);
@@ -1264,6 +1856,15 @@
         renderDiagnosticsTab();
         break;
 
+      case 'agentDebug':
+        lastAgentDebug = msg.value || null;
+        if (lastAgentDebug && lastAgentDebug.diagnostics) {
+          systemDiagnostics = lastAgentDebug.diagnostics;
+        }
+        renderAgentDebugSession(lastAgentDebug);
+        renderDiagnosticsTab();
+        break;
+
       case 'suggestSkill':
         renderSkillSuggestion(msg.value);
         break;
@@ -1271,15 +1872,68 @@
       case 'architectDrafts':
         renderArchitectDrafts(msg.value);
         break;
+
+      case 'terminalOutput':
+        appendTerminalLog(msg.value || '', msg.kind || 'out');
+        break;
     }
   });
 
-  function escapeHtml(str) {
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+  // ── Sidebar Terminal tab ──
+  const terminalLog = document.getElementById('terminal-log');
+  const terminalInput = document.getElementById('terminal-input');
+  const terminalSendBtn = document.getElementById('terminal-send-btn');
+  const termFocusBtn = document.getElementById('term-focus-btn');
+  const termClearBtn = document.getElementById('term-clear-btn');
+
+  function appendTerminalLog(text, kind) {
+    if (!terminalLog) {
+      return;
+    }
+    const empty = terminalLog.querySelector('.empty-state');
+    if (empty) {
+      empty.remove();
+    }
+    const line = document.createElement('div');
+    line.className = 'term-line ' + (kind || 'out');
+    line.textContent = text;
+    terminalLog.appendChild(line);
+    terminalLog.scrollTop = terminalLog.scrollHeight;
+  }
+
+  function sendTerminalFromSidebar() {
+    if (!terminalInput) {
+      return;
+    }
+    const text = terminalInput.value;
+    if (!text.trim()) {
+      return;
+    }
+    appendTerminalLog('$ ' + text, 'cmd');
+    vscode.postMessage({ type: 'sidebarTerminalRun', value: text });
+    terminalInput.value = '';
+  }
+
+  if (terminalSendBtn) {
+    terminalSendBtn.onclick = sendTerminalFromSidebar;
+  }
+  if (terminalInput) {
+    terminalInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        sendTerminalFromSidebar();
+      }
+    });
+  }
+  if (termFocusBtn) {
+    termFocusBtn.onclick = () => vscode.postMessage({ type: 'focusTerminal' });
+  }
+  if (termClearBtn) {
+    termClearBtn.onclick = () => {
+      if (terminalLog) {
+        terminalLog.innerHTML = '<div class="empty-state">Cleared.</div>';
+      }
+    };
   }
 
   function renderArchitectDrafts(drafts) {
@@ -1474,6 +2128,42 @@
     grep_search: '🔎', run_tests: '🧪', index_docs: '📖', query_knowledge: '💡'
   };
 
+  function renderPatchSetBanner(ps) {
+    let el = document.getElementById('patch-set-banner');
+    if (!el) {
+      const host = document.getElementById('timeline-list')?.parentElement || document.body;
+      el = document.createElement('div');
+      el.id = 'patch-set-banner';
+      el.className = 'patch-set-banner';
+      host.insertBefore(el, host.firstChild);
+    }
+    if (!ps || !ps.files || !ps.files.length) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+      return;
+    }
+    el.style.display = 'block';
+    const files = ps.files.map((f) =>
+      `<li><code>${escapeHtml(f.path)}</code>${f.created ? ' <span class="badge">new</span>' : ''} (${f.regionCount || 0} hunks)</li>`
+    ).join('');
+    el.innerHTML = `
+      <div class="patch-set-title">Pending patch set · ${ps.files.length} file(s)</div>
+      <ul class="patch-set-files">${files}</ul>
+      <div class="patch-set-actions">
+        <button type="button" class="btn-accept-patch" data-act="accept">Accept all</button>
+        <button type="button" class="btn-reject-patch" data-act="reject">Reject all</button>
+        <button type="button" class="btn-review-patch" data-act="review">Review merges</button>
+      </div>`;
+    el.querySelectorAll('button[data-act]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const act = btn.getAttribute('data-act');
+        if (act === 'accept') vscode.postMessage({ type: 'acceptPatchSet' });
+        if (act === 'reject') vscode.postMessage({ type: 'rejectPatchSet' });
+        if (act === 'review') vscode.postMessage({ type: 'reviewPatchSet' });
+      });
+    });
+  }
+
   function renderTimeline(events) {
     if (!timelineList) return;
     timelineList.innerHTML = '';
@@ -1539,38 +2229,78 @@
     if (counter) counter.textContent = `${timelineList.querySelectorAll('.timeline-item').length} actions`;
   }
 
-  // ── Diagnostics tab: system warnings/errors (backend-pushed) + a
-  // client-side filter of failed timeline events (no separate backend
-  // data needed for that half — timeline events already carry `success`).
+  // ── Agent Debug panel: session snapshot + diagnostics + recent tools ──
+  function formatDebugTime(ts) {
+    if (!ts) return '';
+    try {
+      return new Date(ts).toLocaleTimeString();
+    } catch {
+      return '';
+    }
+  }
+
+  function renderAgentDebugSession(snap) {
+    const el = document.getElementById('agent-debug-session');
+    if (!el || !snap) return;
+    const total = (snap.tokensIn || 0) + (snap.tokensOut || 0);
+    el.innerHTML = `
+      <div class="debug-chips">
+        <span class="debug-chip"><b>Mode</b> ${escapeHtml(snap.mode || '—')}</span>
+        <span class="debug-chip"><b>Provider</b> ${escapeHtml(snap.provider || '—')}</span>
+        <span class="debug-chip"><b>Model</b> ${escapeHtml(snap.model || '—')}</span>
+        <span class="debug-chip"><b>Tokens</b> in ${Number(snap.tokensIn || 0).toLocaleString()} · out ${Number(snap.tokensOut || 0).toLocaleString()} · Σ ${total.toLocaleString()}</span>
+        <span class="debug-chip"><b>Plan</b> ${snap.planDone || 0}/${snap.planTasks || 0}</span>
+        <span class="debug-chip mono"><b>Chat</b> ${escapeHtml(String(snap.chatId || '').slice(0, 12) || '—')}</span>
+      </div>
+    `;
+  }
+
   function renderDiagnosticsTab() {
     const list = document.getElementById('diagnostics-list');
     if (!list) return;
 
+    const snap = lastAgentDebug;
+    const diags = (snap && snap.diagnostics) ? snap.diagnostics : systemDiagnostics;
+    const tools = (snap && snap.recentTools) ? snap.recentTools : [];
     const failures = allTimelineEvents.filter(e => e.success === false);
 
-    if (systemDiagnostics.length === 0 && failures.length === 0) {
-      list.innerHTML = '<div class="empty-state">No warnings or errors yet. Failed tool calls and system warnings will show up here.</div>';
+    if ((!diags || diags.length === 0) && tools.length === 0 && failures.length === 0) {
+      list.innerHTML = '<div class="empty-state">No agent activity yet. Tools, tokens, mode, and warnings will appear here as you work.</div>';
       return;
     }
 
     let html = '';
 
-    if (systemDiagnostics.length > 0) {
-      html += '<div class="diagnostics-section-label">System</div>';
-      html += systemDiagnostics.map(d => `
+    if (tools.length > 0) {
+      html += '<div class="diagnostics-section-label">Recent tools (newest first)</div>';
+      html += tools.slice(0, 20).map(e => `
+        <div class="diagnostic-item ${e.success ? 'info' : 'error'}">
+          <div class="diagnostic-header">
+            <span class="diagnostic-source">${escapeHtml(e.tool)} ${e.success ? '✓' : '✗'}</span>
+            <span class="diagnostic-severity">${e.duration || 0}ms · ${formatDebugTime(e.timestamp)}</span>
+          </div>
+          <div class="diagnostic-message">${escapeHtml(e.argsSummary || '')}</div>
+          <div class="diagnostic-message diagnostic-result">${escapeHtml(e.resultPreview || '')}</div>
+        </div>
+      `).join('');
+    }
+
+    if (diags && diags.length > 0) {
+      html += '<div class="diagnostics-section-label">System log</div>';
+      html += diags.map(d => `
         <div class="diagnostic-item ${d.severity}">
           <div class="diagnostic-header">
             <span class="diagnostic-source">${escapeHtml(d.source)}</span>
-            <span class="diagnostic-severity">${d.severity}</span>
+            <span class="diagnostic-severity">${d.severity}${d.timestamp ? ' · ' + formatDebugTime(d.timestamp) : ''}</span>
           </div>
           <div class="diagnostic-message">${escapeHtml(d.message)}</div>
         </div>
       `).join('');
     }
 
-    if (failures.length > 0) {
-      html += '<div class="diagnostics-section-label">Failed Tool Calls</div>';
-      html += failures.slice().reverse().map(e => `
+    if (failures.length > 0 && tools.length === 0) {
+      html += '<div class="diagnostics-section-label">Failed tool calls</div>';
+      html += failures.slice().reverse().slice(0, 15).map(e => `
         <div class="diagnostic-item error">
           <div class="diagnostic-header">
             <span class="diagnostic-source">${escapeHtml(e.tool)}</span>

@@ -1,6 +1,6 @@
 # CodePartner AI
 
-[![Version](https://img.shields.io/badge/version-2.1.7-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
+[![Version](https://img.shields.io/badge/version-2.8.0-blue.svg)](https://marketplace.visualstudio.com/items?itemName=AnandShah.codepartner-ai)
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.93.0-0078d4.svg)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -8,7 +8,7 @@
 
 **CodePartner AI** is a powerful **agentic** AI coding co-pilot that goes far beyond simple chat. Built with an "agent-first" philosophy, it autonomously plans, researches, edits code safely, runs commands, controls a browser, manages Git, and learns reusable **Skills** — all while following strict engineering best practices.
 
-It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **inline completions**, **MCP tools**, semantic search, multi-agent collaboration, and a beautiful glassmorphism UI with tabs for Plan, Timeline, Artifacts, and Skills.
+It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **inline completions**, **MCP tools**, semantic search, multi-agent collaboration, **local async agents**, **git plugin catalog**, **CI tools via gh**, prompt queue, reliable Stop, Antigravity-style `@file` tags, and a glassmorphism UI (**Chat | Plan | Activity** — Timeline, Artifacts, Terminal, Skills, Debug under Activity).
 
 ---
 
@@ -22,15 +22,23 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 - **Multi-Agent System**: Automatically dispatches to specialized sub-agents (`researcher`, `code_expert`, `tester`, `writer`) running in **isolated Git worktrees** to enable safe, conflict-free concurrent editing. Also supports **Custom repo-scoped agents** (see below)
 - **Proactive Skill Discovery**: Suggests saving repeated workflows as reusable global **Skills**
 - **Timeline & Revert**: Full audit trail of every tool action with one-click undo
+- **Transactional PatchSet**: Multi-file accept/reject per agent turn; 3-way merge when you edited the same files
+- **Auto-verify**: Focused tests after agent edits (`codepartner.autoVerify`) without waiting for the model
+- **NES**: Rename variants, path segments, string literals + Finish Changes
 
 ### 🛠️ Powerful Tools
 - **Safe File Operations**: Always `read_file` first, precise hunk-based edits (`diffLines` + selective apply), `create_file`, `grep_search`
-- **Approval & Safety**: Configurable policies (`always-ask` / `full-auto`), secret scanner, prompt injection guard
+- **Approval & Safety**: Configurable policies (`always-ask` / `full-auto`), **local sandbox** (`sandboxMode`: off/soft/strict), secret scanner, prompt injection guard
 - **Terminal & Testing**: Runs shell commands, auto-detects and runs tests (`run_tests`), with optional **inline assist** on failures (new `terminalInlineAssist` setting — offers CodePartner help with failed command + output)
-- **Browser Control**: Navigate, click, type, screenshot web pages for research (cross-platform via Puppeteer)
+- **Computer-use Browser**: Local Chrome — observe interactive elements, click/type/select/scroll/press, screenshot (Puppeteer)
 - **Git Integration**: Status, stage, AI-generated commit messages (with Co-author), branches, and GitHub PR creation
 - **Web & Knowledge**: DuckDuckGo search, document indexing (`index_docs` + `query_knowledge`)
 - **MCP Support**: Connect to external Model Context Protocol servers for custom tools
+- **Local async agents** (no cloud): `run_async_agent` / `list_async_agents` — background jobs in the extension host with progress notifications
+- **Git plugin catalog**: set `codepartner.pluginCatalogRepo`, run **CodePartner: Sync Plugin Catalog**; agents merge with `.codepartner/agents/*.md`
+- **CI/CD tools**: `list_ci_runs`, `trigger_ci_workflow`, `write_ci_workflow`, plus `create_pull_request` (uses your `gh` CLI — no CodePartner backend)
+- **Agent Debug panel**: mode, model, tokens, recent tools, system diagnostics
+- **Sidebar Terminal** + multi-file / workspace NES + code-reference scan
 - **Custom Agents**: Repo-local agents (`.codepartner/agents/*.md`) with YAML frontmatter + custom system prompts (see dedicated section)
 - **Artifacts & Skills**: Persistent global storage (`~/.codepartner`) of code, plans, markdown, logs, and screenshots
 
@@ -45,12 +53,37 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 
 ### 🎨 Premium UX
 - Beautiful glassmorphism sidebar with tabs (Chat, Plan, Timeline, Artifacts, Skills)
+- **Separate thinking panel** when the model streams reasoning (collapsible Thought block above the answer)
 - Inline ghost text completions (toggle with `Ctrl+Shift+I`)
 - Diff views, apply/insert/copy actions on code blocks
 - Model selector, mode switcher, chat history with rename/delete
 - Feedback button for bugs/features
 
 ---
+
+
+## 📌 What's new in v2.8.0
+
+### Safety & runtime
+- **Local sandbox** (`codepartner.sandboxMode`: `off` | `soft` | `strict`) — filtered env, command safety, optional Linux bubblewrap
+- **Capability approvals**, path containment, secret redaction, prompt-injection tracking (web / @file / MCP / browser)
+- **Tool scheduler** + per-path write locks
+- **Reliable Stop**, prompt queue, turn-id cancellation
+
+### Agent edits
+- **Transactional PatchSet** — multi-file accept / reject / 3-way merge review after each turn
+- **Auto-verify** — focused related tests after edits (`codepartner.autoVerify`: off | focused | full)
+- **Review policy packs** — security, react, node, quality
+- **NES / Finish Changes** — renames, case variants, path segments, string literals, multi-file
+
+### Context & UX
+- Symbol index + DocumentSymbol enrichment, context ranker, multi-root preferred folder
+- Sidebar **Chat | Plan | Activity** (Timeline, Artifacts, Terminal, Skills, Debug)
+- **Computer-use browser** — observe → act → observe (local Chrome)
+- Optional `codepartner.completionModel` for inline completions
+- Local async agents, git plugin catalog, CI via `gh`
+
+See [CHANGELOG.md](CHANGELOG.md) for the full 2.4 → 2.8 history.
 
 ## 🚀 Quick Start
 
@@ -60,7 +93,7 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
    - Then set:
      - `provider` (e.g. `openai`, `anthropic`, `ollama`)
      - `model` (e.g. `gpt-4o`, `claude-3-5-sonnet-20241022`, `llama3`)
-   - Optional: tweak `approvalPolicy`, `contextTokenBudget`, `inlineCompletions`, etc.
+   - Optional: tweak `approvalPolicy`, `sandboxMode`, `autoVerify`, `completionModel`, `contextTokenBudget`, `inlineCompletions`, etc.
 3. **Open Sidebar**: Click the robot icon in Activity Bar or press `Ctrl+L` / `Cmd+L`
 4. **Try it**:
    - **Fast**: "Explain this function"
@@ -68,6 +101,8 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
    - Use slash commands: `/fix`, `/explain`, `/test`
 
 **Tip**: Use `@workspace` for project-wide awareness and `@web` for research.
+
+**Lint**: `npm run lint` · auto-fix: `npm run lint:fix` · types+lint fix: `npm run fix`
 
 ---
 
@@ -82,6 +117,9 @@ It supports **5 LLM providers** (OpenAI, Azure, Anthropic, Google, Ollama), **in
 | `codepartner.generateTests` | Generate Tests for File | `Ctrl+Alt+T` / `Cmd+Alt+T` | Create unit tests |
 | `codepartner.newChat` | New Chat | `Ctrl+Alt+N` / `Cmd+Alt+N` | Start a fresh conversation |
 | `codepartner.cancelActiveTask` | Cancel Active Task | `Ctrl+Alt+X` / `Cmd+Alt+X` | Stop any running agent/task |
+| `codepartner.acceptPatchSet` | Accept Patch Set | - | Keep all files from last agent turn |
+| `codepartner.rejectPatchSet` | Reject Patch Set | - | Roll back all files from last agent turn |
+| `codepartner.reviewPatchSet` | Review Patch Set | - | 3-way merge / diffs for pending patch set |
 | `codepartner.showDebugLog` | Show Debug Log | - | Open output channel |
 | `codepartner.setApiKey` | Set API Key | - | Securely store LLM API key |
 
@@ -128,7 +166,20 @@ Skills and knowledge travel with you across all projects.
 
 ---
 
-## 🛠️ Custom Repo Agents (New in v2.1.6)
+## 🛠️ Custom Repo Agents & Plugin Catalog
+
+Workspace agents live in `.codepartner/agents/*.md` (YAML frontmatter + body). Optionally set **`codepartner.pluginCatalogRepo`** to a git URL and run **CodePartner: Sync Plugin Catalog** (or the `sync_plugin_catalog` tool) to pull shared agents from a public/private repo into extension storage — no marketplace backend.
+
+### Local async agents
+
+Use **`run_async_agent`** to start a background sub-agent (progress toast, cancellable). Results via **`list_async_agents`**. Jobs live only while VS Code is open.
+
+### CI via GitHub CLI
+
+Tools **`list_ci_runs`**, **`trigger_ci_workflow`**, **`write_ci_workflow`** call your installed `gh` CLI. **`create_pull_request`** remains for PR flow.
+
+## 🛠️ Custom Repo Agents (format)
+
 
 Define your own specialized agents **local to the current repository** by placing Markdown files in a `.codepartner/agents/` directory (create it if it doesn't exist — the extension will detect it automatically).
 
@@ -194,13 +245,13 @@ See full system prompt and tool definitions in `src/extension.ts`.
 CodePartner excels in:
 - **Broadest provider support** including local Ollama (no subscription required)
 - **Global reusable Skills** and proactive suggestions
-- **Browser automation** (unique vs Copilot)
+- **Computer-use browser** (observe/act loop) and local sandbox
 - **Timeline with undo** and Architect drafting mode
 - **Zero lock-in** — bring your own keys
 
 For a detailed comparison (including gaps like inline completions in earlier versions), see [codepartner_comparison_analysis.md](codepartner_comparison_analysis.md).
 
-**Note**: Now at **v2.1.7** — adds **Terminal inline assist** (`codepartner.terminalInlineAssist` setting: offers CodePartner help on terminal command failures with configurable scope and explicit permission for "all-terminals"), plus prior v2.1.6 custom repo-scoped agents (`.codepartner/agents/*.md` YAML frontmatter), embeddings, Architect per-hunk review, worktree-isolated parallel agents, durable Timeline undo, approval policies, MCP, and all v2.1.x improvements. Terminal lint compliance and test runner hardening carried forward. See [CHANGELOG.md](CHANGELOG.md) for details.
+**Note**: Current release **v2.8.0** — local sandbox, PatchSet accept/reject/merge, auto-verify, computer-use browser, richer NES, review packs, multi-root, symbol index, and the earlier Stop/queue/artifacts/file-tags/Agent Debug/async agents/CI stack. See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ---
 
